@@ -1,0 +1,61 @@
+seed: 42
+rdt_repo: /absolute/path/to/RoboticsDiffusionTransformer
+pretrained_model: null
+output_dir: outputs/tiny_smoke
+
+model:
+  action_dim: 7
+  state_dim: 7
+  pred_horizon: 16
+  qwen_hidden_size: 64
+  max_lang_tokens: 12
+  image_tokens: 16
+  hidden_size: 128
+  depth: 2
+  num_heads: 4
+  dtype: float32
+  lang_adaptor: linear
+  img_adaptor: linear
+  state_adaptor: mlp2x_gelu
+  copy_pretrained_final_fc1: false
+  gradient_checkpointing: false
+
+lora:
+  rank: 4
+  alpha: 8
+  dropout: 0.0
+  target_self_attention: true
+  target_cross_attention: true
+  target_ffn: true
+  train_final_layer: true
+
+noise_scheduler:
+  num_train_timesteps: 100
+  num_inference_timesteps: 5
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: sample
+  clip_sample: false
+
+data:
+  train_manifest: cache_synthetic/train/manifest.jsonl
+  val_manifest: cache_synthetic/val/manifest.jsonl
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+
+training:
+  max_steps: 20
+  micro_batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate_lora: 1.0e-3
+  learning_rate_interfaces: 1.0e-3
+  weight_decay_interfaces: 0.0
+  warmup_steps: 0
+  max_grad_norm: 1.0
+  log_every: 1
+  validate_every: 10
+  save_every: 20
+  validation_batches: 2
+  sample_validation_batches: 1
+  mixed_precision: 'no'
+  report_to: tensorboard

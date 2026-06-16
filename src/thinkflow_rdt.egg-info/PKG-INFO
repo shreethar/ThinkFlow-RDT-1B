@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: thinkflow-rdt
+Version: 0.1.0
+Summary: SFT-conditioned RDT-1B diffusion action model with LoRA
+Requires-Python: >=3.10
+Requires-Dist: accelerate>=0.30
+Requires-Dist: diffusers>=0.27
+Requires-Dist: huggingface-hub>=0.23
+Requires-Dist: numpy>=1.24
+Requires-Dist: peft>=0.11
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: safetensors>=0.4
+Requires-Dist: tensorboard>=2.15
+Requires-Dist: timm>=0.9
+Requires-Dist: tqdm>=4.66
+Requires-Dist: transformers>=4.44
