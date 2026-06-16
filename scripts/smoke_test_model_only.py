@@ -200,7 +200,7 @@ def main() -> None:
         print(f"  {key:22s} {tuple(value.shape)} {value.dtype}")
 
     print("\n[3/6] Selecting representative parameters...")
-    lora_name, lora_param = first_named_parameter(model, ("lora_A",), trainable=True)
+    lora_name, lora_param = first_named_parameter(model, ("lora_B",), trainable=True)
     interface_name, interface_param = first_named_parameter(
         model, ("runner.lang_adaptor", "runner.img_adaptor", "runner.state_adaptor"), trainable=True
     )
