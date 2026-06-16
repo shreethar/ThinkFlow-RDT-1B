@@ -255,9 +255,6 @@ class SFTConditionedRDT(nn.Module):
             )
 
         valid = time_mask.unsqueeze(-1).to(prediction.dtype) * dim_mask
-        print(f"DEBUG: time_mask sum={time_mask.sum().item()}, dim_mask sum={dim_mask.sum().item()}, valid sum={valid.sum().item()}")
-        print(f"DEBUG: prediction max={prediction.max().item():.6f}, min={prediction.min().item():.6f}")
-        print(f"DEBUG: target max={target.max().item():.6f}, min={target.min().item():.6f}")
         squared_error = (prediction - target).pow(2) * valid
         denominator = valid.sum().clamp_min(1.0)
         loss = squared_error.sum() / denominator
