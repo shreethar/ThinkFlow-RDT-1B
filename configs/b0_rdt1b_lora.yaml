@@ -1,5 +1,5 @@
 seed: 42
-rdt_repo: "C:\\Users\\rshre\\RoboticsDiffusionTransformer"
+rdt_repo: /workspace/RoboticsDiffusionTransformer
 pretrained_model: robotics-diffusion-transformer/rdt-1b
 output_dir: outputs/b0_sft_rdt1b_lora
 
