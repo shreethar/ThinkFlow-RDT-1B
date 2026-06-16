@@ -75,23 +75,29 @@ def main():
     N1 = grid_thw[0].prod().item()
     N2 = grid_thw[1].prod().item()
     
+    # Due to 2x2 spatial patch merging in the Qwen VL model,
+    # the number of visual tokens in the LLM sequence is N // 4.
+    M1 = N1 // 4
+    M2 = N2 // 4
+    
     image_indices = torch.where(is_image_token)[0]
-    if len(image_indices) != N1 + N2:
-        raise ValueError(f"Found {len(image_indices)} image padding tokens, but grid_thw specifies {N1} + {N2} = {N1+N2}")
+    if len(image_indices) != M1 + M2:
+        raise ValueError(f"Found {len(image_indices)} image padding tokens, but expected {M1} + {M2} = {M1+M2}")
         
-    cam1_indices = image_indices[:N1]
-    cam2_indices = image_indices[N1 : N1 + N2]
+    cam1_indices = image_indices[:M1]
+    cam2_indices = image_indices[M1 : M1 + M2]
     
-    cam1_tokens = hidden[cam1_indices] # [N1, 2560]
-    cam2_tokens = hidden[cam2_indices] # [N2, 2560]
+    cam1_tokens = hidden[cam1_indices] # [M1, 2560]
+    cam2_tokens = hidden[cam2_indices] # [M2, 2560]
     
-    # Reshape and adaptive pool each camera to 8x8 = 64 tokens
-    H1, W1 = grid_thw[0, 1].item(), grid_thw[0, 2].item()
+    # Reshape and adaptive pool each camera to 8x8 = 64 tokens.
+    # The feature grid size is halved in both dimensions: (H // 2, W // 2)
+    H1, W1 = grid_thw[0, 1].item() // 2, grid_thw[0, 2].item() // 2
     cam1_tokens_reshaped = cam1_tokens.view(1, H1, W1, -1).permute(0, 3, 1, 2)
     cam1_pooled = F.adaptive_avg_pool2d(cam1_tokens_reshaped.float(), (8, 8))
     cam1_pooled = cam1_pooled.permute(0, 2, 3, 1).view(64, -1).to(hidden.dtype)
     
-    H2, W2 = grid_thw[1, 1].item(), grid_thw[1, 2].item()
+    H2, W2 = grid_thw[1, 1].item() // 2, grid_thw[1, 2].item() // 2
     cam2_tokens_reshaped = cam2_tokens.view(1, H2, W2, -1).permute(0, 3, 1, 2)
     cam2_pooled = F.adaptive_avg_pool2d(cam2_tokens_reshaped.float(), (8, 8))
     cam2_pooled = cam2_pooled.permute(0, 2, 3, 1).view(64, -1).to(hidden.dtype)
