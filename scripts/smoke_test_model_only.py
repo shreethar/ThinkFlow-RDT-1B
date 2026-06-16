@@ -204,7 +204,7 @@ def main() -> None:
     interface_name, interface_param = first_named_parameter(
         model, ("runner.lang_adaptor", "runner.img_adaptor", "runner.state_adaptor"), trainable=True
     )
-    final_name, final_param = first_named_parameter(model, ("final_layer",), trainable=True)
+    final_name, final_param = first_named_parameter(model, ("ffn_final.fc2",), trainable=True)
     frozen_name, frozen_param = first_named_parameter(
         model, ("base_layer.weight", "attn.qkv.weight"), trainable=False
     )
@@ -224,7 +224,7 @@ def main() -> None:
     initial_loss = None
     losses: list[float] = []
 
-    print("\n[4/6] Forward/backward and tiny memorization test...")
+    print("\n[4/6] Forward/backward and tiny overfit test...")
     for step in range(args.steps):
         if args.fixed_diffusion_rng:
             # Makes sampled noise, timestep and dropout identical each iteration.
@@ -245,10 +245,6 @@ def main() -> None:
             print(f"    Interface  : {grad_norm(interface_param)}")
             print(f"    Final head : {grad_norm(final_param)}")
             print(f"    Frozen RDT : {grad_norm(frozen_param)} (must be None)")
-            print("    --- All Trainable Parameters and Gradients ---")
-            for name, param in model.named_parameters():
-                if param.requires_grad:
-                    print(f"      {name}: grad={grad_norm(param)}, shape={tuple(param.shape)}")
             if lora_param.grad is None:
                 raise RuntimeError("LoRA parameter received no gradient")
             if interface_param.grad is None:
