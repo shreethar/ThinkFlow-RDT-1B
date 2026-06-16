@@ -1,13 +1,13 @@
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForVision2Seq
+from transformers import AutoProcessor, AutoModelForImageTextToText
 import torch.nn.functional as F
 import os
 
 def main():
     model_id = "shreethar/stage1_unsloth"
     print(f"Loading processor and model from {model_id}...")
-    processor = AutoProcessor.from_pretrained(model_id)
+    processor = AutoModelForImageTextToText.from_pretrained(model_id)
     vlm = AutoModelForVision2Seq.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16,
