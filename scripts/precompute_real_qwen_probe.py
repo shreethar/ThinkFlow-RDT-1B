@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import os
 
 def main():
+    torch.backends.cudnn.enabled = False
     model_id = "shreethar/stage1_unsloth"
     print(f"Loading processor and model from {model_id}...")
     processor = AutoProcessor.from_pretrained(model_id)
