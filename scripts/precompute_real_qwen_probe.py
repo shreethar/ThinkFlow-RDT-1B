@@ -128,8 +128,8 @@ def main():
         {
             "lang_tokens": lang_tokens.cpu(),
             "img_tokens": img_tokens.cpu(),
-            "state": torch.zeros(7, dtype=torch.float32),
-            "actions": torch.zeros(64, 7, dtype=torch.float32),
+            "state": torch.randn(7, dtype=torch.float32),
+            "actions": torch.randn(64, 7, dtype=torch.float32),
             "ctrl_freq": 10.0,
         },
         output_path
