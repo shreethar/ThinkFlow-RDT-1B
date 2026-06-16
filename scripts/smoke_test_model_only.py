@@ -245,6 +245,10 @@ def main() -> None:
             print(f"    Interface  : {grad_norm(interface_param)}")
             print(f"    Final head : {grad_norm(final_param)}")
             print(f"    Frozen RDT : {grad_norm(frozen_param)} (must be None)")
+            print("    --- All Trainable Parameters and Gradients ---")
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    print(f"      {name}: grad={grad_norm(param)}, shape={tuple(param.shape)}")
             if lora_param.grad is None:
                 raise RuntimeError("LoRA parameter received no gradient")
             if interface_param.grad is None:
