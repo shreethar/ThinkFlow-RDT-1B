@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "thinkflow-rdt"
 version = "0.1.0"
 description = "SFT-conditioned RDT-1B diffusion action model with LoRA"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
   "accelerate>=0.30",
   "diffusers>=0.27",
