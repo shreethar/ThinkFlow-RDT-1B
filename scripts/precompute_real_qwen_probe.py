@@ -7,10 +7,10 @@ import os
 def main():
     model_id = "shreethar/stage1_unsloth"
     print(f"Loading processor and model from {model_id}...")
-    processor = AutoModelForImageTextToText.from_pretrained(model_id)
-    vlm = AutoModelForVision2Seq.from_pretrained(
+    processor = AutoProcessor.from_pretrained(model_id)
+    vlm = AutoModelForImageTextToText.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map="cuda",
         attn_implementation="sdpa"
     )
