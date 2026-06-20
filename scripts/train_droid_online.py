@@ -103,7 +103,7 @@ def droid_online_collate_fn(samples):
     return batch
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def extract_qwen_features(batch, processor, vlm, max_lang_tokens=128, device="cuda"):
     instructions = batch["instructions"]
     primary_images_np = batch["primary_images"]
