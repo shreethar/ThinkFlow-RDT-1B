@@ -19,6 +19,12 @@ class DroidOnlineDataset(Dataset):
         self.pred_horizon = pred_horizon
         
         print("Loading tensorflow_datasets...")
+        import tensorflow as tf
+        # Disable TensorFlow GPU visibility to prevent it from hogging VRAM
+        try:
+            tf.config.set_visible_devices([], 'GPU')
+        except Exception as e:
+            print(f"Warning: Could not disable TensorFlow GPU: {e}")
         import tensorflow_datasets as tfds
         # Build dataset from local directory
         builder = tfds.builder_from_directory(dataset_dir)
