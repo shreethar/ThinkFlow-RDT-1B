@@ -375,7 +375,10 @@ def main():
         loss = metrics["loss"]
         print(f"Initial loss: {loss.item():.6f}")
         loss.backward()
-        
+        # Set learning rate manually to a non-zero value to bypass the warmup scheduler phase during Test B
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = 1e-3
+
         fc2_param = model.runner.model.final_layer.modules_to_save.default.ffn_final.fc2.weight
         print(f"DEBUG Step 1: fc2 grad norm = {fc2_param.grad.norm().item() if fc2_param.grad is not None else 'None'}")
         
