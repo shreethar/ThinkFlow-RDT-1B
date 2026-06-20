@@ -167,11 +167,22 @@ def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device="cuda
     )
     
     # 3. Re-run full generated sequence to get hidden states
+    prompt_len = inputs["input_ids"].shape[1]
+    new_len = generated_ids.shape[1]
+    orig_mm = inputs["mm_token_type_ids"]
+    pad_len = new_len - prompt_len
+    if pad_len > 0:
+        pad_zeros = torch.zeros(B, pad_len, dtype=orig_mm.dtype, device=orig_mm.device)
+        mm_token_type_ids = torch.cat([orig_mm, pad_zeros], dim=1)
+    else:
+        mm_token_type_ids = orig_mm
+
     out = vlm(
         input_ids=generated_ids,
         attention_mask=(generated_ids != tokenizer.pad_token_id).long(),
         pixel_values=inputs["pixel_values"],
         image_grid_thw=inputs["image_grid_thw"],
+        mm_token_type_ids=mm_token_type_ids,
         output_hidden_states=True,
         use_cache=False,
         return_dict=True,
