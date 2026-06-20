@@ -259,6 +259,7 @@ def main():
     # Test flags
     parser.add_argument("--test-a", action="store_true", help="Run Test A: Answer span generation and token shape [1, N, 2560].")
     parser.add_argument("--test-b", action="store_true", help="Run Test B: Backward pass, gradient flow, and parameter updates.")
+    parser.add_argument("--fixed-batch", action="store_true", help="Extract one fixed batch to verify overfitting (resets seed per step).")
     
     args = parser.parse_args()
 
@@ -290,8 +291,8 @@ def main():
     # 2. Load DROID Dataset
     print(f"Loading DROID dataset from {args.dataset_dir} (num_episodes={args.num_episodes})...")
     num_ep = args.num_episodes if args.num_episodes > 0 else 999999
-    # For Test A & B, we only need 1 episode to extract samples
-    if args.test_a or args.test_b:
+    # For Test A, B or fixed-batch, we only need 1 episode to extract samples
+    if args.test_a or args.test_b or args.fixed_batch:
         num_ep = 1
     dataset = DroidOnlineDataset(args.dataset_dir, num_episodes=num_ep, pred_horizon=cfg.model.pred_horizon)
     
@@ -300,7 +301,7 @@ def main():
     dataloader = DataLoader(
         dataset,
         batch_size=bs,
-        shuffle=not (args.test_a or args.test_b),
+        shuffle=not (args.test_a or args.test_b or args.fixed_batch),
         collate_fn=droid_online_collate_fn
     )
 
@@ -442,6 +443,66 @@ def main():
         return
 
     # ==================== TEST C / FULL SFT TRAINING ====================
+    if args.fixed_batch:
+        print(f"Extracting one fixed batch of size {args.batch_size} from DROID...")
+        raw_batch = next(iter(dataloader))
+        
+        # Extract VLM features once for this fixed batch
+        print("Running VLM forward pass online to extract visual and language tokens...")
+        answer_tokens, answer_mask, decoded_answers = extract_b0_features(
+            raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
+        )
+        print(f"Decoded Answer Plan:\n{decoded_answers[0] if decoded_answers else 'None'}")
+        
+        # Prepare batch with duplicated answer tokens
+        batch = {
+            "state": raw_batch["state"].to(device),
+            "actions": raw_batch["actions"].to(device),
+            "action_time_mask": raw_batch["action_time_mask"].to(device),
+            "action_dim_mask": raw_batch["action_dim_mask"].to(device),
+            "ctrl_freq": raw_batch["ctrl_freq"].to(device),
+            "lang_tokens": answer_tokens,
+            "lang_mask": answer_mask,
+            "img_tokens": answer_tokens,
+            "img_mask": answer_mask,
+        }
+        
+        print(f"\nStarting overfitting loop on this real DROID batch for {args.steps} steps...")
+        initial_loss = None
+        for step in range(args.steps):
+            # Reset RNG so noise added in diffusion is deterministic each step
+            torch.manual_seed(cfg.seed + 999)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(cfg.seed + 999)
+                
+            optimizer.zero_grad(set_to_none=True)
+            metrics = model(batch)
+            loss = metrics["loss"]
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss at step {step}: {loss.item()}")
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in model.parameters() if p.requires_grad),
+                cfg.training.max_grad_norm,
+            )
+            optimizer.step()
+            scheduler.step()
+            
+            value = float(loss.detach().float().cpu())
+            mae = float(metrics['train_target_mae'].detach().float().cpu())
+            if initial_loss is None:
+                initial_loss = value
+                
+            if step % 20 == 0 or step == args.steps - 1:
+                print(f"  step={step:03d} loss={value:.6f} mae={mae:.6f}")
+                
+        print("\nOverfitting finished.")
+        print(f"  initial loss: {initial_loss:.6f}")
+        print(f"  final loss:   {value:.6f}")
+        print(f"  final/initial:{value / max(initial_loss, 1e-5):.4f}")
+        return
+
     print(f"\nStarting online SFT training on all {len(dataset)} windows for {args.steps} steps...")
     step = 0
     dataloader_iter = iter(dataloader)
