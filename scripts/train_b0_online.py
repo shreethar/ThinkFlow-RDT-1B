@@ -375,6 +375,7 @@ def main():
         loss = metrics["loss"]
         print(f"Initial loss: {loss.item():.6f}")
         loss.backward()
+        
         # Set learning rate manually to a non-zero value to bypass the warmup scheduler phase during Test B
         for param_group in optimizer.param_groups:
             param_group["lr"] = 1e-3
@@ -388,20 +389,20 @@ def main():
         fc2_change = (fc2_param - fc2_orig).abs().max().item()
         print(f"DEBUG Step 1: fc2 weight max change = {fc2_change:.6e}")
         
-        # Step 2: Now run the second step to compute gradients on upstream layers
+        # Step 2: Run second optimization step so that lora_B parameters become non-zero
         optimizer.zero_grad(set_to_none=True)
         metrics = model(batch)
         loss = metrics["loss"]
         print(f"Loss after one step: {loss.item():.6f}")
         loss.backward()
+        optimizer.step()
         
-        print("DEBUG Step 2: Gradients of trainable parameters:")
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                grad_norm = param.grad.norm().item() if param.grad is not None else "None"
-                # Print only parameters with non-zero gradient or specifically selected parameters
-                if param.grad is not None and param.grad.norm().item() > 0.0 or "adaptor" in name:
-                    print(f"  {name}: shape={list(param.shape)} grad_norm={grad_norm}")
+        # Step 3: Run third step to verify gradients propagate all the way to lora_A (which depends on non-zero lora_B)
+        optimizer.zero_grad(set_to_none=True)
+        metrics = model(batch)
+        loss = metrics["loss"]
+        print(f"Loss after two steps: {loss.item():.6f}")
+        loss.backward()
         
         # Check gradients
         grad_lang = model.runner.lang_adaptor.weight.grad
@@ -414,8 +415,8 @@ def main():
         
         if lora_params:
             grad_lora = lora_params[0].grad
-            print(f"lora param grad norm: {grad_lora.norm().item() if grad_lora is not None else 'None'}")
-            assert grad_lora is not None and grad_lora.norm().item() > 0.0, "LoRA gradient is zero or None!"
+            print(f"lora_A param grad norm: {grad_lora.norm().item() if grad_lora is not None else 'None'}")
+            assert grad_lora is not None and grad_lora.norm().item() > 0.0, "LoRA A gradient is zero or None!"
             
         torch.nn.utils.clip_grad_norm_(
             (p for p in model.parameters() if p.requires_grad),
