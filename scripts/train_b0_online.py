@@ -375,7 +375,15 @@ def main():
         loss = metrics["loss"]
         print(f"Initial loss: {loss.item():.6f}")
         loss.backward()
+        
+        fc2_param = model.runner.model.final_layer.modules_to_save.default.ffn_final.fc2.weight
+        print(f"DEBUG Step 1: fc2 grad norm = {fc2_param.grad.norm().item() if fc2_param.grad is not None else 'None'}")
+        
+        fc2_orig = fc2_param.clone()
         optimizer.step()
+        
+        fc2_change = (fc2_param - fc2_orig).abs().max().item()
+        print(f"DEBUG Step 1: fc2 weight max change = {fc2_change:.6e}")
         
         # Step 2: Now run the second step to compute gradients on upstream layers
         optimizer.zero_grad(set_to_none=True)
@@ -383,6 +391,14 @@ def main():
         loss = metrics["loss"]
         print(f"Loss after one step: {loss.item():.6f}")
         loss.backward()
+        
+        print("DEBUG Step 2: Gradients of trainable parameters:")
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                grad_norm = param.grad.norm().item() if param.grad is not None else "None"
+                # Print only parameters with non-zero gradient or specifically selected parameters
+                if param.grad is not None and param.grad.norm().item() > 0.0 or "adaptor" in name:
+                    print(f"  {name}: shape={list(param.shape)} grad_norm={grad_norm}")
         
         # Check gradients
         grad_lang = model.runner.lang_adaptor.weight.grad
