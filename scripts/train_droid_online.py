@@ -214,6 +214,8 @@ def main():
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--dataset-dir", default="dataset/droid_100/1.0.0")
+    parser.add_argument("--num-episodes", type=int, default=100, help="Number of episodes to load. Set to -1 to load all.")
+    parser.add_argument("--fixed-batch", action="store_true", help="If set, overfit on a single fixed batch instead of the full dataset.")
     parser.add_argument("--no-pretrained", action="store_true")
     args = parser.parse_args()
 
@@ -240,12 +242,13 @@ def main():
     vlm.requires_grad_(False)
 
     # 2. Load DROID Dataset
-    print(f"Loading DROID dataset from {args.dataset_dir}...")
-    dataset = DroidOnlineDataset(args.dataset_dir, num_episodes=1, pred_horizon=cfg.model.pred_horizon)
+    print(f"Loading DROID dataset from {args.dataset_dir} (num_episodes={args.num_episodes})...")
+    num_ep = args.num_episodes if args.num_episodes > 0 else 999999
+    dataset = DroidOnlineDataset(args.dataset_dir, num_episodes=num_ep, pred_horizon=cfg.model.pred_horizon)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=not args.fixed_batch,
         collate_fn=droid_online_collate_fn
     )
 
@@ -263,69 +266,125 @@ def main():
         num_training_steps=args.steps,
     )
 
-    # 4. Get one fixed batch for verification of overfitting
-    print(f"Extracting one fixed batch of size {args.batch_size} from DROID...")
-    raw_batch = next(iter(dataloader))
+    if args.fixed_batch:
+        # 4. Get one fixed batch for verification of overfitting
+        print(f"Extracting one fixed batch of size {args.batch_size} from DROID...")
+        raw_batch = next(iter(dataloader))
 
-    # Move basic tensors to device
-    batch = {
-        "state": raw_batch["state"].to(device),
-        "actions": raw_batch["actions"].to(device),
-        "action_time_mask": raw_batch["action_time_mask"].to(device),
-        "action_dim_mask": raw_batch["action_dim_mask"].to(device),
-        "ctrl_freq": raw_batch["ctrl_freq"].to(device),
-    }
+        # Move basic tensors to device
+        batch = {
+            "state": raw_batch["state"].to(device),
+            "actions": raw_batch["actions"].to(device),
+            "action_time_mask": raw_batch["action_time_mask"].to(device),
+            "action_dim_mask": raw_batch["action_dim_mask"].to(device),
+            "ctrl_freq": raw_batch["ctrl_freq"].to(device),
+        }
 
-    # Extract VLM features online (once, for this fixed overfitting batch)
-    print("Running VLM forward pass online to extract visual and language tokens...")
-    lang_tokens, lang_mask, img_tokens, img_mask = extract_qwen_features(
-        raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
-    )
-
-    batch["lang_tokens"] = lang_tokens
-    batch["lang_mask"] = lang_mask
-    batch["img_tokens"] = img_tokens
-    batch["img_mask"] = img_mask
-
-    # 5. Overfitting loop
-    print(f"\nStarting overfitting loop on this real DROID batch for {args.steps} steps...")
-    initial_loss = None
-    for step in range(args.steps):
-        # Reset RNG so noise added in diffusion is deterministic each step
-        torch.manual_seed(cfg.seed + 999)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(cfg.seed + 999)
-
-        optimizer.zero_grad(set_to_none=True)
-        metrics = model(batch)
-        loss = metrics["loss"]
-        if not torch.isfinite(loss):
-            raise RuntimeError(f"Non-finite loss at step {step}: {loss.item()}")
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(
-            (p for p in model.parameters() if p.requires_grad),
-            cfg.training.max_grad_norm,
+        # Extract VLM features online (once, for this fixed overfitting batch)
+        print("Running VLM forward pass online to extract visual and language tokens...")
+        lang_tokens, lang_mask, img_tokens, img_mask = extract_qwen_features(
+            raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
         )
-        optimizer.step()
-        scheduler.step()
 
-        value = float(loss.detach().float().cpu())
-        mae = float(metrics['train_target_mae'].detach().float().cpu())
-        if initial_loss is None:
-            initial_loss = value
+        batch["lang_tokens"] = lang_tokens
+        batch["lang_mask"] = lang_mask
+        batch["img_tokens"] = img_tokens
+        batch["img_mask"] = img_mask
+
+        # 5. Overfitting loop
+        print(f"\nStarting overfitting loop on this real DROID batch for {args.steps} steps...")
+        initial_loss = None
+        for step in range(args.steps):
+            # Reset RNG so noise added in diffusion is deterministic each step
+            torch.manual_seed(cfg.seed + 999)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(cfg.seed + 999)
+
+            optimizer.zero_grad(set_to_none=True)
+            metrics = model(batch)
+            loss = metrics["loss"]
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss at step {step}: {loss.item()}")
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in model.parameters() if p.requires_grad),
+                cfg.training.max_grad_norm,
+            )
+            optimizer.step()
+            scheduler.step()
+
+            value = float(loss.detach().float().cpu())
+            mae = float(metrics['train_target_mae'].detach().float().cpu())
+            if initial_loss is None:
+                initial_loss = value
+            
+            if step % 20 == 0 or step == args.steps - 1:
+                print(f"  step={step:03d} loss={value:.6f} mae={mae:.6f}")
+
+        print("\nOverfitting finished.")
+        print(f"  initial loss: {initial_loss:.6f}")
+        print(f"  final loss:   {value:.6f}")
+        print(f"  final/initial:{value / max(initial_loss, 1e-12):.4f}")
+
+        if value >= initial_loss:
+            raise RuntimeError("Overfitting failed: Loss did not decrease.")
+        print("PASS: Online feature extraction and overfitting check passed successfully on real DROID data.")
+    else:
+        # Full training loop
+        print(f"\nStarting online SFT training on all {len(dataset)} windows for {args.steps} steps...")
+        step = 0
+        dataloader_iter = iter(dataloader)
         
-        if step % 20 == 0 or step == args.steps - 1:
-            print(f"  step={step:03d} loss={value:.6f} mae={mae:.6f}")
+        while step < args.steps:
+            try:
+                raw_batch = next(dataloader_iter)
+            except StopIteration:
+                dataloader_iter = iter(dataloader)
+                raw_batch = next(dataloader_iter)
+                
+            # Move basic tensors to device
+            batch = {
+                "state": raw_batch["state"].to(device),
+                "actions": raw_batch["actions"].to(device),
+                "action_time_mask": raw_batch["action_time_mask"].to(device),
+                "action_dim_mask": raw_batch["action_dim_mask"].to(device),
+                "ctrl_freq": raw_batch["ctrl_freq"].to(device),
+            }
+            
+            # Extract Qwen features online for this batch
+            lang_tokens, lang_mask, img_tokens, img_mask = extract_qwen_features(
+                raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
+            )
+            
+            batch["lang_tokens"] = lang_tokens
+            batch["lang_mask"] = lang_mask
+            batch["img_tokens"] = img_tokens
+            batch["img_mask"] = img_mask
+            
+            optimizer.zero_grad(set_to_none=True)
+            metrics = model(batch)
+            loss = metrics["loss"]
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss at step {step}: {loss.item()}")
+            loss.backward()
 
-    print("\nOverfitting finished.")
-    print(f"  initial loss: {initial_loss:.6f}")
-    print(f"  final loss:   {value:.6f}")
-    print(f"  final/initial:{value / max(initial_loss, 1e-12):.4f}")
+            torch.nn.utils.clip_grad_norm_(
+                (p for p in model.parameters() if p.requires_grad),
+                cfg.training.max_grad_norm,
+            )
+            optimizer.step()
+            scheduler.step()
 
-    if value >= initial_loss:
-        raise RuntimeError("Overfitting failed: Loss did not decrease.")
-    print("PASS: Online feature extraction and overfitting check passed successfully on real DROID data.")
+            value = float(loss.detach().float().cpu())
+            mae = float(metrics['train_target_mae'].detach().float().cpu())
+            
+            if step % 10 == 0 or step == args.steps - 1:
+                print(f"  step={step:04d} loss={value:.6f} mae={mae:.6f}")
+                
+            step += 1
+            
+        print(f"\nTraining on all {len(dataset)} windows finished successfully.")
 
 
 if __name__ == "__main__":
