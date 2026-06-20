@@ -375,6 +375,15 @@ def main():
         print(f"Initial loss: {loss.item():.6f}")
         loss.backward()
         
+        print(f"DEBUG: batch['lang_mask'] sum={batch['lang_mask'].sum().item()}")
+        print(f"DEBUG: batch['img_mask'] sum={batch['img_mask'].sum().item()}")
+        
+        print("DEBUG: Trainable parameters and their gradients:")
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                grad_norm = param.grad.norm().item() if param.grad is not None else "None"
+                print(f"  {name}: shape={list(param.shape)} grad_norm={grad_norm}")
+        
         # Check gradients
         grad_lang = model.runner.lang_adaptor.weight.grad
         grad_img = model.runner.img_adaptor.weight.grad
