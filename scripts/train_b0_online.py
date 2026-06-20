@@ -167,6 +167,7 @@ def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device="cuda
     )
     
     # 3. Re-run full generated sequence to get hidden states
+    B = generated_ids.shape[0]
     prompt_len = inputs["input_ids"].shape[1]
     new_len = generated_ids.shape[1]
     orig_mm = inputs["mm_token_type_ids"]
