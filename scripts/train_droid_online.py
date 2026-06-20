@@ -194,11 +194,25 @@ def extract_qwen_features(batch, processor, vlm, max_lang_tokens=128, device="cu
         vision_end_indices = torch.where(input_ids == vision_end_token_id)[0]
         instruction_start_idx = vision_end_indices[-1].item() + 1
         
-        im_end_indices = torch.where(input_ids == im_end_token_id)[0]
-        valid_im_ends = im_end_indices[im_end_indices > instruction_start_idx]
-        instruction_end_idx = valid_im_ends[0].item()
+        im_start_token_id = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
+        pad_token_id = processor.tokenizer.pad_token_id
+        eos_token_id = processor.tokenizer.eos_token_id
         
-        lang_indices = torch.arange(instruction_start_idx, instruction_end_idx)
+        cand_indices = torch.arange(instruction_start_idx, len(input_ids))
+        cand_tokens = input_ids[cand_indices]
+        
+        stop_tokens = {t for t in [im_start_token_id, im_end_token_id, pad_token_id, eos_token_id] if t is not None}
+        stop_idx = len(cand_indices)
+        for idx, tok in enumerate(cand_tokens.tolist()):
+            if tok in stop_tokens:
+                stop_idx = idx
+                break
+        
+        lang_indices = cand_indices[:stop_idx]
+        if len(lang_indices) == 0:
+            # Fallback to at least 1 token (e.g. instruction_start_idx)
+            lang_indices = torch.tensor([instruction_start_idx], dtype=torch.long, device=device)
+            
         lang_tokens = hidden[lang_indices]
         
         num_lang = min(len(lang_indices), max_lang_tokens)
