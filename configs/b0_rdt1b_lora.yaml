@@ -8,6 +8,7 @@ model:
   state_dim: 7
   pred_horizon: 64
   qwen_hidden_size: 2560
+  qwen_kv_dim: 1024
   max_lang_tokens: 128
   image_tokens: 128
   hidden_size: 2048
