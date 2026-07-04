@@ -326,8 +326,7 @@ def main():
         raw_batch = next(iter(dataloader))
         
         # Save initial weights
-        lang_adaptor_weight_orig = model.runner.lang_adaptor.weight.clone()
-        img_adaptor_weight_orig = model.runner.img_adaptor.weight.clone()
+        qwen_adaptor_weight_orig = model.qwen_adaptor.weight.clone()
         
         # Get trainable parameters lists
         lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "lora_" in n]
@@ -397,13 +396,10 @@ def main():
         loss.backward()
         
         # Check gradients
-        grad_lang = model.runner.lang_adaptor.weight.grad
-        grad_img = model.runner.img_adaptor.weight.grad
-        print(f"lang_adaptor grad norm: {grad_lang.norm().item() if grad_lang is not None else 'None'}")
-        print(f"img_adaptor grad norm: {grad_img.norm().item() if grad_img is not None else 'None'}")
+        grad_qwen = model.qwen_adaptor.weight.grad
+        print(f"qwen_adaptor grad norm: {grad_qwen.norm().item() if grad_qwen is not None else 'None'}")
         
-        assert grad_lang is not None and grad_lang.norm().item() > 0.0, "lang_adaptor gradient is zero or None!"
-        assert grad_img is not None and grad_img.norm().item() > 0.0, "img_adaptor gradient is zero or None!"
+        assert grad_qwen is not None and grad_qwen.norm().item() > 0.0, "qwen_adaptor gradient is zero or None!"
         
         if lora_params:
             grad_lora = lora_params[0].grad
@@ -417,13 +413,10 @@ def main():
         optimizer.step()
         
         # Verify weights updated
-        diff_lang = (model.runner.lang_adaptor.weight - lang_adaptor_weight_orig).abs().max().item()
-        diff_img = (model.runner.img_adaptor.weight - img_adaptor_weight_orig).abs().max().item()
-        print(f"lang_adaptor weight max change: {diff_lang:.6e}")
-        print(f"img_adaptor weight max change: {diff_img:.6e}")
+        diff_qwen = (model.qwen_adaptor.weight - qwen_adaptor_weight_orig).abs().max().item()
+        print(f"qwen_adaptor weight max change: {diff_qwen:.6e}")
         
-        assert diff_lang > 0.0, "lang_adaptor weights did not change!"
-        assert diff_img > 0.0, "img_adaptor weights did not change!"
+        assert diff_qwen > 0.0, "qwen_adaptor weights did not change!"
         
         if lora_weight_orig is not None:
             diff_lora = (lora_params[0] - lora_weight_orig).abs().max().item()
