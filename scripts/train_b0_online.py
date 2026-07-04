@@ -356,7 +356,7 @@ def main():
             "ctrl_freq": raw_batch["ctrl_freq"].to(device),
             "lang_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
             "lang_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 1152, device=device),
+            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
             "img_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
             "qwen_kv": qwen_kv,
         }
@@ -452,7 +452,7 @@ def main():
             "ctrl_freq": raw_batch["ctrl_freq"].to(device),
             "lang_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
             "lang_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 1152, device=device),
+            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
             "img_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
             "qwen_kv": qwen_kv,
         }
@@ -518,7 +518,7 @@ def main():
             "ctrl_freq": raw_batch["ctrl_freq"].to(device),
             "lang_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
             "lang_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 1152, device=device),
+            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
             "img_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
             "qwen_kv": qwen_kv,
         }
