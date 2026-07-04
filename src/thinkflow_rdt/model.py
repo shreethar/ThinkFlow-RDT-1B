@@ -114,6 +114,8 @@ class SFTConditionedRDT(nn.Module):
         RDTRunner = import_rdt_runner(cfg.rdt_repo)
         dtype = resolve_dtype(cfg.model.dtype)
         self.compute_dtype = dtype
+        self.horizon = cfg.model.pred_horizon
+        self.qwen_adaptor = nn.Linear(cfg.model.qwen_kv_dim, cfg.model.hidden_size, dtype=dtype)
         runner_config = {
             "lang_adaptor": cfg.model.lang_adaptor,
             "img_adaptor": cfg.model.img_adaptor,
@@ -164,6 +166,7 @@ class SFTConditionedRDT(nn.Module):
         self.runner.lang_adaptor.to(dtype=dtype).requires_grad_(True)
         self.runner.img_adaptor.to(dtype=dtype).requires_grad_(True)
         self.runner.state_adaptor.to(dtype=dtype).requires_grad_(True)
+        self.qwen_adaptor.requires_grad_(True)
 
     @property
     def model_dtype(self) -> torch.dtype:
@@ -189,6 +192,7 @@ class SFTConditionedRDT(nn.Module):
         float_keys = {
             "lang_tokens",
             "img_tokens",
+            "qwen_kv",
             "state",
             "actions",
             "action_dim_mask",
@@ -235,14 +239,23 @@ class SFTConditionedRDT(nn.Module):
         lang_cond, img_cond, state_action_cond = self.runner.adapt_conditions(
             lang_tokens, img_tokens, state_action
         )
+        
+        # Replace language and image condition streams entirely with Qwen token
+        qwen_c = self.qwen_adaptor(batch["qwen_kv"])
+        lang_cond = qwen_c
+        img_cond = qwen_c
+        
+        # Update the masks since the sequence length is now 1
+        qwen_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=lang_mask.device)
+        
         prediction = self.runner.model(
             state_action_cond,
             ctrl_freq,
             timesteps,
             lang_cond,
             img_cond,
-            lang_mask=lang_mask,
-            img_mask=img_mask,
+            lang_mask=qwen_mask,
+            img_mask=qwen_mask,
         )
 
         if self.runner.prediction_type == "sample":
