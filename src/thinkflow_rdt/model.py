@@ -112,6 +112,19 @@ class SFTConditionedRDT(nn.Module):
         super().__init__()
         self.cfg = cfg
         RDTRunner = import_rdt_runner(cfg.rdt_repo)
+        
+        # Monkey patch RDTRunner's parent class _from_pretrained method dynamically
+        from models.hub_mixin import CompatiblePyTorchModelHubMixin
+        if not hasattr(CompatiblePyTorchModelHubMixin, "_monkeypatched"):
+            original_from_pretrained = CompatiblePyTorchModelHubMixin._from_pretrained
+            @classmethod
+            def safe_from_pretrained(cls, *args, **kwargs):
+                kwargs.pop("proxies", None)
+                kwargs.pop("resume_download", None)
+                return original_from_pretrained.__get__(cls, type(cls))(*args, **kwargs)
+            CompatiblePyTorchModelHubMixin._from_pretrained = safe_from_pretrained
+            CompatiblePyTorchModelHubMixin._monkeypatched = True
+
         dtype = resolve_dtype(cfg.model.dtype)
         self.compute_dtype = dtype
         self.horizon = cfg.model.pred_horizon
