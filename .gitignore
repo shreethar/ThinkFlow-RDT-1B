@@ -4,3 +4,7 @@ src/thinkflow_rdt.egg-info/*
 src/thinkflow_rdt.egg-info/requires.txt
 src/thinkflow_rdt.egg-info/PKG-INFO
 features.json
+
+src/thinkflow_rdt/__pycache__
+
+dataset/mock_dataset
