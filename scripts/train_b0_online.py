@@ -184,9 +184,12 @@ def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device="cuda
     if isinstance(past_key_values, tuple):
         K = past_key_values[7][0]
         V = past_key_values[7][1]
-    else:
+    elif hasattr(past_key_values, "key_cache"):
         K = past_key_values.key_cache[7]
         V = past_key_values.value_cache[7]
+    else:
+        K = past_key_values.layers[7].keys
+        V = past_key_values.layers[7].values
         
     think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
     
