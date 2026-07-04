@@ -27,6 +27,16 @@ class DroidOnlineDataset(Dataset):
         except Exception as e:
             print(f"Warning: Could not disable TensorFlow GPU: {e}")
         import tensorflow_datasets as tfds
+        
+        # Download dataset if it doesn't exist locally
+        if not os.path.exists(dataset_dir) or not os.listdir(dataset_dir):
+            print(f"Dataset not found at {dataset_dir}. Downloading from Hugging Face...")
+            from huggingface_hub import snapshot_download
+            # Assuming the repo ID used in upload_dataset.py
+            repo_id = "shreethar/droid_100_tfds" 
+            snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=dataset_dir)
+            print("Download complete!")
+            
         # Build dataset from local directory
         builder = tfds.builder_from_directory(dataset_dir)
         ds = builder.as_dataset(split="train")
