@@ -309,14 +309,14 @@ def main():
         raw_batch = next(iter(dataloader))
         print(f"Instruction: {raw_batch['instructions'][0]}")
         
-        answer_tokens, answer_mask, decoded_answers = extract_b0_features(
+        qwen_kv, decoded_answers = extract_b0_features(
             raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
         )
         
         print(f"Decoded Answer Plan:\n{decoded_answers[0]}")
-        print(f"Extracted Hidden States Shape: {answer_tokens.shape}")
+        print(f"Extracted KV Cache Shape: {qwen_kv.shape}")
         
-        assert answer_tokens.shape == (1, cfg.model.max_lang_tokens, 2560), f"Expected shape (1, {cfg.model.max_lang_tokens}, 2560), got {answer_tokens.shape}"
+        assert qwen_kv.shape == (1, 1, cfg.model.qwen_kv_dim), f"Expected shape (1, 1, {cfg.model.qwen_kv_dim}), got {qwen_kv.shape}"
         print("TEST A PASSED SUCCESSFULLY!")
         return
 
