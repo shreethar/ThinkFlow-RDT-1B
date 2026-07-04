@@ -32,9 +32,10 @@ class DroidOnlineDataset(Dataset):
         if not os.path.exists(dataset_dir) or not os.listdir(dataset_dir):
             print(f"Dataset not found at {dataset_dir}. Downloading from Hugging Face...")
             from huggingface_hub import snapshot_download
-            # Assuming the repo ID used in upload_dataset.py
             repo_id = "shreethar/droid_100_tfds" 
-            snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=dataset_dir)
+            # We download to dataset/droid_100 because the repo contains the 1.0.0 folder
+            parent_dir = os.path.dirname(dataset_dir)
+            snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=parent_dir)
             print("Download complete!")
             
         # Build dataset from local directory
