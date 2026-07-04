@@ -151,51 +151,35 @@ def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device="cuda
     )
     inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
     
-    # 2. Generate answer tokens
+    # 2. Generate answer tokens and extract KV cache
     tokenizer = processor.tokenizer
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     
-    generated_ids = vlm.generate(
+    out = vlm.generate(
         **inputs,
         max_new_tokens=128,
         do_sample=False,
         temperature=None,
         top_p=None,
         use_cache=True,
+        return_dict_in_generate=True,
         eos_token_id=im_end_id,
         pad_token_id=tokenizer.pad_token_id,
     )
     
-    # 3. Re-run full generated sequence to get hidden states
-    B = generated_ids.shape[0]
-    prompt_len = inputs["input_ids"].shape[1]
-    new_len = generated_ids.shape[1]
-    orig_mm = inputs["mm_token_type_ids"]
-    pad_len = new_len - prompt_len
-    if pad_len > 0:
-        pad_zeros = torch.zeros(B, pad_len, dtype=orig_mm.dtype, device=orig_mm.device)
-        mm_token_type_ids = torch.cat([orig_mm, pad_zeros], dim=1)
+    generated_ids = out.sequences
+    past_key_values = out.past_key_values
+    
+    if isinstance(past_key_values, tuple):
+        K = past_key_values[7][0]
+        V = past_key_values[7][1]
     else:
-        mm_token_type_ids = orig_mm
-
-    out = vlm(
-        input_ids=generated_ids,
-        attention_mask=(generated_ids != tokenizer.pad_token_id).long(),
-        pixel_values=inputs["pixel_values"],
-        image_grid_thw=inputs["image_grid_thw"],
-        mm_token_type_ids=mm_token_type_ids,
-        output_hidden_states=True,
-        use_cache=False,
-        return_dict=True,
-    )
-    
-    hidden = out.hidden_states[24] # [B, L_total, 2560]
-    
-    # 4. Locate answer span
+        K = past_key_values.key_cache[7]
+        V = past_key_values.value_cache[7]
+        
     think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
     
-    answer_tokens_list = []
-    answer_masks_list = []
+    qwen_kv_list = []
     decoded_answers = []
     
     B = generated_ids.shape[0]
@@ -203,48 +187,34 @@ def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device="cuda
         ids = generated_ids[b]
         
         think_end_pos = find_subsequence(ids, think_end_ids)
-        im_end_positions = torch.where(ids == im_end_id)[0]
         
-        if len(im_end_positions) > 0:
-            end = im_end_positions[-1].item()
-        else:
-            end = len(ids)
-            
         if think_end_pos != -1:
-            start = think_end_pos
+            target_idx = think_end_pos - 1
         else:
-            prompt_len = inputs["attention_mask"][b].sum().item()
-            start = prompt_len
-            
-        if start >= end:
-            start = max(inputs["input_ids"].shape[1], end - 1)
-            
-        # Decode the answer
-        decoded_ans = tokenizer.decode(ids[start:end], skip_special_tokens=True)
+            im_end_positions = torch.where(ids == im_end_id)[0]
+            if len(im_end_positions) > 0:
+                target_idx = im_end_positions[-1].item() - 1
+            else:
+                target_idx = len(ids) - 1
+                
+        # Extract KV at target_idx
+        k_vec = K[b, :, target_idx, :] # [num_kv_heads, head_dim]
+        v_vec = V[b, :, target_idx, :] # [num_kv_heads, head_dim]
+        
+        # Flatten and concat
+        k_flat = k_vec.reshape(-1)
+        v_flat = v_vec.reshape(-1)
+        kv_concat = torch.cat([k_flat, v_flat], dim=-1) # [num_kv_heads * head_dim * 2]
+        
+        qwen_kv_list.append(kv_concat.unsqueeze(0))
+        
+        prompt_len = inputs["attention_mask"][b].sum().item()
+        decoded_ans = tokenizer.decode(ids[prompt_len:], skip_special_tokens=True)
         decoded_answers.append(decoded_ans)
         
-        x = hidden[b, start:end] # [N, 2560]
-        
-        # Pad or truncate to max_lang_tokens (128)
-        N = x.shape[0]
-        if N > max_lang_tokens:
-            x = x[:max_lang_tokens]
-            mask = torch.ones(max_lang_tokens, dtype=torch.bool, device=device)
-        else:
-            pad_len = max_lang_tokens - N
-            if pad_len > 0:
-                pad_tensor = torch.zeros(pad_len, 2560, dtype=x.dtype, device=device)
-                x = torch.cat([x, pad_tensor], dim=0)
-            mask = torch.zeros(max_lang_tokens, dtype=torch.bool, device=device)
-            mask[:N] = True
-            
-        answer_tokens_list.append(x)
-        answer_masks_list.append(mask)
-        
-    answer_tokens = torch.stack(answer_tokens_list, dim=0)
-    answer_mask = torch.stack(answer_masks_list, dim=0)
+    qwen_kv = torch.stack(qwen_kv_list, dim=0).to(torch.bfloat16) # [B, 1, 1024]
     
-    return answer_tokens, answer_mask, decoded_answers
+    return qwen_kv, decoded_answers
 
 
 def main():
@@ -351,23 +321,30 @@ def main():
             lora_weight_orig = lora_params[0].clone()
         else:
             lora_weight_orig = None
-            
+                    # Extract Qwen features online
         print("Extracting B0 features...")
-        answer_tokens, answer_mask, decoded_answers = extract_b0_features(
+        qwen_kv, decoded_answers = extract_b0_features(
             raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
         )
+        print(f"Decoded Answer Plan:\n{decoded_answers[0] if decoded_answers else 'None'}")
         
-        # Prepare batch with duplicated answer tokens to both lang and img context
+        if args.test_a:
+            print(f"Extracted KV Cache Shape: {qwen_kv.shape}")
+            print("TEST A PASSED SUCCESSFULLY!")
+            return
+            
+        # Prepare batch with new qwen_kv
         batch = {
             "state": raw_batch["state"].to(device),
             "actions": raw_batch["actions"].to(device),
             "action_time_mask": raw_batch["action_time_mask"].to(device),
             "action_dim_mask": raw_batch["action_dim_mask"].to(device),
             "ctrl_freq": raw_batch["ctrl_freq"].to(device),
-            "lang_tokens": answer_tokens,
-            "lang_mask": answer_mask,
-            "img_tokens": answer_tokens,
-            "img_mask": answer_mask,
+            "lang_tokens": torch.zeros(bs, 1, 4096, device=device),
+            "lang_mask": torch.ones(bs, 1, dtype=torch.bool, device=device),
+            "img_tokens": torch.zeros(bs, 1, 1152, device=device),
+            "img_mask": torch.ones(bs, 1, dtype=torch.bool, device=device),
+            "qwen_kv": qwen_kv,
         }
         
         # Step 1: Run one optimization step so that ffn_final.fc2.weight becomes non-zero
@@ -447,24 +424,23 @@ def main():
         print(f"Extracting one fixed batch of size {args.batch_size} from DROID...")
         raw_batch = next(iter(dataloader))
         
-        # Extract VLM features once for this fixed batch
-        print("Running VLM forward pass online to extract visual and language tokens...")
-        answer_tokens, answer_mask, decoded_answers = extract_b0_features(
+        # Extract Qwen features online for this batch
+        qwen_kv, decoded_answers = extract_b0_features(
             raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
         )
-        print(f"Decoded Answer Plan:\n{decoded_answers[0] if decoded_answers else 'None'}")
         
-        # Prepare batch with duplicated answer tokens
+        # Prepare batch with new qwen_kv
         batch = {
             "state": raw_batch["state"].to(device),
             "actions": raw_batch["actions"].to(device),
             "action_time_mask": raw_batch["action_time_mask"].to(device),
             "action_dim_mask": raw_batch["action_dim_mask"].to(device),
             "ctrl_freq": raw_batch["ctrl_freq"].to(device),
-            "lang_tokens": answer_tokens,
-            "lang_mask": answer_mask,
-            "img_tokens": answer_tokens,
-            "img_mask": answer_mask,
+            "lang_tokens": torch.zeros(bs, 1, 4096, device=device),
+            "lang_mask": torch.ones(bs, 1, dtype=torch.bool, device=device),
+            "img_tokens": torch.zeros(bs, 1, 1152, device=device),
+            "img_mask": torch.ones(bs, 1, dtype=torch.bool, device=device),
+            "qwen_kv": qwen_kv,
         }
         
         print(f"\nStarting overfitting loop on this real DROID batch for {args.steps} steps...")
@@ -515,21 +491,22 @@ def main():
             raw_batch = next(dataloader_iter)
             
         # Extract Qwen features online for this batch
-        answer_tokens, answer_mask, _ = extract_b0_features(
+        qwen_kv, _ = extract_b0_features(
             raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
         )
         
-        # Prepare batch with duplicated answer tokens
+        # Prepare batch with new qwen_kv
         batch = {
             "state": raw_batch["state"].to(device),
             "actions": raw_batch["actions"].to(device),
             "action_time_mask": raw_batch["action_time_mask"].to(device),
             "action_dim_mask": raw_batch["action_dim_mask"].to(device),
             "ctrl_freq": raw_batch["ctrl_freq"].to(device),
-            "lang_tokens": answer_tokens,
-            "lang_mask": answer_mask,
-            "img_tokens": answer_tokens,
-            "img_mask": answer_mask,
+            "lang_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 4096, device=device),
+            "lang_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
+            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 1152, device=device),
+            "img_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
+            "qwen_kv": qwen_kv,
         }
         
         optimizer.zero_grad(set_to_none=True)
