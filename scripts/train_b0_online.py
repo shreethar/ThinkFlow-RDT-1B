@@ -2,6 +2,7 @@
 import argparse
 import os
 import sys
+import time
 import numpy as np
 from PIL import Image
 import torch
@@ -434,6 +435,8 @@ def main():
         print(f"\nStarting overfitting loop on this real DROID batch for {args.steps} steps...")
         initial_loss = None
         for step in range(args.steps):
+            start_t = time.time()
+            
             # Extract Qwen features online for this batch
             qwen_kv, decoded_answers = extract_b0_features(
                 raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
@@ -477,8 +480,9 @@ def main():
             if initial_loss is None:
                 initial_loss = value
                 
+            end_t = time.time()
             if step % 20 == 0 or step == args.steps - 1:
-                print(f"  step={step:03d} loss={value:.6f} mae={mae:.6f}")
+                print(f"  step={step:03d} loss={value:.6f} mae={mae:.6f} time={end_t - start_t:.2f}s")
                 
         print("\nOverfitting finished.")
         print(f"  initial loss: {initial_loss:.6f}")
@@ -491,6 +495,7 @@ def main():
     dataloader_iter = iter(dataloader)
     
     while step < args.steps:
+        start_t = time.time()
         try:
             raw_batch = next(dataloader_iter)
         except StopIteration:
@@ -533,8 +538,9 @@ def main():
         value = float(loss.detach().float().cpu())
         mae = float(metrics['train_target_mae'].detach().float().cpu())
         
+        end_t = time.time()
         if step % 10 == 0 or step == args.steps - 1:
-            print(f"  step={step:04d} loss={value:.6f} mae={mae:.6f}")
+            print(f"  step={step:04d} loss={value:.6f} mae={mae:.6f} time={end_t - start_t:.2f}s")
             
         step += 1
         
