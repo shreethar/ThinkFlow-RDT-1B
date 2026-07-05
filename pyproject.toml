@@ -22,7 +22,6 @@ dependencies = [
   "timm>=0.9",
   "tqdm>=4.66",
   "transformers>=4.44",
-  "protobuf<5.0.0",
   "wandb>=0.17",
 ]
 
