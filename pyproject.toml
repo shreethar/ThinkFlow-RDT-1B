@@ -23,6 +23,7 @@ dependencies = [
   "tqdm>=4.66",
   "transformers>=4.44",
   "wandb>=0.17",
+  "protobuf>=5.26.0",
 ]
 
 [tool.setuptools.packages.find]
