@@ -431,28 +431,28 @@ def main():
         print(f"Extracting one fixed batch of size {args.batch_size} from DROID...")
         raw_batch = next(iter(dataloader))
         
-        # Extract Qwen features online for this batch
-        qwen_kv, decoded_answers = extract_b0_features(
-            raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
-        )
-        
-        # Prepare batch with new qwen_kv
-        batch = {
-            "state": raw_batch["state"].to(device),
-            "actions": raw_batch["actions"].to(device),
-            "action_time_mask": raw_batch["action_time_mask"].to(device),
-            "action_dim_mask": raw_batch["action_dim_mask"].to(device),
-            "ctrl_freq": raw_batch["ctrl_freq"].to(device),
-            "lang_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
-            "lang_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
-            "img_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-            "qwen_kv": qwen_kv,
-        }
-        
         print(f"\nStarting overfitting loop on this real DROID batch for {args.steps} steps...")
         initial_loss = None
         for step in range(args.steps):
+            # Extract Qwen features online for this batch
+            qwen_kv, decoded_answers = extract_b0_features(
+                raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
+            )
+            
+            # Prepare batch with new qwen_kv
+            batch = {
+                "state": raw_batch["state"].to(device),
+                "actions": raw_batch["actions"].to(device),
+                "action_time_mask": raw_batch["action_time_mask"].to(device),
+                "action_dim_mask": raw_batch["action_dim_mask"].to(device),
+                "ctrl_freq": raw_batch["ctrl_freq"].to(device),
+                "lang_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
+                "lang_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
+                "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
+                "img_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
+                "qwen_kv": qwen_kv,
+            }
+
             # Reset RNG so noise added in diffusion is deterministic each step
             torch.manual_seed(cfg.seed + 999)
             if torch.cuda.is_available():
