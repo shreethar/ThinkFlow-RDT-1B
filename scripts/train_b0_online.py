@@ -506,6 +506,14 @@ def main():
         print(f"  initial loss: {initial_loss:.6f}")
         print(f"  final loss:   {value:.6f}")
         print(f"  final/initial:{value / max(initial_loss, 1e-5):.4f}")
+        
+        # Save the overfitted weights so we can evaluate them
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        save_path = os.path.join(cfg.output_dir, "model.pt")
+        print(f"Saving overfitted weights to {save_path}...")
+        trainable_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+        torch.save(trainable_state_dict, save_path)
+        print("Overfitted model saved successfully! Run evaluate_rdt.py to see it!")
         return
 
     print(f"\nStarting online SFT training on all {len(dataset)} windows for {args.steps} steps...")
