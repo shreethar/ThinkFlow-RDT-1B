@@ -55,7 +55,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
         
-    baseline_traj = model.sample_actions(batch)[0].cpu().numpy() # [64, 7]
+    baseline_traj = model.sample_actions(batch)[0].float().cpu().numpy() # [64, 7]
 
     # 3. Load Trained Model
     print(f"Loading trained weights from {args.model_path}...")
@@ -70,8 +70,8 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
         
-    trained_traj = model.sample_actions(batch)[0].cpu().numpy() # [64, 7]
-    gt_traj = batch["actions"][0].cpu().numpy() # [64, 7]
+    trained_traj = model.sample_actions(batch)[0].float().cpu().numpy() # [64, 7]
+    gt_traj = batch["actions"][0].float().cpu().numpy() # [64, 7]
 
     # 4. Plot Comparison
     print(f"Plotting results to {args.output}...")
