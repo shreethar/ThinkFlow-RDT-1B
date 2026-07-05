@@ -17,8 +17,12 @@ from thinkflow_rdt.train import create_optimizer, seed_everything
 
 
 class DroidOnlineDataset(Dataset):
-    def __init__(self, dataset_dir, num_episodes=100, pred_horizon=64):
+    def __init__(self, dataset_dir, num_episodes=100, pred_horizon=64, precomputed_path=None):
         self.pred_horizon = pred_horizon
+        self.precomputed_kvs = None
+        if precomputed_path and os.path.exists(precomputed_path):
+            print(f"Loading precomputed Qwen KV features from {precomputed_path}...")
+            self.precomputed_kvs = torch.load(precomputed_path)
         
         print("Loading tensorflow_datasets...")
         import tensorflow as tf
@@ -99,7 +103,10 @@ class DroidOnlineDataset(Dataset):
         return len(self.samples)
         
     def __getitem__(self, index):
-        return self.samples[index]
+        sample = self.samples[index].copy()
+        if self.precomputed_kvs is not None:
+            sample["qwen_kv"] = self.precomputed_kvs[index]
+        return sample
 
 
 def droid_online_collate_fn(samples):
@@ -113,6 +120,10 @@ def droid_online_collate_fn(samples):
         "action_dim_mask": torch.ones(len(samples), 7, dtype=torch.float32),
         "ctrl_freq": torch.tensor([s["ctrl_freq"] for s in samples], dtype=torch.float32),
     }
+    
+    if "qwen_kv" in samples[0]:
+        batch["qwen_kv"] = torch.stack([s["qwen_kv"] for s in samples], dim=0)
+        
     return batch
 
 
@@ -240,6 +251,7 @@ def main():
     parser.add_argument("--dataset-dir", default="dataset/droid_100/1.0.0")
     parser.add_argument("--num-episodes", type=int, default=100)
     parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--precomputed-path", type=str, default="", help="Path to precomputed Qwen KV tensor.")
     
     # Test flags
     parser.add_argument("--test-a", action="store_true", help="Run Test A: Answer span generation and token shape [1, N, 2560].")
@@ -258,28 +270,31 @@ def main():
     print(f"Using device: {device}")
 
     # 1. Load VLM
-    vlm_model_id = "shreethar/stage1_unsloth"
-    print(f"Loading VLM from {vlm_model_id}...")
-    processor = AutoProcessor.from_pretrained(vlm_model_id)
-    # Ensure left-padding is used for LLM generation
-    processor.tokenizer.padding_side = "left"
-    
-    vlm = AutoModelForImageTextToText.from_pretrained(
-        vlm_model_id,
-        dtype=torch.bfloat16,
-        device_map="cuda" if torch.cuda.is_available() else "cpu",
-        attn_implementation="sdpa"
-    )
-    vlm.eval()
-    vlm.requires_grad_(False)
+    if not args.precomputed_path:
+        vlm_model_id = "shreethar/stage1_unsloth"
+        print(f"Loading VLM from {vlm_model_id}...")
+        processor = AutoProcessor.from_pretrained(vlm_model_id)
+        # Ensure left-padding is used for LLM generation
+        processor.tokenizer.padding_side = "left"
+        
+        vlm = AutoModelForImageTextToText.from_pretrained(
+            vlm_model_id,
+            dtype=torch.bfloat16,
+            device_map="cuda" if torch.cuda.is_available() else "cpu",
+            attn_implementation="sdpa"
+        )
+        vlm.eval()
+        vlm.requires_grad_(False)
+    else:
+        print("Using precomputed features. Skipping VLM initialization!")
+        processor, vlm = None, None
 
     # 2. Load DROID Dataset
     print(f"Loading DROID dataset from {args.dataset_dir} (num_episodes={args.num_episodes})...")
     num_ep = args.num_episodes if args.num_episodes > 0 else 999999
     # For Test A, B or fixed-batch, we only need 1 episode to extract samples
-    if args.test_a or args.test_b or args.fixed_batch:
-        num_ep = 1
-    dataset = DroidOnlineDataset(args.dataset_dir, num_episodes=num_ep, pred_horizon=cfg.model.pred_horizon)
+    print(f"Loading DROID dataset from {args.dataset_dir} (num_episodes={num_ep})...")
+    dataset = DroidOnlineDataset(args.dataset_dir, num_episodes=num_ep, pred_horizon=cfg.model.pred_horizon, precomputed_path=args.precomputed_path)
     
     # Set batch size to 1 for Test A & B
     bs = 1 if (args.test_a or args.test_b) else args.batch_size
@@ -437,10 +452,13 @@ def main():
         for step in range(args.steps):
             start_t = time.time()
             
-            # Extract Qwen features online for this batch
-            qwen_kv, decoded_answers = extract_b0_features(
-                raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
-            )
+            # Use precomputed features if available, otherwise extract online
+            if "qwen_kv" in raw_batch:
+                qwen_kv = raw_batch["qwen_kv"].to(device)
+            else:
+                qwen_kv, decoded_answers = extract_b0_features(
+                    raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
+                )
             
             # Prepare batch with new qwen_kv
             batch = {
@@ -502,10 +520,13 @@ def main():
             dataloader_iter = iter(dataloader)
             raw_batch = next(dataloader_iter)
             
-        # Extract Qwen features online for this batch
-        qwen_kv, _ = extract_b0_features(
-            raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
-        )
+        # Use precomputed features if available, otherwise extract online
+        if "qwen_kv" in raw_batch:
+            qwen_kv = raw_batch["qwen_kv"].to(device)
+        else:
+            qwen_kv, _ = extract_b0_features(
+                raw_batch, processor, vlm, max_lang_tokens=cfg.model.max_lang_tokens, device=device
+            )
         
         # Prepare batch with new qwen_kv
         batch = {
