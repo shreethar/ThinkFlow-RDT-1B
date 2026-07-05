@@ -511,7 +511,8 @@ def main():
         os.makedirs(cfg.output_dir, exist_ok=True)
         save_path = os.path.join(cfg.output_dir, "model.pt")
         print(f"Saving overfitted weights to {save_path}...")
-        trainable_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+        trainable_keys = [k for k, v in model.named_parameters() if v.requires_grad]
+        trainable_state_dict = {k: v for k, v in model.state_dict().items() if k in trainable_keys}
         torch.save(trainable_state_dict, save_path)
         print("Overfitted model saved successfully! Run evaluate_rdt.py to see it!")
         return
@@ -581,7 +582,8 @@ def main():
     print(f"Saving trained weights to {save_path}...")
     
     # Extract only parameters that require gradients (LoRA + Qwen Adaptor)
-    trainable_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+    trainable_keys = [k for k, v in model.named_parameters() if v.requires_grad]
+    trainable_state_dict = {k: v for k, v in model.state_dict().items() if k in trainable_keys}
     torch.save(trainable_state_dict, save_path)
     print("Model saved successfully!")
 
