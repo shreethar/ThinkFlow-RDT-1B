@@ -286,9 +286,19 @@ class SFTConditionedRDT(nn.Module):
         states = batch["state"].unsqueeze(1)
 
         state_input = torch.cat([states, dim_mask], dim=-1)
-        lang_cond, img_cond, state_cond = self.runner.adapt_conditions(
+        _, _, state_cond = self.runner.adapt_conditions(
             batch["lang_tokens"], batch["img_tokens"], state_input
         )
+        
+        # Replace language and image condition streams entirely with Qwen token
+        qwen_c = self.qwen_adaptor(batch["qwen_kv"])
+        lang_cond = qwen_c
+        img_cond = qwen_c
+        
+        # Update the masks since the sequence length is now 1
+        qwen_mask = torch.ones(states.shape[0], 1, dtype=torch.bool, device=lang_mask.device)
+        lang_mask = qwen_mask
+        img_mask = qwen_mask
         noisy = torch.randn(
             states.shape[0],
             self.cfg.model.pred_horizon,

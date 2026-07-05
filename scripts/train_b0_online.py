@@ -566,6 +566,16 @@ def main():
         step += 1
         
     print(f"\nTraining on all {len(dataset)} windows finished successfully.")
+    
+    # Save the trained weights
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    save_path = os.path.join(cfg.output_dir, "model.pt")
+    print(f"Saving trained weights to {save_path}...")
+    
+    # Extract only parameters that require gradients (LoRA + Qwen Adaptor)
+    trainable_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+    torch.save(trainable_state_dict, save_path)
+    print("Model saved successfully!")
 
 
 if __name__ == "__main__":
