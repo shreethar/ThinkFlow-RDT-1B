@@ -8,7 +8,8 @@ Requires-Dist: torchvision==0.25.0
 Requires-Dist: accelerate>=0.30
 Requires-Dist: diffusers>=0.27
 Requires-Dist: huggingface-hub>=0.23
-Requires-Dist: numpy>=1.24
+Requires-Dist: numpy<2.0.0,>=1.24
+Requires-Dist: scipy<1.14
 Requires-Dist: peft>=0.11
 Requires-Dist: PyYAML>=6.0
 Requires-Dist: safetensors>=0.4
@@ -16,3 +17,6 @@ Requires-Dist: tensorboard>=2.15
 Requires-Dist: timm>=0.9
 Requires-Dist: tqdm>=4.66
 Requires-Dist: transformers>=4.44
+Requires-Dist: matplotlib>=3.7.0
+Requires-Dist: wandb>=0.17
+Requires-Dist: protobuf>=5.26.0

@@ -19,10 +19,10 @@ from thinkflow_rdt.train import create_optimizer, seed_everything
 class DroidOnlineDataset(Dataset):
     def __init__(self, dataset_dir, num_episodes=100, pred_horizon=64, precomputed_path=None):
         self.pred_horizon = pred_horizon
-        self.precomputed_kvs = None
+        self.precomputed_features = None
         if precomputed_path and os.path.exists(precomputed_path):
-            print(f"Loading precomputed Qwen KV features from {precomputed_path}...")
-            self.precomputed_kvs = torch.load(precomputed_path)
+            print(f"Loading precomputed Qwen features from {precomputed_path}...")
+            self.precomputed_features = torch.load(precomputed_path)
         
         print("Loading tensorflow_datasets...")
         import tensorflow as tf
@@ -104,8 +104,10 @@ class DroidOnlineDataset(Dataset):
         
     def __getitem__(self, index):
         sample = self.samples[index].copy()
-        if self.precomputed_kvs is not None:
-            sample["qwen_kv"] = self.precomputed_kvs[index]
+        if self.precomputed_features is not None:
+            sample["qwen_kv"] = self.precomputed_features["qwen_kv"][index]
+            sample["qwen_visual"] = self.precomputed_features["qwen_visual"][index]
+            sample["qwen_text"] = self.precomputed_features["qwen_text"][index]
         return sample
 
 
@@ -123,6 +125,8 @@ def droid_online_collate_fn(samples):
     
     if "qwen_kv" in samples[0]:
         batch["qwen_kv"] = torch.stack([s["qwen_kv"] for s in samples], dim=0)
+        batch["qwen_visual"] = torch.stack([s["qwen_visual"] for s in samples], dim=0)
+        batch["qwen_text"] = torch.stack([s["qwen_text"] for s in samples], dim=0)
         
     return batch
 
@@ -137,7 +141,7 @@ def find_subsequence(sequence, subsequence):
 
 
 @torch.no_grad()
-def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device="cuda"):
+def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, max_img_tokens=512, device="cuda"):
     instructions = batch["instructions"]
     primary_images_np = batch["primary_images"]
     wrist_images_np = batch["wrist_images"]
@@ -186,6 +190,7 @@ def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device="cuda
         top_p=None,
         use_cache=True,
         return_dict_in_generate=True,
+        output_hidden_states=True,
         eos_token_id=im_end_id,
         pad_token_id=tokenizer.pad_token_id,
     )
@@ -205,7 +210,13 @@ def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device="cuda
         
     think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
     
+    # Extract input embeddings (Layer 0) which contains fused text and visual features
+    input_embeddings = out.hidden_states[0][0] # [B, seq_len, 2560]
+    input_ids = inputs["input_ids"] # [B, seq_len]
+    
     qwen_kv_list = []
+    qwen_text_list = []
+    qwen_visual_list = []
     decoded_answers = []
     
     B = generated_ids.shape[0]
@@ -234,13 +245,42 @@ def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device="cuda
         
         qwen_kv_list.append(kv_concat.unsqueeze(0))
         
+        # Split input embeddings into visual and text based on token IDs
+        # Qwen2-VL image pad token is 151655
+        is_img = (ids == 151655)
+        is_pad = (ids == tokenizer.pad_token_id)
+        is_lang = (~is_img) & (~is_pad)
+        
+        emb = input_embeddings[b]
+        img_emb = emb[is_img] # [num_img_tokens, 2560]
+        lang_emb = emb[is_lang] # [num_lang_tokens, 2560]
+        
+        # Pad or truncate visual features
+        if img_emb.shape[0] > max_img_tokens:
+            img_emb = img_emb[:max_img_tokens]
+        else:
+            pad_len = max_img_tokens - img_emb.shape[0]
+            img_emb = torch.cat([img_emb, torch.zeros(pad_len, img_emb.shape[1], device=img_emb.device, dtype=img_emb.dtype)], dim=0)
+            
+        # Pad or truncate text features
+        if lang_emb.shape[0] > max_lang_tokens:
+            lang_emb = lang_emb[:max_lang_tokens]
+        else:
+            pad_len = max_lang_tokens - lang_emb.shape[0]
+            lang_emb = torch.cat([lang_emb, torch.zeros(pad_len, lang_emb.shape[1], device=lang_emb.device, dtype=lang_emb.dtype)], dim=0)
+            
+        qwen_visual_list.append(img_emb.unsqueeze(0))
+        qwen_text_list.append(lang_emb.unsqueeze(0))
+        
         prompt_len = inputs["attention_mask"][b].sum().item()
         decoded_ans = tokenizer.decode(ids[prompt_len:], skip_special_tokens=True)
         decoded_answers.append(decoded_ans)
         
-    qwen_kv = torch.stack(qwen_kv_list, dim=0).to(torch.bfloat16) # [B, 1, 1024]
+    qwen_kv = torch.cat(qwen_kv_list, dim=0).to(torch.bfloat16) # [B, 1, 2048]
+    qwen_visual = torch.cat(qwen_visual_list, dim=0).to(torch.bfloat16) # [B, max_img_tokens, 2560]
+    qwen_text = torch.cat(qwen_text_list, dim=0).to(torch.bfloat16) # [B, max_lang_tokens, 2560]
     
-    return qwen_kv, decoded_answers
+    return {"qwen_kv": qwen_kv, "qwen_visual": qwen_visual, "qwen_text": qwen_text}, decoded_answers
 
 
 def main():

@@ -48,26 +48,36 @@ def main():
     vlm.eval()
     vlm.requires_grad_(False)
 
-    all_features = []
+    all_qwen_kv = []
+    all_qwen_visual = []
+    all_qwen_text = []
     print(f"Starting precomputation for {len(dataset)} windows...")
     
     for batch_idx, batch in enumerate(tqdm(dataloader)):
-        # Extract features (returns [B, 1, 2048] tensor)
-        qwen_kv, _ = extract_b0_features(batch, processor, vlm, max_lang_tokens=128, device=device)
+        # Extract features (returns dict with qwen_kv, qwen_visual, qwen_text)
+        qwen_features, _ = extract_b0_features(batch, processor, vlm, max_lang_tokens=128, max_img_tokens=512, device=device)
         
         # Move to CPU to save RAM before appending
-        all_features.append(qwen_kv.cpu())
+        all_qwen_kv.append(qwen_features["qwen_kv"].cpu())
+        all_qwen_visual.append(qwen_features["qwen_visual"].cpu())
+        all_qwen_text.append(qwen_features["qwen_text"].cpu())
         
     print("Concatenating all features...")
-    final_tensor = torch.cat(all_features, dim=0) # [Total_Windows, 1, 2048]
+    final_dict = {
+        "qwen_kv": torch.cat(all_qwen_kv, dim=0),
+        "qwen_visual": torch.cat(all_qwen_visual, dim=0),
+        "qwen_text": torch.cat(all_qwen_text, dim=0),
+    }
     
-    print(f"Final tensor shape: {final_tensor.shape}")
+    print(f"Final qwen_kv shape: {final_dict['qwen_kv'].shape}")
+    print(f"Final qwen_visual shape: {final_dict['qwen_visual'].shape}")
+    print(f"Final qwen_text shape: {final_dict['qwen_text'].shape}")
     out_dir = os.path.dirname(args.output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     
     print(f"Saving to {args.output}...")
-    torch.save(final_tensor, args.output)
+    torch.save(final_dict, args.output)
     print("Precomputation finished successfully!")
 
 if __name__ == "__main__":
