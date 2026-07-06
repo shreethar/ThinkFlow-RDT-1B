@@ -245,15 +245,36 @@ def extract_b0_features(batch, processor, vlm, max_lang_tokens=128, max_img_toke
         
         qwen_kv_list.append(kv_concat.unsqueeze(0))
         
-        # Split input embeddings into visual and text based on token IDs
-        # Qwen2-VL image pad token is 151655
-        is_img = (ids == 151655)
-        is_pad = (ids == tokenizer.pad_token_id)
-        is_lang = (~is_img) & (~is_pad)
-        
+        # Dynamically map the compressed sequence length in input_embeddings
         emb = input_embeddings[b]
-        img_emb = emb[is_img] # [num_img_tokens, 2560]
-        lang_emb = emb[is_lang] # [num_lang_tokens, 2560]
+        emb_is_img = []
+        emb_is_lang = []
+        
+        total_img_tokens_in_ids = (ids == 151655).sum().item()
+        total_img_tokens_in_emb = emb.shape[0] - (len(ids) - total_img_tokens_in_ids)
+        ratio = total_img_tokens_in_ids // max(1, total_img_tokens_in_emb)
+        
+        i = 0
+        while i < len(ids):
+            if ids[i] == 151655:
+                block_len = 0
+                while i < len(ids) and ids[i] == 151655:
+                    block_len += 1
+                    i += 1
+                num_compressed = block_len // ratio
+                emb_is_img.extend([True] * num_compressed)
+                emb_is_lang.extend([False] * num_compressed)
+            else:
+                is_pad_token = (ids[i] == tokenizer.pad_token_id)
+                emb_is_img.append(False)
+                emb_is_lang.append(not is_pad_token)
+                i += 1
+                
+        emb_is_img = torch.tensor(emb_is_img, dtype=torch.bool, device=emb.device)
+        emb_is_lang = torch.tensor(emb_is_lang, dtype=torch.bool, device=emb.device)
+        
+        img_emb = emb[emb_is_img] # [num_img_tokens, 2560]
+        lang_emb = emb[emb_is_lang] # [num_lang_tokens, 2560]
         
         # Pad or truncate visual features
         if img_emb.shape[0] > max_img_tokens:
