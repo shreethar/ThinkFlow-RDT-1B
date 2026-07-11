@@ -11,3 +11,6 @@ dataset/mock_dataset
 
 src/thinkflow_rdt.egg-info/requires.txt
 src/thinkflow_rdt.egg-info/PKG-INFO
+
+src/thinkflow_rdt/adapters/__pycache__
+tests/__pycache__
