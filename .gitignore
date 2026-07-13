@@ -7,10 +7,19 @@ features.json
 
 src/thinkflow_rdt/__pycache__
 
-dataset/mock_dataset
+dataset/mock_dataset/bc_z_dataset/data
+dataset/mock_dataset/bridge_dataset/bridge_subset
+dataset/mock_dataset/droid_dataset/droid_100
+dataset/mock_dataset/fmb_dataset/data
+dataset/mock_dataset/fractal_dataset/data
+dataset/mock_dataset/kuka_dataset/data
 
 src/thinkflow_rdt.egg-info/requires.txt
 src/thinkflow_rdt.egg-info/PKG-INFO
 
 src/thinkflow_rdt/adapters/__pycache__
 tests/__pycache__
+
+bash.exe.stackdump
+
+skills.md
