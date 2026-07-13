@@ -70,3 +70,42 @@ def test_bridge_dataset_sample_schema_from_episode_arrays():
     assert second["image_mask"] == {"primary": 0, "wrist": 0, "secondary": 1}
     assert second["images"]["primary"] is None
     assert second["images"]["secondary"].size == (2, 2)
+
+
+def test_bridge_dataset_filters_empty_language_steps():
+    episode = BridgeEpisode(
+        episode_id="123",
+        instructions=["pick", "", "place"],
+        primary_images=[np.ones((2, 2, 3), dtype=np.uint8)] * 3,
+        secondary_images=[None, None, None],
+        states=np.ones((3, 7), dtype=np.float32),
+        actions=np.ones((3, 7), dtype=np.float32),
+    )
+    dataset = BridgeStandardizedDataset.from_episodes([episode], horizon=2)
+
+    assert len(dataset) == 2
+    assert [dataset[index]["step_idx"] for index in range(len(dataset))] == ["0", "2"]
+
+
+def test_bridge_dataset_caps_episode_samples_and_preserves_gripper_window():
+    actions = np.zeros((100, 7), dtype=np.float32)
+    actions[50:, 6] = 1.0
+    episode = BridgeEpisode(
+        episode_id="123",
+        instructions=["pick"] * 100,
+        primary_images=[np.ones((2, 2, 3), dtype=np.uint8)] * 100,
+        secondary_images=[None] * 100,
+        states=np.ones((100, 7), dtype=np.float32),
+        actions=actions,
+    )
+    dataset = BridgeStandardizedDataset.from_episodes(
+        [episode],
+        horizon=2,
+        max_samples_per_episode=10,
+    )
+
+    step_indices = [int(dataset[index]["step_idx"]) for index in range(len(dataset))]
+
+    assert len(dataset) == 10
+    for special_step in [47, 48, 49, 50, 51, 52]:
+        assert special_step in step_indices

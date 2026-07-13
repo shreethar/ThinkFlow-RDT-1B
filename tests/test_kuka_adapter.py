@@ -46,3 +46,17 @@ def test_kuka_dataset_sample_schema_from_episode_arrays():
     assert sample["state_mask"].tolist() == [1.0] * 7
     assert sample["actions"].shape == (4, 7)
     assert sample["actions_mask"].tolist() == [1.0, 1.0, 0.0, 0.0]
+
+
+def test_kuka_dataset_filters_empty_language_steps_from_episode_arrays():
+    episode = KukaEpisode(
+        episode_id="train_000000",
+        instructions=["pick", "", "place"],
+        images=[np.zeros((2, 2, 3), dtype=np.uint8)] * 3,
+        states=np.ones((3, 7), dtype=np.float32),
+        actions=np.ones((3, 7), dtype=np.float32),
+    )
+    dataset = KukaStandardizedDataset.from_episodes([episode], horizon=2)
+
+    assert len(dataset) == 2
+    assert [dataset[index]["step_idx"] for index in range(len(dataset))] == ["0", "2"]
