@@ -7,12 +7,15 @@ from .action_stats import (
     normalize_action_array,
 )
 from .bridge import BridgeStandardizedDataset, BridgeStandardizedIterableDataset
+from .bc_z import BcZStandardizedDataset, BcZStandardizedIterableDataset
 from .droid import DroidStandardizedDataset
 from .fractal import FractalStandardizedDataset
 from .kuka import KukaStandardizedDataset
 
 __all__ = [
     "ActionNormalizationStats",
+    "BcZStandardizedDataset",
+    "BcZStandardizedIterableDataset",
     "BridgeStandardizedDataset",
     "BridgeStandardizedIterableDataset",
     "DroidStandardizedDataset",
