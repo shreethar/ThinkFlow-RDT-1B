@@ -53,6 +53,10 @@ DATASET_CONFIGS: dict[str, dict[str, Path]] = {
         / "1.0.0",
         "audit_json": REPO_ROOT / "dataset" / "mock_dataset" / "droid_dataset" / "audit.json",
     },
+    "bc_z": {
+        "data_dir": REPO_ROOT / "dataset" / "mock_dataset" / "bc_z_dataset" / "data",
+        "audit_json": REPO_ROOT / "dataset" / "mock_dataset" / "bc_z_dataset" / "audit.json",
+    },
 }
 
 
@@ -110,8 +114,22 @@ def iter_tfds_episodes(
             num_parallel_calls=tf.data.AUTOTUNE,
         )
     else:
-        dataset = builder.as_dataset(split=split)
-    yield from dataset
+        try:
+            dataset = builder.as_dataset(split=split)
+        except NotImplementedError:
+            dataset = builder.as_data_source(split=split)
+            
+    try:
+        try:
+            yield from dataset
+        except TypeError:
+            for episode in dataset:
+                yield episode
+    except RuntimeError as e:
+        if "No such file or directory" in str(e):
+            print(f"Stopping early due to missing shard: {e}")
+        else:
+            raise
 
 
 def fractal_actions_from_steps(steps: list[Any]) -> np.ndarray:
@@ -169,11 +187,31 @@ def droid_actions_from_steps(steps: list[Any]) -> np.ndarray:
     return standardize_droid_action(absolute_actions, cartesian_positions)
 
 
+def bc_z_actions_from_steps(steps: list[Any]) -> np.ndarray:
+    actions: list[np.ndarray] = []
+    for step in steps:
+        action = step["action"]
+        xyz_res = tensor_numpy(action["future/xyz_residual"])
+        xyz_next = xyz_res.reshape(10, 3)[0]
+        
+        aa_res = tensor_numpy(action["future/axis_angle_residual"])
+        aa_next = aa_res.reshape(10, 3)[0]
+        
+        target_close = tensor_numpy(action["future/target_close"])
+        target_close_next = np.array([target_close[0]], dtype=np.float32)
+        
+        action_7d = np.concatenate([xyz_next, aa_next, target_close_next], axis=-1)
+        actions.append(action_7d)
+    
+    return np.stack(actions, axis=0).astype(np.float32)
+
+
 ACTION_EXTRACTORS: dict[str, Callable[[list[Any]], np.ndarray]] = {
     "fractal": fractal_actions_from_steps,
     "kuka": kuka_actions_from_steps,
     "bridge": bridge_actions_from_steps,
     "droid": droid_actions_from_steps,
+    "bc_z": bc_z_actions_from_steps,
 }
 
 
