@@ -1,0 +1,6 @@
+Bridge: 500
+DROID: 500
+BC-Z: 500
+FMB: 500
+
+Bridge

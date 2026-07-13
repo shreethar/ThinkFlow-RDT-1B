@@ -1,0 +1,87 @@
+{
+    "dataset_name": "bridge",
+    "splits": [
+        "train"
+    ],
+    "num_episodes_checked": 1077,
+    "episode_length": {
+        "min": 4,
+        "max": 98,
+        "mean": 37,
+        "p05": 21,
+        "p95": 50
+    },
+    "control_frequency": "10 Hz",
+    "language_fields": [
+        "steps['language_instruction']"
+    ],
+    "image_fields": {
+        "primary_candidate": "steps['observation']['image_0']",
+        "wrist_candidate": "None",
+        "side_candidate": "steps['observation']['image_1']"
+    },
+    "action_fields": {
+        "raw_action_shape": [
+            7
+        ],
+        "chosen_action_source": "steps['action']",
+        "raw_semantics": "relative Cartesian delta + gripper"
+    },
+    "state_fields": [
+        "steps['observation']['state']"
+    ],
+    "gripper_convention_raw": "1 - open | 0 - closed",
+    "standardized_mapping": {
+        "state": "steps['observation']['state']; first 6 dims kept as Bridge pose/rotation state, gripper dim inverted and thresholded to 0=open | 1=closed",
+        "action": "steps['action']; first 6 dims kept as relative Cartesian pose delta, gripper dim inverted and thresholded to 0=open | 1=closed",
+        "images": "primary=steps['observation']['image_0']; secondary=steps['observation']['image_1']; wrist=None; all-zero image arrays are treated as None and mask=0"
+    },
+    "problems_found": [
+        "Some examples dont have instructions",
+        "Some examples has side candidates, some don't"
+    ],
+    "action_normalization": {
+        "method": "clip each standardized action dimension to q01/q99, then linearly map to [-1, 1]",
+        "dim_names": [
+            "delta_x",
+            "delta_y",
+            "delta_z",
+            "delta_rx",
+            "delta_ry",
+            "delta_rz",
+            "gripper_closed"
+        ],
+        "q01": [
+            -0.02969393879175186,
+            -0.044418856501579285,
+            -0.029462624341249466,
+            -0.07992900907993317,
+            -0.09013758599758148,
+            -0.31561169028282166,
+            0.0
+        ],
+        "q99": [
+            0.029669582843780518,
+            0.044798001646995544,
+            0.05036991834640503,
+            0.087203249335289,
+            0.08104434609413147,
+            0.29962795972824097,
+            1.0
+        ],
+        "eps": 1e-06,
+        "source": {
+            "dataset_id": "bridge",
+            "data_dir": "C:\\Users\\rshre\\thinkflow_rdt1b_lora\\dataset\\mock_dataset\\bridge_dataset\\bridge_subset",
+            "split": "train",
+            "shard_pattern": null,
+            "max_episodes": null,
+            "num_episodes": 1077,
+            "num_steps": 40692,
+            "q_low": 0.01,
+            "q_high": 0.99,
+            "computed_at_utc": "2026-07-11T16:44:55.700774+00:00",
+            "note": "Stats are computed from locally available shards only; rerun this script after downloading a larger subset."
+        }
+    }
+}

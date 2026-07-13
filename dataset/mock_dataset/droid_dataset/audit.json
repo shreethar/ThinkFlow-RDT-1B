@@ -1,0 +1,84 @@
+{
+    "dataset_name": "droid_100",
+    "splits": [
+        "train"
+    ],
+    "num_episodes_checked": 32212,
+    "episode_length": {
+        "min": 13,
+        "max": 1627,
+        "mean": 322,
+        "p05": 91,
+        "p95": 845
+    },
+    "control_frequency": "15 Hz",
+    "language_fields": [
+        "steps['language_instruction']"
+    ],
+    "image_fields": {
+        "primary_candidate": "steps['observation']['exterior_image_1_left']",
+        "wrist_candidate": "steps['observation']['wrist_image_left']",
+        "side_candidate": "steps['observation']['exterior_image_2_left']"
+    },
+    "action_fields": {
+        "raw_action_shape": [
+            7
+        ],
+        "chosen_action_source": "steps['action']",
+        "raw_semantics": "absolute Cartesian position + gripper"
+    },
+    "state_fields": [
+        "steps['observation']['cartesian_position']"
+    ],
+    "gripper_convention_raw": "1 - closed | 0 - open",
+    "standardized_mapping": {
+        "state": "[steps['observation']['cartesian_position'] (6D), steps['observation']['gripper_position'] thresholded to 0=open | 1=closed]",
+        "action": "[steps['action'][:6] - steps['observation']['cartesian_position'], steps['action'][6] thresholded to 0=open | 1=closed]",
+        "images": "primary=steps['observation']['exterior_image_1_left']; wrist=steps['observation']['wrist_image_left']; secondary=steps['observation']['exterior_image_2_left']"
+    },
+    "problems_found": [],
+    "action_normalization": {
+        "method": "clip each standardized action dimension to q01/q99, then linearly map to [-1, 1]",
+        "dim_names": [
+            "delta_x",
+            "delta_y",
+            "delta_z",
+            "delta_rx",
+            "delta_ry",
+            "delta_rz",
+            "gripper_closed"
+        ],
+        "q01": [
+            -0.07185495644807816,
+            -0.0486299991607666,
+            -0.04794008284807205,
+            -6.25670051574707,
+            -0.13617128133773804,
+            -0.18606863915920258,
+            0.0
+        ],
+        "q99": [
+            0.0593644455075264,
+            0.048618119210004807,
+            0.064729705452919,
+            6.246786594390869,
+            0.11932922154664993,
+            0.18108855187892914,
+            1.0
+        ],
+        "eps": 1e-06,
+        "source": {
+            "dataset_id": "droid",
+            "data_dir": "C:\\Users\\rshre\\thinkflow_rdt1b_lora\\dataset\\mock_dataset\\droid_dataset\\droid_100\\1.0.0",
+            "split": "train",
+            "shard_pattern": null,
+            "max_episodes": null,
+            "num_episodes": 100,
+            "num_steps": 32212,
+            "q_low": 0.01,
+            "q_high": 0.99,
+            "computed_at_utc": "2026-07-11T17:00:08.979495+00:00",
+            "note": "Stats are computed from locally available shards only; rerun this script after downloading a larger subset."
+        }
+    }
+}

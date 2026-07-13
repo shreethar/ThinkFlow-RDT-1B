@@ -1,0 +1,120 @@
+{
+    "dataset_name": "kuka",
+    "splits": [
+        "train"
+    ],
+    "num_episodes_checked": 580,
+    "episode_length": {
+        "min": 3,
+        "max": 24,
+        "mean": 15,
+        "p05": 6,
+        "p95": 21
+    },
+    "control_frequency": "3 Hz",
+    "language_fields": [
+        "steps['observation']['natural_language_instruction']"
+    ],
+    "image_fields": {
+        "primary_candidate": "steps['observation']['image']",
+        "wrist_candidate": "None",
+        "side_candidate": "None"
+    },
+    "action_fields": {
+        "raw_action_shape": [
+            7
+        ],
+        "chosen_action_source": [
+            "steps['action']['world_vector']",
+            "steps['action']['rotation_delta']",
+            "steps['action']['gripper_closedness_action']"
+        ],
+        "raw_semantics": "commanded relative Cartesian end-effector translation + commanded relative RPY/yaw rotation + sparse gripper command"
+    },
+    "state_fields": [
+        "steps['observation']['clip_function_input/base_pose_tool_reached']",
+        "steps['observation']['gripper_closed']"
+    ],
+    "standardized_mapping": {
+        "observation_7d": {
+            "source": [
+                "steps['observation']['clip_function_input/base_pose_tool_reached'][:3]",
+                "quat_xyzw_to_rpy_rad(steps['observation']['clip_function_input/base_pose_tool_reached'][3:7])",
+                "steps['observation']['gripper_closed']"
+            ],
+            "semantics": "[absolute_eef_x, absolute_eef_y, absolute_eef_z, absolute_roll_rad, absolute_pitch_rad, absolute_yaw_rad, gripper_closed]",
+            "notes": "base_pose_tool_reached is absolute end-effector pose in the robot base frame. RPY is derived from quaternion xyzw and should be kept in radians."
+        },
+        "action_7d": {
+            "source": [
+                "steps['action']['world_vector']",
+                "steps['action']['rotation_delta']",
+                "binary_target_from_sparse_gripper_command(steps['action']['gripper_closedness_action'], steps['observation']['gripper_closed'])"
+            ],
+            "semantics": "[commanded_delta_x, commanded_delta_y, commanded_delta_z, commanded_delta_roll_rad, commanded_delta_pitch_rad, commanded_delta_yaw_rad, gripper_target]",
+            "notes": "Kuka raw gripper action is sparse: +1 closes, -1 opens, 0 holds. The adapter converts it to binary target 0=open, 1=closed."
+        }
+    },
+    "gripper_convention_raw": [
+        "gripper action: +1 close, -1 open, 0 no-op/hold",
+        "gripper state: 0 open, 1 closed"
+    ],
+    "empirical_checks": {
+        "gripper_action_vs_next_closed_delta": {
+            "corr": 0.8569465714002911,
+            "interpretation": "Raw gripper action is a sparse transition command. +1 is followed by closed rising, -1 is followed by closed falling, and 0 holds state."
+        },
+        "rotation_delta": {
+            "interpretation": "Only yaw action is nonzero in the checked shard. Rotation values are radians/command units, not degrees."
+        }
+    },
+    "problems_found": [
+        "Not all episodes are success, refer to metadata.",
+        "Raw gripper action is sparse command format, not direct binary target; adapter converts to 0=open, 1=closed target with hold behavior.",
+        "rotation_delta roll/pitch are zero in checked shard; yaw is the active rotation command."
+    ],
+    "action_normalization": {
+        "method": "clip each standardized action dimension to q01/q99, then linearly map to [-1, 1]",
+        "dim_names": [
+            "delta_x",
+            "delta_y",
+            "delta_z",
+            "delta_rx",
+            "delta_ry",
+            "delta_rz",
+            "gripper_closed"
+        ],
+        "q01": [
+            -0.06785056740045547,
+            -0.11387788504362106,
+            -0.14061544835567474,
+            0.0,
+            0.0,
+            -0.5682597756385803,
+            0.0
+        ],
+        "q99": [
+            0.07286428660154343,
+            0.10444919019937515,
+            0.17392590641975403,
+            0.0,
+            0.0,
+            0.3403763771057129,
+            1.0
+        ],
+        "eps": 1e-06,
+        "source": {
+            "dataset_id": "kuka",
+            "data_dir": "C:\\Users\\rshre\\thinkflow_rdt1b_lora\\dataset\\mock_dataset\\kuka_dataset\\data",
+            "split": "train",
+            "shard_pattern": null,
+            "max_episodes": null,
+            "num_episodes": 580,
+            "num_steps": 8764,
+            "q_low": 0.01,
+            "q_high": 0.99,
+            "computed_at_utc": "2026-07-11T16:40:39.762239+00:00",
+            "note": "Stats are computed from locally available shards only; rerun this script after downloading a larger subset."
+        }
+    }
+}

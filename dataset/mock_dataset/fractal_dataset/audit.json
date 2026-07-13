@@ -1,0 +1,137 @@
+{
+    "dataset_name": "fractal",
+    "splits": [
+        "train"
+    ],
+    "num_episodes_checked": 80,
+    "episode_length": {
+        "min": 15,
+        "max": 115,
+        "mean": 42,
+        "p05": 21,
+        "p95": 71
+    },
+    "control_frequency": "3 Hz",
+    "language_fields": [
+        "steps['observation']['natural_language_instruction']"
+    ],
+    "image_fields": {
+        "primary_candidate": "steps['observation']['image']",
+        "wrist_candidate": "None",
+        "side_candidate": "None"
+    },
+    "action_fields": {
+        "raw_action_shape": [
+            7
+        ],
+        "chosen_action_source": [
+            "steps['action']['world_vector']",
+            "steps['action']['rotation_delta']",
+            "steps['action']['gripper_closedness_action']"
+        ],
+        "raw_semantics": "commanded relative Cartesian end-effector translation + commanded relative RPY rotation + gripper command"
+    },
+    "state_fields": [
+        "steps['observation']['base_pose_tool_reached']",
+        "steps['observation']['gripper_closed']"
+    ],
+    "standardized_mapping": {
+        "observation_7d": {
+            "source": [
+                "steps['observation']['base_pose_tool_reached'][:3]",
+                "quat_xyzw_to_rpy_rad(steps['observation']['base_pose_tool_reached'][3:7])",
+                "steps['observation']['gripper_closed']"
+            ],
+            "semantics": "[absolute_eef_x, absolute_eef_y, absolute_eef_z, absolute_roll_rad, absolute_pitch_rad, absolute_yaw_rad, gripper_closed]",
+            "notes": "base_pose_tool_reached is absolute end-effector pose in the robot base frame. RPY is derived from quaternion xyzw and should be kept in radians."
+        },
+        "action_7d": {
+            "source": [
+                "steps['action']['world_vector']",
+                "steps['action']['rotation_delta']",
+                "steps['action']['gripper_closedness_action']"
+            ],
+            "semantics": "[commanded_delta_x, commanded_delta_y, commanded_delta_z, commanded_delta_roll_rad, commanded_delta_pitch_rad, commanded_delta_yaw_rad, gripper_command]",
+            "notes": "Action is a commanded controller action, not the exact achieved next-state delta."
+        }
+    },
+    "gripper_convention_raw": [
+        "gripper action: +1 close, -1 open, 0 no-op/hold",
+        "gripper state: 0 open, 1 closed"
+    ],
+    "empirical_checks": {
+        "world_vector_vs_next_position_delta": {
+            "corr": [
+                0.65832018,
+                0.80682564,
+                0.79652448
+            ],
+            "scale_next_delta_approx_scale_times_action": [
+                0.15744282,
+                0.25444987,
+                0.2473465
+            ],
+            "interpretation": "world_vector is a commanded relative translation. It correlates with achieved next-step translation but is not numerically equal to the measured delta."
+        },
+        "rotation_delta_vs_next_rpy_delta": {
+            "corr": [
+                -0.10300951,
+                -0.17387014,
+                0.41252735
+            ],
+            "interpretation": "rotation_delta is a commanded relative RPY rotation. Directly subtracting absolute Euler angles is a weak validation because of Euler wrapping/frame effects and controller tracking."
+        },
+        "gripper_action_vs_next_commanded": {
+            "corr": 0.9683817933572885,
+            "interpretation": "gripper_closedness_action maps closely to the next timestep gripper_closedness_commanded, confirming it is a gripper command field."
+        }
+    },
+    "problems_found": [
+        "Absolute RPY derived from quaternion has Euler wrapping discontinuities near +/-pi.",
+        "rotation_delta is commanded orientation motion and should not be expected to equal naive next_rpy - current_rpy."
+    ],
+    "action_normalization": {
+        "method": "clip each standardized action dimension to q01/q99, then linearly map to [-1, 1]",
+        "dim_names": [
+            "delta_x",
+            "delta_y",
+            "delta_z",
+            "delta_rx",
+            "delta_ry",
+            "delta_rz",
+            "gripper_closed"
+        ],
+        "q01": [
+            -0.18420135974884033,
+            -0.14381493628025055,
+            -0.23013125360012054,
+            -0.3226361870765686,
+            -0.3567909598350525,
+            -0.42910099029541016,
+            0.0
+        ],
+        "q99": [
+            0.16988487541675568,
+            0.1567763388156891,
+            0.2093898206949234,
+            0.6162124276161194,
+            0.4375317692756653,
+            0.43933209776878357,
+            1.0
+        ],
+        "eps": 1e-06,
+        "source": {
+            "dataset_id": "fractal",
+            "data_dir": "C:\\Users\\rshre\\thinkflow_rdt1b_lora\\dataset\\mock_dataset\\fractal_dataset\\data",
+            "split": "train",
+            "shard_pattern": null,
+            "max_episodes": null,
+            "num_episodes": 80,
+            "num_steps": 3369,
+            "q_low": 0.01,
+            "q_high": 0.99,
+            "computed_at_utc": "2026-07-11T16:38:03.594135+00:00",
+            "note": "Stats are computed from locally available shards only; rerun this script after downloading a larger subset."
+        }
+    }
+}
