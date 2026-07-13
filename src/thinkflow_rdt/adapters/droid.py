@@ -7,7 +7,18 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from .action_stats import (
+    ActionNormalizationStats,
+    normalize_action_horizon,
+    resolve_action_stats,
+)
 from .fractal import ACTION_DIM, DEFAULT_HORIZON, STATE_DIM, pad_action_horizon
+from .sample_filtering import (
+    DEFAULT_GRIPPER_WINDOW_AFTER,
+    DEFAULT_GRIPPER_WINDOW_BEFORE,
+    DEFAULT_MAX_SAMPLES_PER_EPISODE,
+    build_dataset_sample_index,
+)
 
 
 @dataclass(frozen=True)
@@ -110,22 +121,41 @@ class DroidStandardizedDataset:
         max_episodes: int | None = None,
         shard_pattern: str | None = None,
         gripper_closed_threshold: float = 0.5,
+        normalize_actions: bool = False,
+        action_stats_path: str | Path | None = None,
+        action_stats: ActionNormalizationStats | dict[str, Any] | None = None,
+        filter_empty_language: bool = True,
+        max_samples_per_episode: int | None = DEFAULT_MAX_SAMPLES_PER_EPISODE,
+        gripper_window_before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
+        gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
     ) -> None:
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.split = split
         self.horizon = horizon
         self.dataset_id = dataset_id
         self.gripper_closed_threshold = gripper_closed_threshold
+        self.filter_empty_language = filter_empty_language
+        self.max_samples_per_episode = max_samples_per_episode
+        self.gripper_window_before = gripper_window_before
+        self.gripper_window_after = gripper_window_after
+        self.action_stats = resolve_action_stats(
+            normalize_actions=normalize_actions,
+            action_stats=action_stats,
+            action_stats_path=action_stats_path,
+            search_dir=self.data_dir,
+        )
 
         self.episodes = self._load_episodes(
             max_episodes=max_episodes,
             shard_pattern=shard_pattern,
         )
-        self.index: list[tuple[int, int]] = [
-            (episode_index, step_index)
-            for episode_index, episode in enumerate(self.episodes)
-            for step_index in range(episode.states.shape[0])
-        ]
+        self.index = build_dataset_sample_index(
+            self.episodes,
+            max_samples_per_episode=max_samples_per_episode,
+            filter_empty_language=filter_empty_language,
+            gripper_window_before=gripper_window_before,
+            gripper_window_after=gripper_window_after,
+        )
         if not self.index:
             raise ValueError(f"No Droid samples found in {self.data_dir}")
 
@@ -137,6 +167,12 @@ class DroidStandardizedDataset:
         horizon: int = DEFAULT_HORIZON,
         dataset_id: str = "droid",
         split: str = "train",
+        normalize_actions: bool = False,
+        action_stats: ActionNormalizationStats | dict[str, Any] | None = None,
+        filter_empty_language: bool = True,
+        max_samples_per_episode: int | None = DEFAULT_MAX_SAMPLES_PER_EPISODE,
+        gripper_window_before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
+        gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
     ) -> DroidStandardizedDataset:
         obj = cls.__new__(cls)
         obj.data_dir = Path(".").resolve()
@@ -144,12 +180,22 @@ class DroidStandardizedDataset:
         obj.horizon = horizon
         obj.dataset_id = dataset_id
         obj.gripper_closed_threshold = 0.5
+        obj.filter_empty_language = filter_empty_language
+        obj.max_samples_per_episode = max_samples_per_episode
+        obj.gripper_window_before = gripper_window_before
+        obj.gripper_window_after = gripper_window_after
+        obj.action_stats = resolve_action_stats(
+            normalize_actions=normalize_actions or action_stats is not None,
+            action_stats=action_stats,
+        )
         obj.episodes = episodes
-        obj.index = [
-            (episode_index, step_index)
-            for episode_index, episode in enumerate(episodes)
-            for step_index in range(episode.states.shape[0])
-        ]
+        obj.index = build_dataset_sample_index(
+            episodes,
+            max_samples_per_episode=max_samples_per_episode,
+            filter_empty_language=filter_empty_language,
+            gripper_window_before=gripper_window_before,
+            gripper_window_after=gripper_window_after,
+        )
         return obj
 
     def __len__(self) -> int:
@@ -164,6 +210,8 @@ class DroidStandardizedDataset:
             horizon=self.horizon,
             action_dim=ACTION_DIM,
         )
+        if self.action_stats is not None:
+            actions = normalize_action_horizon(actions, actions_mask, self.action_stats)
 
         primary = pil_or_none(episode.primary_images[step_index])
         wrist = pil_or_none(episode.wrist_images[step_index])
