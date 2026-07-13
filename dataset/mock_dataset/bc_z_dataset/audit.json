@@ -1,0 +1,87 @@
+{
+    "dataset_name": "bc_z",
+    "splits": [
+        "train"
+    ],
+    "num_episodes_checked": 0,
+    "episode_length": {},
+    "control_frequency": "10 Hz",
+    "language_fields": [
+        "steps['observation']['natural_language_instruction']"
+    ],
+    "image_fields": {
+        "primary_candidate": "steps['observation']['image']",
+        "wrist_candidate": "None",
+        "side_candidate": "None"
+    },
+    "action_fields": {
+        "raw_action_shape": [
+            7
+        ],
+        "chosen_action_source": [
+            "steps['action']['future/xyz_residual'][0]",
+            "steps['action']['future/axis_angle_residual'][0]",
+            "steps['action']['future/target_close'][0]"
+        ],
+        "raw_semantics": "immediate future xyz residual + axis angle residual + target close"
+    },
+    "state_fields": [
+        "steps['observation']['present/xyz']",
+        "steps['observation']['present/axis_angle']",
+        "steps['observation']['present/sensed_close']"
+    ],
+    "standardized_mapping": {
+        "state": "[present/xyz, present/axis_angle, present/sensed_close thresholded to 0=open | 1=closed at 0.5]",
+        "action": "[future/xyz_residual[0], future/axis_angle_residual[0], future/target_close[0]]",
+        "images": "primary=steps['observation']['image']"
+    },
+    "gripper_convention_raw": [
+        "gripper action: 1 close, 0 open",
+        "gripper state: 0 open, 1 closed (thresholded at 0.5)"
+    ],
+    "problems_found": [],
+    "action_normalization": {
+        "method": "clip each standardized action dimension to q01/q99, then linearly map to [-1, 1]",
+        "dim_names": [
+            "delta_x",
+            "delta_y",
+            "delta_z",
+            "delta_rx",
+            "delta_ry",
+            "delta_rz",
+            "gripper_closed"
+        ],
+        "q01": [
+            -0.0914856493473053,
+            -0.06087971106171608,
+            -0.04837722331285477,
+            -0.11007791012525558,
+            -0.1323043704032898,
+            -0.20832698047161102,
+            0.0
+        ],
+        "q99": [
+            0.08350291103124619,
+            0.060307472944259644,
+            0.05263283848762512,
+            0.11667461693286896,
+            0.12229415774345398,
+            0.18172408640384674,
+            1.0
+        ],
+        "eps": 1e-06,
+        "source": {
+            "dataset_id": "bc_z",
+            "data_dir": "/home/ubuntu/ThinkFlow-RDT-1B/dataset/mock_dataset/bc_z_dataset/data",
+            "split": "train",
+            "shard_pattern": null,
+            "max_episodes": null,
+            "num_episodes": 100,
+            "num_steps": 13290,
+            "q_low": 0.01,
+            "q_high": 0.99,
+            "computed_at_utc": "2026-07-13T09:00:07.861947+00:00",
+            "note": "Stats are computed from locally available shards only; rerun this script after downloading a larger subset."
+        }
+    }
+}
