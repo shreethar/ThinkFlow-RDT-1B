@@ -80,7 +80,7 @@
             "num_steps": 13290,
             "q_low": 0.01,
             "q_high": 0.99,
-            "computed_at_utc": "2026-07-13T09:00:07.861947+00:00",
+            "computed_at_utc": "2026-07-13T10:31:05.868713+00:00",
             "note": "Stats are computed from locally available shards only; rerun this script after downloading a larger subset."
         }
     }
