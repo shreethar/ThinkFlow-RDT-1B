@@ -85,35 +85,35 @@
             "gripper_closed"
         ],
         "q01": [
-            -0.06785056740045547,
-            -0.11387788504362106,
-            -0.14061544835567474,
+            -0.07158641517162323,
+            -0.10160613059997559,
+            -0.14181764423847198,
             0.0,
             0.0,
-            -0.5682597756385803,
+            -0.5772645473480225,
             0.0
         ],
         "q99": [
-            0.07286428660154343,
-            0.10444919019937515,
-            0.17392590641975403,
+            0.07131362706422806,
+            0.10166916996240616,
+            0.171391561627388,
             0.0,
             0.0,
-            0.3403763771057129,
+            0.3399951457977295,
             1.0
         ],
         "eps": 1e-06,
         "source": {
             "dataset_id": "kuka",
-            "data_dir": "C:\\Users\\rshre\\thinkflow_rdt1b_lora\\dataset\\mock_dataset\\kuka_dataset\\data",
+            "data_dir": "/home/ubuntu/ThinkFlow-RDT-1B/dataset/mock_dataset/kuka_dataset/data",
             "split": "train",
             "shard_pattern": null,
             "max_episodes": null,
-            "num_episodes": 580,
-            "num_steps": 8764,
+            "num_episodes": 25398,
+            "num_steps": 376985,
             "q_low": 0.01,
             "q_high": 0.99,
-            "computed_at_utc": "2026-07-11T16:40:39.762239+00:00",
+            "computed_at_utc": "2026-07-19T05:54:56.221661+00:00",
             "note": "Stats are computed from locally available shards only; rerun this script after downloading a larger subset."
         }
     }

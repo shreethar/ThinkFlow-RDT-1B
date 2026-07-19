@@ -102,35 +102,35 @@
             "gripper_closed"
         ],
         "q01": [
-            -0.18420135974884033,
-            -0.14381493628025055,
-            -0.23013125360012054,
-            -0.3226361870765686,
-            -0.3567909598350525,
-            -0.42910099029541016,
+            -0.2200726717710495,
+            -0.14985093474388123,
+            -0.23123720288276672,
+            -0.3549765944480896,
+            -0.41965362429618835,
+            -0.4351651668548584,
             0.0
         ],
         "q99": [
-            0.16988487541675568,
-            0.1567763388156891,
-            0.2093898206949234,
-            0.6162124276161194,
-            0.4375317692756653,
-            0.43933209776878357,
+            0.17926958203315735,
+            0.15004317462444305,
+            0.2192215919494629,
+            0.5932967066764832,
+            0.35349518060684204,
+            0.44897955656051636,
             1.0
         ],
         "eps": 1e-06,
         "source": {
             "dataset_id": "fractal",
-            "data_dir": "C:\\Users\\rshre\\thinkflow_rdt1b_lora\\dataset\\mock_dataset\\fractal_dataset\\data",
+            "data_dir": "/home/ubuntu/ThinkFlow-RDT-1B/dataset/mock_dataset/fractal_dataset/data",
             "split": "train",
             "shard_pattern": null,
             "max_episodes": null,
-            "num_episodes": 80,
-            "num_steps": 3369,
+            "num_episodes": 25039,
+            "num_steps": 1081207,
             "q_low": 0.01,
             "q_high": 0.99,
-            "computed_at_utc": "2026-07-11T16:38:03.594135+00:00",
+            "computed_at_utc": "2026-07-19T05:20:28.232510+00:00",
             "note": "Stats are computed from locally available shards only; rerun this script after downloading a larger subset."
         }
     }
