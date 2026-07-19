@@ -25,3 +25,5 @@ tests/__pycache__
 bash.exe.stackdump
 
 skills.md
+
+.env
