@@ -41,7 +41,7 @@ DATASET_CONFIGS: dict[str, dict[str, Path]] = {
         / "dataset"
         / "mock_dataset"
         / "bridge_dataset"
-        / "bridge_subset",
+        / "data",
         "audit_json": REPO_ROOT / "dataset" / "mock_dataset" / "bridge_dataset" / "audit.json",
     },
     "droid": {
@@ -49,8 +49,7 @@ DATASET_CONFIGS: dict[str, dict[str, Path]] = {
         / "dataset"
         / "mock_dataset"
         / "droid_dataset"
-        / "droid_100"
-        / "1.0.0",
+        / "data",
         "audit_json": REPO_ROOT / "dataset" / "mock_dataset" / "droid_dataset" / "audit.json",
     },
     "bc_z": {
