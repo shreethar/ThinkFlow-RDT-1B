@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from thinkflow_rdt.adapters.combined_lazy import (
     LazyCombinedStandardizedDataset,
+    default_lazy_standardized_dataset_configs,
     episode_split_name,
     is_missing_local_shard_error,
 )
@@ -58,3 +59,16 @@ def test_lazy_combined_dataset_continues_after_missing_shard_error():
         {"dataset_id": "broken", "value": 0},
         {"dataset_id": "right", "value": 1},
     ]
+
+
+def test_default_configs_accept_mock_dataset_root_directly(tmp_path):
+    mock_root = tmp_path / "mock_dataset"
+    data_dir = mock_root / "bc_z_dataset" / "data"
+    data_dir.mkdir(parents=True)
+
+    configs = default_lazy_standardized_dataset_configs(
+        dataset_ids=["bc_z"],
+        root=mock_root,
+    )
+
+    assert configs[0].data_dir == data_dir

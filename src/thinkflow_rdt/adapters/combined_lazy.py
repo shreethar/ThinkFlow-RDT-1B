@@ -391,10 +391,12 @@ def default_lazy_standardized_dataset_configs(
     root: str | Path | None = None,
 ) -> list[LazyStandardizedDatasetConfig]:
     root_path = Path(root).expanduser().resolve() if root is not None else REPO_ROOT
-    mock_root = root_path / "dataset" / "mock_dataset"
+    nested_mock_root = root_path / "dataset" / "mock_dataset"
 
-    if mock_root.exists():
-        configs = _mock_layout_configs(mock_root)
+    if _looks_like_mock_dataset_root(root_path):
+        configs = _mock_layout_configs(root_path)
+    elif nested_mock_root.exists():
+        configs = _mock_layout_configs(nested_mock_root)
     else:
         configs = _hf_layout_configs(root_path)
 
@@ -641,6 +643,19 @@ def _mock_layout_configs(mock_root: Path) -> dict[str, LazyStandardizedDatasetCo
             data_dir=mock_root / "kuka_dataset" / "data",
         ),
     }
+
+
+def _looks_like_mock_dataset_root(root: Path) -> bool:
+    return any(
+        (root / dataset_dir).exists()
+        for dataset_dir in (
+            "bc_z_dataset",
+            "bridge_dataset",
+            "droid_dataset",
+            "fractal_dataset",
+            "kuka_dataset",
+        )
+    )
 
 
 def _hf_layout_configs(root: Path) -> dict[str, LazyStandardizedDatasetConfig]:
