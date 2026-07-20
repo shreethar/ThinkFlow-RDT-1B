@@ -83,6 +83,7 @@ def standardize_droid_action(
         raise ValueError(f"Expected cartesian_position last dim 6, got {cartesian.shape}")
 
     delta = action[..., :6] - cartesian
+    delta[..., 3:6] = (delta[..., 3:6] + np.pi) % (2 * np.pi) - np.pi
     gripper = (action[..., 6:7] >= closed_threshold).astype(np.float32)
     return np.concatenate([delta, gripper], axis=-1).astype(np.float32)
 
