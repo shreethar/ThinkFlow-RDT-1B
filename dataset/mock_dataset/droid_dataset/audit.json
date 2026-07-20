@@ -33,7 +33,7 @@
     "gripper_convention_raw": "1 - closed | 0 - open",
     "standardized_mapping": {
         "state": "[steps['observation']['cartesian_position'] (6D), steps['observation']['gripper_position'] thresholded to 0=open | 1=closed]",
-        "action": "[steps['action'][:6] - steps['observation']['cartesian_position'], steps['action'][6] thresholded to 0=open | 1=closed]",
+        "action": "[steps['action'][:6] - steps['observation']['cartesian_position'], steps['action'][6] thresholded to 0=open | 1=closed]; rotation deltas 3:6 are wrapped into [-pi, pi] to remove Euler angle wrap-around jumps",
         "images": "primary=steps['observation']['exterior_image_1_left']; wrist=steps['observation']['wrist_image_left']; secondary=steps['observation']['exterior_image_2_left']"
     },
     "problems_found": [],
