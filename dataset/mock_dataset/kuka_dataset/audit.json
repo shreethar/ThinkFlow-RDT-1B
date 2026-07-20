@@ -127,7 +127,7 @@
             "num_action_rows_used_for_stats": 777946,
             "q_low": 0.01,
             "q_high": 0.99,
-            "computed_at_utc": "2026-07-19T08:06:47.889580+00:00",
+            "computed_at_utc": "2026-07-20T07:51:05.696171+00:00",
             "note": "Stats are computed from locally available shards after applying the same language, Kuka success, max-64, and gripper-change sampling policy used by the standardized loaders. Rerun after downloading a larger subset."
         }
     }

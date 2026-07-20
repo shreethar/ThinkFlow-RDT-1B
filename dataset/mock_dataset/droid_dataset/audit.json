@@ -52,18 +52,18 @@
             -0.06600221991539001,
             -0.05424238741397858,
             -0.05239218473434448,
-            -6.25539493560791,
-            -0.14170986413955688,
-            -0.19161486625671387,
+            -0.15070652961730957,
+            -0.14170996844768524,
+            -0.19132447242736816,
             0.0
         ],
         "q99": [
             0.06595593690872192,
             0.053091131150722504,
             0.07051952183246613,
-            6.255575180053711,
-            0.1354268193244934,
-            0.18940353393554688,
+            0.15218210220336914,
+            0.13542675971984863,
+            0.18921470642089844,
             1.0
         ],
         "eps": 1e-06,
@@ -91,7 +91,7 @@
             "num_action_rows_used_for_stats": 22004712,
             "q_low": 0.01,
             "q_high": 0.99,
-            "computed_at_utc": "2026-07-19T09:37:26.746200+00:00",
+            "computed_at_utc": "2026-07-20T09:21:50.363294+00:00",
             "note": "Stats are computed from locally available shards after applying the same language, Kuka success, max-64, and gripper-change sampling policy used by the standardized loaders. Rerun after downloading a larger subset."
         }
     }
