@@ -1,5 +1,5 @@
 seed: 42
-rdt_repo: /absolute/path/to/RoboticsDiffusionTransformer
+rdt_repo: /home/ubuntu/RoboticsDiffusionTransformer
 pretrained_model: null
 output_dir: outputs/tiny_smoke
 
@@ -8,6 +8,9 @@ model:
   state_dim: 7
   pred_horizon: 16
   qwen_hidden_size: 64
+  qwen_kv_dim: 64
+  lang_token_dim: 64
+  img_token_dim: 64
   max_lang_tokens: 12
   image_tokens: 16
   hidden_size: 128
