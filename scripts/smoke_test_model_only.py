@@ -39,13 +39,19 @@ def make_synthetic_batch(cfg, batch_size: int, device: torch.device) -> dict[str
     lang_tokens = torch.randn(
         batch_size,
         min(16, cfg.model.max_lang_tokens),
-        cfg.model.qwen_hidden_size,
+        cfg.model.lang_token_dim,
         generator=generator,
     )
     img_tokens = torch.randn(
         batch_size,
         cfg.model.image_tokens,
-        cfg.model.qwen_hidden_size,
+        cfg.model.img_token_dim,
+        generator=generator,
+    )
+    qwen_kv = torch.randn(
+        batch_size,
+        1,
+        cfg.model.qwen_kv_dim,
         generator=generator,
     )
     state = torch.randn(
@@ -63,6 +69,7 @@ def make_synthetic_batch(cfg, batch_size: int, device: torch.device) -> dict[str
     return {
         "lang_tokens": lang_tokens.to(device),
         "img_tokens": img_tokens.to(device),
+        "qwen_kv": qwen_kv.to(device),
         "state": state.to(device),
         "actions": actions.to(device),
         "lang_mask": torch.ones(batch_size, lang_tokens.shape[1], dtype=torch.bool, device=device),
@@ -154,11 +161,11 @@ def main() -> None:
             lang = lang[0]
         if img.ndim == 3 and img.shape[0] == 1:
             img = img[0]
-        if lang.ndim != 2 or lang.shape[-1] != cfg.model.qwen_hidden_size:
-            raise ValueError(f"lang_tokens must be [L,{cfg.model.qwen_hidden_size}], got {tuple(lang.shape)}")
-        if img.shape != (cfg.model.image_tokens, cfg.model.qwen_hidden_size):
+        if lang.ndim != 2 or lang.shape[-1] != cfg.model.lang_token_dim:
+            raise ValueError(f"lang_tokens must be [L,{cfg.model.lang_token_dim}], got {tuple(lang.shape)}")
+        if img.shape != (cfg.model.image_tokens, cfg.model.img_token_dim):
             raise ValueError(
-                f"img_tokens must be [{cfg.model.image_tokens},{cfg.model.qwen_hidden_size}], got {tuple(img.shape)}. "
+                f"img_tokens must be [{cfg.model.image_tokens},{cfg.model.img_token_dim}], got {tuple(img.shape)}. "
                 "Pool/pad the visual features before this smoke test."
             )
 
@@ -187,6 +194,7 @@ def main() -> None:
         batch = {
             "lang_tokens": lang.unsqueeze(0).repeat(args.batch_size, 1, 1).to(device),
             "img_tokens": img.unsqueeze(0).repeat(args.batch_size, 1, 1).to(device),
+            "qwen_kv": torch.randn(args.batch_size, 1, cfg.model.qwen_kv_dim, device=device),
             "state": state.unsqueeze(0).repeat(args.batch_size, 1).to(device),
             "actions": actions.unsqueeze(0).repeat(args.batch_size, 1, 1).to(device),
             "lang_mask": lang_mask.unsqueeze(0).repeat(args.batch_size, 1).to(device),
