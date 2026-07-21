@@ -9,7 +9,14 @@ import torch
 from torch.utils.data import Dataset
 
 
-REQUIRED_KEYS = {"lang_tokens", "img_tokens", "state", "actions", "ctrl_freq"}
+REQUIRED_KEYS = {
+    "qwen_kv",
+    "lang_tokens",
+    "img_tokens",
+    "state",
+    "actions",
+    "ctrl_freq",
+}
 
 
 class CachedFeatureDataset(Dataset[dict[str, Any]]):
@@ -66,6 +73,14 @@ class RDTBatchCollator:
     feature_dim: int
     state_dim: int
     action_dim: int
+    lang_token_dim: int | None = None
+    img_token_dim: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.lang_token_dim is None:
+            self.lang_token_dim = self.feature_dim
+        if self.img_token_dim is None:
+            self.img_token_dim = self.feature_dim
 
     def _pad_sequence(
         self,
@@ -112,6 +127,7 @@ class RDTBatchCollator:
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         batch: dict[str, list[torch.Tensor]] = {
+            "qwen_kv": [],
             "lang_tokens": [],
             "lang_mask": [],
             "img_tokens": [],
@@ -125,11 +141,19 @@ class RDTBatchCollator:
 
         for sample in samples:
             lang, default_lang_mask = self._pad_sequence(
-                sample["lang_tokens"], self.max_lang_tokens, self.feature_dim
+                sample["lang_tokens"], self.max_lang_tokens, self.lang_token_dim
             )
             image, default_img_mask = self._pad_sequence(
-                sample["img_tokens"], self.image_tokens, self.feature_dim
+                sample["img_tokens"], self.image_tokens, self.img_token_dim
             )
+
+            qwen_kv = torch.as_tensor(sample["qwen_kv"], dtype=torch.float32)
+            if qwen_kv.ndim == 1:
+                qwen_kv = qwen_kv.unsqueeze(0)
+            if qwen_kv.ndim != 2:
+                raise ValueError(
+                    f"Expected qwen_kv [tokens, dim] or [dim], got {tuple(qwen_kv.shape)}"
+                )
 
             if "lang_mask" in sample:
                 supplied = torch.as_tensor(sample["lang_mask"], dtype=torch.bool)
@@ -157,6 +181,7 @@ class RDTBatchCollator:
             if action_dim_mask.numel() != self.action_dim:
                 raise ValueError("action_dim_mask has the wrong width")
 
+            batch["qwen_kv"].append(qwen_kv)
             batch["lang_tokens"].append(lang.to(torch.float32))
             batch["lang_mask"].append(default_lang_mask)
             batch["img_tokens"].append(image.to(torch.float32))
