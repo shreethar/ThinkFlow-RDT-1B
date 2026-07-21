@@ -140,10 +140,10 @@ class SFTConditionedRDT(nn.Module):
             action_dim=cfg.model.action_dim,
             pred_horizon=cfg.model.pred_horizon,
             config=runner_config,
-            lang_token_dim=cfg.model.qwen_hidden_size,
-            img_token_dim=cfg.model.qwen_hidden_size,
+            lang_token_dim=cfg.model.lang_token_dim,
+            img_token_dim=cfg.model.img_token_dim,
             state_token_dim=cfg.model.state_dim,
-            max_lang_cond_len=cfg.model.max_lang_tokens,
+            max_lang_cond_len=cfg.model.max_lang_tokens + 1,
             img_cond_len=cfg.model.image_tokens,
             lang_pos_embed_config=None,
             img_pos_embed_config=None,
@@ -240,18 +240,16 @@ class SFTConditionedRDT(nn.Module):
         )
 
         lang_cond, img_cond, state_action_cond = self.runner.adapt_conditions(
-            batch["qwen_text"], batch["qwen_visual"], state_action
+            batch["lang_tokens"], batch["img_tokens"], state_action
         )
         
         # Compute the Qwen KV cache vector and concatenate it to the text stream
         qwen_c = self.qwen_adaptor(batch["qwen_kv"])
         lang_cond = torch.cat([qwen_c, lang_cond], dim=1)
         
-        # Create masks (all ones because our tensors are dynamically padded correctly in preprocessing)
+        # Create masks
         qwen_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=qwen_c.device)
-        text_mask = torch.ones(batch_size, lang_cond.shape[1] - 1, dtype=torch.bool, device=qwen_c.device)
-        lang_mask = torch.cat([qwen_mask, text_mask], dim=1)
-        img_mask = torch.ones(batch_size, img_cond.shape[1], dtype=torch.bool, device=qwen_c.device)
+        lang_mask_final = torch.cat([qwen_mask, lang_mask], dim=1)
         
         prediction = self.runner.model(
             state_action_cond,
@@ -259,8 +257,8 @@ class SFTConditionedRDT(nn.Module):
             timesteps,
             lang_cond,
             img_cond,
-            lang_mask=qwen_mask,
-            img_mask=qwen_mask,
+            lang_mask=lang_mask_final,
+            img_mask=img_mask,
         )
 
         if self.runner.prediction_type == "sample":
@@ -289,7 +287,7 @@ class SFTConditionedRDT(nn.Module):
 
         state_input = torch.cat([states, dim_mask], dim=-1)
         lang_cond, img_cond, state_cond = self.runner.adapt_conditions(
-            batch["qwen_text"], batch["qwen_visual"], state_input
+            batch["lang_tokens"], batch["img_tokens"], state_input
         )
         
         # Compute the Qwen KV cache vector and concatenate it to the text stream
@@ -299,9 +297,7 @@ class SFTConditionedRDT(nn.Module):
         # Create masks
         batch_size = states.shape[0]
         qwen_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=states.device)
-        text_mask = torch.ones(batch_size, lang_cond.shape[1] - 1, dtype=torch.bool, device=states.device)
-        lang_mask = torch.cat([qwen_mask, text_mask], dim=1)
-        img_mask = torch.ones(batch_size, img_cond.shape[1], dtype=torch.bool, device=states.device)
+        lang_mask_final = torch.cat([qwen_mask, lang_mask], dim=1)
         noisy = torch.randn(
             states.shape[0],
             self.cfg.model.pred_horizon,
@@ -330,7 +326,7 @@ class SFTConditionedRDT(nn.Module):
                 model_timestep,
                 lang_cond,
                 img_cond,
-                lang_mask=lang_mask,
+                lang_mask=lang_mask_final,
                 img_mask=img_mask,
             )
             noisy = scheduler.step(output, timestep, noisy).prev_sample

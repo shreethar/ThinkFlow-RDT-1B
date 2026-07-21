@@ -14,6 +14,8 @@ class ModelConfig:
     pred_horizon: int
     qwen_hidden_size: int
     qwen_kv_dim: int
+    lang_token_dim: int
+    img_token_dim: int
     max_lang_tokens: int
     image_tokens: int
     hidden_size: int
