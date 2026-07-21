@@ -106,8 +106,10 @@ class DroidOnlineDataset(Dataset):
         sample = self.samples[index].copy()
         if self.precomputed_features is not None:
             sample["qwen_kv"] = self.precomputed_features["qwen_kv"][index]
-            sample["qwen_visual"] = self.precomputed_features["qwen_visual"][index]
-            sample["qwen_text"] = self.precomputed_features["qwen_text"][index]
+            sample["lang_tokens"] = self.precomputed_features["lang_tokens"][index]
+            sample["lang_mask"] = self.precomputed_features["lang_mask"][index]
+            sample["img_tokens"] = self.precomputed_features["img_tokens"][index]
+            sample["img_mask"] = self.precomputed_features["img_mask"][index]
         return sample
 
 
@@ -125,8 +127,10 @@ def droid_online_collate_fn(samples):
     
     if "qwen_kv" in samples[0]:
         batch["qwen_kv"] = torch.stack([s["qwen_kv"] for s in samples], dim=0)
-        batch["qwen_visual"] = torch.stack([s["qwen_visual"] for s in samples], dim=0)
-        batch["qwen_text"] = torch.stack([s["qwen_text"] for s in samples], dim=0)
+        batch["lang_tokens"] = torch.stack([s["lang_tokens"] for s in samples], dim=0)
+        batch["lang_mask"] = torch.stack([s["lang_mask"] for s in samples], dim=0)
+        batch["img_tokens"] = torch.stack([s["img_tokens"] for s in samples], dim=0)
+        batch["img_mask"] = torch.stack([s["img_mask"] for s in samples], dim=0)
         
     return batch
 
@@ -430,11 +434,11 @@ def main():
             "action_time_mask": raw_batch["action_time_mask"].to(device),
             "action_dim_mask": raw_batch["action_dim_mask"].to(device),
             "ctrl_freq": raw_batch["ctrl_freq"].to(device),
-            "lang_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
-            "lang_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
-            "img_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-            "qwen_kv": qwen_kv,
+            "lang_tokens": raw_batch["lang_tokens"].to(device),
+            "lang_mask": raw_batch["lang_mask"].to(device),
+            "img_tokens": raw_batch["img_tokens"].to(device),
+            "img_mask": raw_batch["img_mask"].to(device),
+            "qwen_kv": raw_batch["qwen_kv"].to(device) if "qwen_kv" in raw_batch else qwen_kv,
         }
         
         # Step 1: Run one optimization step so that ffn_final.fc2.weight becomes non-zero
@@ -528,11 +532,11 @@ def main():
                 "action_time_mask": raw_batch["action_time_mask"].to(device),
                 "action_dim_mask": raw_batch["action_dim_mask"].to(device),
                 "ctrl_freq": raw_batch["ctrl_freq"].to(device),
-                "lang_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
-                "lang_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-                "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
-                "img_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-                "qwen_kv": qwen_kv,
+                "lang_tokens": raw_batch["lang_tokens"].to(device),
+                "lang_mask": raw_batch["lang_mask"].to(device),
+                "img_tokens": raw_batch["img_tokens"].to(device),
+                "img_mask": raw_batch["img_mask"].to(device),
+                "qwen_kv": raw_batch["qwen_kv"].to(device) if "qwen_kv" in raw_batch else qwen_kv,
             }
 
             # Reset RNG so noise added in diffusion is deterministic each step
@@ -605,11 +609,11 @@ def main():
             "action_time_mask": raw_batch["action_time_mask"].to(device),
             "action_dim_mask": raw_batch["action_dim_mask"].to(device),
             "ctrl_freq": raw_batch["ctrl_freq"].to(device),
-            "lang_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
-            "lang_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-            "img_tokens": torch.zeros(raw_batch["state"].shape[0], 1, 2560, device=device),
-            "img_mask": torch.ones(raw_batch["state"].shape[0], 1, dtype=torch.bool, device=device),
-            "qwen_kv": qwen_kv,
+            "lang_tokens": raw_batch["lang_tokens"].to(device),
+            "lang_mask": raw_batch["lang_mask"].to(device),
+            "img_tokens": raw_batch["img_tokens"].to(device),
+            "img_mask": raw_batch["img_mask"].to(device),
+            "qwen_kv": raw_batch["qwen_kv"].to(device) if "qwen_kv" in raw_batch else qwen_kv,
         }
         
         optimizer.zero_grad(set_to_none=True)
