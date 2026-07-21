@@ -13,6 +13,7 @@ def write_split(
     split: str,
     count: int,
     feature_dim: int,
+    qwen_kv_dim: int,
     lang_tokens: int,
     image_tokens: int,
     horizon: int,
@@ -24,6 +25,7 @@ def write_split(
     generator = torch.Generator().manual_seed(123 if split == "train" else 456)
     with manifest.open("w", encoding="utf-8") as handle:
         for index in range(count):
+            qwen_kv = torch.randn(1, qwen_kv_dim, generator=generator)
             lang = torch.randn(lang_tokens, feature_dim, generator=generator)
             image = torch.randn(image_tokens, feature_dim, generator=generator)
             state = torch.randn(action_dim, generator=generator) * 0.1
@@ -37,6 +39,7 @@ def write_split(
             path = split_dir / f"sample_{index:06d}.pt"
             torch.save(
                 {
+                    "qwen_kv": qwen_kv.to(torch.float16),
                     "lang_tokens": lang.to(torch.float16),
                     "img_tokens": image.to(torch.float16),
                     "state": state,
@@ -54,17 +57,20 @@ def main() -> None:
     parser.add_argument("--train-count", type=int, default=64)
     parser.add_argument("--val-count", type=int, default=16)
     parser.add_argument("--feature-dim", type=int, default=64)
+    parser.add_argument("--qwen-kv-dim", type=int, default=None)
     parser.add_argument("--lang-tokens", type=int, default=12)
     parser.add_argument("--image-tokens", type=int, default=16)
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--action-dim", type=int, default=7)
     args = parser.parse_args()
     output = Path(args.output)
+    qwen_kv_dim = args.feature_dim if args.qwen_kv_dim is None else args.qwen_kv_dim
     write_split(
         output,
         "train",
         args.train_count,
         args.feature_dim,
+        qwen_kv_dim,
         args.lang_tokens,
         args.image_tokens,
         args.horizon,
@@ -75,6 +81,7 @@ def main() -> None:
         "val",
         args.val_count,
         args.feature_dim,
+        qwen_kv_dim,
         args.lang_tokens,
         args.image_tokens,
         args.horizon,
