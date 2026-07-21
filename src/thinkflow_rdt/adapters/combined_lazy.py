@@ -80,7 +80,8 @@ class LazyStandardizedDataset(TorchIterableDataset):
 
     Splits are deterministic hash partitions over episode ids. This gives an
     approximate 80/10/10 split without a full pre-scan, and prevents an episode
-    from appearing in multiple splits.
+    from appearing in multiple train/validation/test splits. Optional curriculum
+    stages are deterministic hash partitions over sampled timesteps.
     """
 
     def __init__(
@@ -90,6 +91,9 @@ class LazyStandardizedDataset(TorchIterableDataset):
         split_name: str,
         split_ratios: Sequence[float] = DEFAULT_SPLIT_RATIOS,
         seed: int = 0,
+        stage: int | None = None,
+        stage_count: int = 3,
+        droid_stage_count: int = 2,
         horizon: int = DEFAULT_HORIZON,
         normalize_actions: bool = True,
         filter_empty_language: bool = True,
@@ -107,6 +111,9 @@ class LazyStandardizedDataset(TorchIterableDataset):
         self.split_name = split_name
         self.split_ratios = tuple(float(ratio) for ratio in split_ratios)
         self.seed = int(seed)
+        self.stage = stage
+        self.stage_count = int(stage_count)
+        self.droid_stage_count = int(droid_stage_count)
         self.horizon = horizon
         self.normalize_actions = normalize_actions
         self.filter_empty_language = filter_empty_language
@@ -154,7 +161,6 @@ class LazyStandardizedDataset(TorchIterableDataset):
             )
             if assigned_split != self.split_name:
                 continue
-
             if worker is not None:
                 if split_seen % worker.num_workers != worker.id:
                     split_seen += 1
@@ -175,6 +181,16 @@ class LazyStandardizedDataset(TorchIterableDataset):
                 gripper_window_after=self.gripper_window_after,
             )
             for step_index in step_indices:
+                if self.stage is not None and not sample_belongs_to_stage(
+                    self.dataset_id,
+                    episode_id,
+                    step_index,
+                    self.stage,
+                    stage_count=self.stage_count,
+                    droid_stage_count=self.droid_stage_count,
+                    seed=self.seed,
+                ):
+                    continue
                 yield self._sample_from_episode(episode, step_index)
 
     @property
@@ -338,6 +354,9 @@ def build_lazy_combined_standardized_splits(
     root: str | Path | None = None,
     split_ratios: Sequence[float] = DEFAULT_SPLIT_RATIOS,
     seed: int = 0,
+    stage: int | None = None,
+    stage_count: int = 3,
+    droid_stage_count: int = 2,
     horizon: int = DEFAULT_HORIZON,
     normalize_actions: bool = True,
     filter_empty_language: bool = True,
@@ -364,6 +383,9 @@ def build_lazy_combined_standardized_splits(
                         split_name=split_name,
                         split_ratios=split_ratios,
                         seed=seed,
+                        stage=stage,
+                        stage_count=stage_count,
+                        droid_stage_count=droid_stage_count,
                         horizon=horizon,
                         normalize_actions=normalize_actions,
                         filter_empty_language=filter_empty_language,
@@ -446,6 +468,93 @@ def episode_belongs_to_split(
             seed=seed,
         )
         == split_name
+    )
+
+
+def episode_stage_index(
+    dataset_id: str,
+    episode_id: str,
+    *,
+    stage_count: int = 3,
+    droid_stage_count: int = 2,
+    seed: int = 0,
+) -> int:
+    active_stage_count = droid_stage_count if dataset_id == "droid" else stage_count
+    if active_stage_count <= 0:
+        raise ValueError("active stage count must be positive")
+    key = f"stage:{seed}:{dataset_id}:{episode_id}".encode("utf-8")
+    digest = hashlib.blake2b(key, digest_size=8).digest()
+    bucket = int.from_bytes(digest, byteorder="little", signed=False) / float(2**64)
+    return min(int(bucket * active_stage_count), active_stage_count - 1) + 1
+
+
+def episode_belongs_to_stage(
+    dataset_id: str,
+    episode_id: str,
+    stage: int,
+    *,
+    stage_count: int = 3,
+    droid_stage_count: int = 2,
+    seed: int = 0,
+) -> bool:
+    if stage < 1 or stage > stage_count:
+        raise ValueError(f"stage must be in [1, {stage_count}], got {stage}")
+    if dataset_id == "droid" and stage > droid_stage_count:
+        return False
+    return (
+        episode_stage_index(
+            dataset_id,
+            episode_id,
+            stage_count=stage_count,
+            droid_stage_count=droid_stage_count,
+            seed=seed,
+        )
+        == stage
+    )
+
+
+def sample_stage_index(
+    dataset_id: str,
+    episode_id: str,
+    step_index: int,
+    *,
+    stage_count: int = 3,
+    droid_stage_count: int = 2,
+    seed: int = 0,
+) -> int:
+    active_stage_count = droid_stage_count if dataset_id == "droid" else stage_count
+    if active_stage_count <= 0:
+        raise ValueError("active stage count must be positive")
+    key = f"stage:{seed}:{dataset_id}:{episode_id}:{step_index}".encode("utf-8")
+    digest = hashlib.blake2b(key, digest_size=8).digest()
+    bucket = int.from_bytes(digest, byteorder="little", signed=False) / float(2**64)
+    return min(int(bucket * active_stage_count), active_stage_count - 1) + 1
+
+
+def sample_belongs_to_stage(
+    dataset_id: str,
+    episode_id: str,
+    step_index: int,
+    stage: int,
+    *,
+    stage_count: int = 3,
+    droid_stage_count: int = 2,
+    seed: int = 0,
+) -> bool:
+    if stage < 1 or stage > stage_count:
+        raise ValueError(f"stage must be in [1, {stage_count}], got {stage}")
+    if dataset_id == "droid" and stage > droid_stage_count:
+        return False
+    return (
+        sample_stage_index(
+            dataset_id,
+            episode_id,
+            step_index,
+            stage_count=stage_count,
+            droid_stage_count=droid_stage_count,
+            seed=seed,
+        )
+        == stage
     )
 
 

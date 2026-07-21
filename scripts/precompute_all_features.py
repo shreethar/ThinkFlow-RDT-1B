@@ -677,6 +677,24 @@ def parse_args() -> argparse.Namespace:
         help="Dataset id to include. Repeat for multiple. Defaults to all.",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--stage",
+        type=int,
+        choices=[1, 2, 3],
+        default=None,
+        help=(
+            "Optional curriculum/precompute stage. Sampled timesteps from non-Droid "
+            "datasets are split across stages 1/2/3; Droid samples are split across "
+            "stages 1/2 and excluded from stage 3."
+        ),
+    )
+    parser.add_argument("--stage-count", type=int, default=3)
+    parser.add_argument("--droid-stage-count", type=int, default=2)
+    parser.add_argument(
+        "--no-stage-subdir",
+        action="store_true",
+        help="When --stage is set, write directly to --output-dir instead of output-dir/stage_N.",
+    )
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--max-samples-per-split", type=int, default=None)
     parser.add_argument("--max-batches-per-split", type=int, default=None)
@@ -733,13 +751,19 @@ def main() -> None:
     splits = build_combined_standardized_splits(
         configs=configs,
         seed=seed,
+        stage=args.stage,
+        stage_count=args.stage_count,
+        droid_stage_count=args.droid_stage_count,
         horizon=cfg.model.pred_horizon,
         normalize_actions=not args.no_normalize_actions,
     )
     split_names = args.split or list(SPLIT_NAMES)
 
     models = load_models(args, cfg, device)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = args.output_dir
+    if args.stage is not None and not args.no_stage_subdir:
+        output_dir = output_dir / f"stage_{args.stage}"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     run_metadata = {
         "config": args.config,
@@ -747,6 +771,10 @@ def main() -> None:
         "splits": split_names,
         "datasets": [config.dataset_id for config in configs],
         "seed": seed,
+        "stage": args.stage,
+        "stage_unit": "sampled_timestep",
+        "stage_count": args.stage_count,
+        "droid_stage_count": args.droid_stage_count,
         "batch_size": args.batch_size,
         "normalize_actions": not args.no_normalize_actions,
         "qwen_model_id": args.qwen_model_id,
@@ -757,7 +785,7 @@ def main() -> None:
             args.siglip_fallback_model_id,
         ),
     }
-    (args.output_dir / "precompute_metadata.json").write_text(
+    (output_dir / "precompute_metadata.json").write_text(
         json.dumps(run_metadata, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -766,7 +794,7 @@ def main() -> None:
         precompute_split(
             split_name=split_name,
             dataset=splits[split_name],
-            output_dir=args.output_dir,
+            output_dir=output_dir,
             cfg=cfg,
             args=args,
             models=models,

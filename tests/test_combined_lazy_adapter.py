@@ -3,8 +3,12 @@ from __future__ import annotations
 from thinkflow_rdt.adapters.combined_lazy import (
     LazyCombinedStandardizedDataset,
     default_lazy_standardized_dataset_configs,
+    episode_belongs_to_stage,
+    episode_stage_index,
     episode_split_name,
     is_missing_local_shard_error,
+    sample_belongs_to_stage,
+    sample_stage_index,
 )
 
 
@@ -72,3 +76,25 @@ def test_default_configs_accept_mock_dataset_root_directly(tmp_path):
     )
 
     assert configs[0].data_dir == data_dir
+
+
+def test_stage_assignment_is_deterministic_and_droid_skips_stage_three():
+    episode_id = "episode_123"
+
+    first = sample_stage_index("bridge", episode_id, 12, seed=7)
+    second = sample_stage_index("bridge", episode_id, 12, seed=7)
+
+    assert first == second
+    assert first in {1, 2, 3}
+    assert sample_belongs_to_stage("droid", episode_id, 12, 3, seed=7) is False
+
+
+def test_legacy_episode_stage_helpers_remain_available():
+    episode_id = "episode_123"
+
+    first = episode_stage_index("bridge", episode_id, seed=7)
+    second = episode_stage_index("bridge", episode_id, seed=7)
+
+    assert first == second
+    assert first in {1, 2, 3}
+    assert episode_belongs_to_stage("droid", episode_id, 3, seed=7) is False
