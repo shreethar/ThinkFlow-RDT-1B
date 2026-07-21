@@ -39,6 +39,8 @@ def create_dataloader(
         feature_dim=cfg.model.qwen_hidden_size,
         state_dim=cfg.model.state_dim,
         action_dim=cfg.model.action_dim,
+        lang_token_dim=cfg.model.lang_token_dim,
+        img_token_dim=cfg.model.img_token_dim,
     )
     persistent = cfg.data.persistent_workers and cfg.data.num_workers > 0
     return DataLoader(
