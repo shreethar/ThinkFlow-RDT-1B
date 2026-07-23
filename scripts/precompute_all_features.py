@@ -9,7 +9,7 @@ import shutil
 import sys
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -21,6 +21,8 @@ from transformers import (
     AutoProcessor,
     SiglipImageProcessor,
     SiglipVisionModel,
+    StoppingCriteria,
+    StoppingCriteriaList,
     T5EncoderModel,
     T5Tokenizer,
 )
@@ -48,6 +50,23 @@ CTRL_FREQ_BY_DATASET = {
 }
 IMAGE_KEYS = ("primary", "wrist", "secondary")
 SPLIT_NAMES = ("train", "validation", "test")
+QWEN_TRAJECTORY_PROMPT_TEMPLATE = (
+    "You are a robot manipulation assistant. Given an observation image and a "
+    "task instruction, predict the end-effector's 2D trajectory as 5 waypoints. "
+    "Output ONLY the coordinate list in this exact format: "
+    "[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]\n\n"
+    "Task: The task is {task}. What is the trajectory that the end effector should take?"
+)
+
+
+class StopAfterSubsequence(StoppingCriteria):
+    def __init__(self, subsequence_ids: list[int]) -> None:
+        self.subsequence_ids = list(subsequence_ids)
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any) -> bool:
+        if not self.subsequence_ids:
+            return False
+        return all(find_subsequence(sequence, self.subsequence_ids) != -1 for sequence in input_ids)
 
 
 def find_subsequence(sequence: torch.Tensor | list[int], subsequence: list[int]) -> int:
@@ -92,6 +111,30 @@ def as_rgb_pil(image: Any) -> Image.Image | None:
 
 def blank_rgb_image(size: int = 384) -> Image.Image:
     return Image.new("RGB", (size, size), color=(0, 0, 0))
+
+
+def format_qwen_trajectory_prompt(task: str, template: str = QWEN_TRAJECTORY_PROMPT_TEMPLATE) -> str:
+    return template.format(task=str(task).strip())
+
+
+def apply_qwen_chat_template(
+    processor: Any,
+    messages: list[dict[str, Any]],
+    *,
+    enable_thinking: bool,
+) -> str:
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+    }
+    try:
+        return processor.apply_chat_template(
+            messages,
+            **kwargs,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        return processor.apply_chat_template(messages, **kwargs)
 
 
 def image_to_jpeg_bytes(image: Image.Image, *, quality: int = 90) -> bytes:
@@ -181,6 +224,11 @@ def image_slots_for_sample(
     return slots, slot_mask, qwen_images
 
 
+def primary_image_for_qwen(sample: dict[str, Any]) -> Image.Image:
+    image = as_rgb_pil(sample.get("images", {}).get("primary"))
+    return image if image is not None else blank_rgb_image()
+
+
 def standardized_collate_fn(
     samples: list[dict[str, Any]],
     *,
@@ -196,7 +244,7 @@ def standardized_collate_fn(
     skipped_no_image = 0
 
     for sample in samples:
-        slots, slot_mask, qwen_images = image_slots_for_sample(
+        slots, slot_mask, _qwen_images = image_slots_for_sample(
             sample,
             image_history_size=image_history_size,
             max_images_per_sample=max_images_per_sample,
@@ -204,10 +252,8 @@ def standardized_collate_fn(
         if not any(slot_mask) and skip_no_image:
             skipped_no_image += 1
             continue
-        if not qwen_images:
-            qwen_images = [blank_rgb_image()]
         kept.append(sample)
-        qwen_image_groups.append(qwen_images)
+        qwen_image_groups.append([primary_image_for_qwen(sample)])
         siglip_image_slots.append(slots)
         siglip_slot_masks.append(slot_mask)
 
@@ -259,6 +305,7 @@ def standardized_collate_fn(
             }
             for sample, dataset_id, slot_mask in zip(kept, dataset_ids, siglip_slot_masks)
         ],
+        "kept_samples": kept,
         "skipped_no_image": skipped_no_image,
     }
 
@@ -285,19 +332,27 @@ def extract_qwen_kv(
     layer_index: int,
     max_new_tokens: int,
     expected_dim: int | None,
+    stop_at_think_end: bool = True,
+    prompt_template: str | None = QWEN_TRAJECTORY_PROMPT_TEMPLATE,
+    enable_thinking: bool = True,
 ) -> torch.Tensor:
     texts_list: list[str] = []
     images_list: list[list[Image.Image]] = []
 
     for instruction, images in zip(batch["instructions"], batch["qwen_images"]):
+        qwen_instruction = (
+            format_qwen_trajectory_prompt(instruction, prompt_template)
+            if prompt_template is not None
+            else str(instruction)
+        )
         content = [{"type": "image", "image": image} for image in images]
-        content.append({"type": "text", "text": instruction})
+        content.append({"type": "text", "text": qwen_instruction})
         messages = [{"role": "user", "content": content}]
         texts_list.append(
-            processor.apply_chat_template(
+            apply_qwen_chat_template(
+                processor,
                 messages,
-                tokenize=False,
-                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
             )
         )
         images_list.append(images)
@@ -316,6 +371,10 @@ def extract_qwen_kv(
     tokenizer = processor.tokenizer
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     eos_token_id = im_end_id if im_end_id is not None else tokenizer.eos_token_id
+    think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+    stopping_criteria = None
+    if stop_at_think_end and think_end_ids:
+        stopping_criteria = StoppingCriteriaList([StopAfterSubsequence(think_end_ids)])
 
     generated = vlm.generate(
         **inputs,
@@ -328,6 +387,7 @@ def extract_qwen_kv(
         output_hidden_states=False,
         eos_token_id=eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
+        stopping_criteria=stopping_criteria,
     )
 
     generated_ids = generated.sequences
@@ -342,7 +402,6 @@ def extract_qwen_kv(
         keys = past_key_values.layers[layer_index].keys
         values = past_key_values.layers[layer_index].values
 
-    think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
     kv_vectors: list[torch.Tensor] = []
     cache_len = keys.shape[2]
 
@@ -631,6 +690,254 @@ def save_batch_records(
     return start_index + batch_size
 
 
+def iter_episode_sample_groups(dataset: Any) -> Iterable[list[dict[str, Any]]]:
+    current_key: tuple[str, str] | None = None
+    current_samples: list[dict[str, Any]] = []
+    for sample in dataset:
+        key = (str(sample["dataset_id"]), str(sample["episode_id"]))
+        if current_key is None:
+            current_key = key
+        if key != current_key:
+            if current_samples:
+                yield current_samples
+            current_key = key
+            current_samples = []
+        current_samples.append(sample)
+    if current_samples:
+        yield current_samples
+
+
+def sample_gripper_binary(sample: dict[str, Any], *, normalized_actions: bool) -> int:
+    actions = np.asarray(sample["actions"], dtype=np.float32)
+    value = float(actions[0, 6])
+    threshold = 0.0 if normalized_actions else 0.5
+    return int(value >= threshold)
+
+
+def select_episode_qwen_anchors(
+    samples: list[dict[str, Any]],
+    *,
+    normalized_actions: bool,
+) -> list[dict[str, Any]]:
+    if not samples:
+        return []
+    anchors = [samples[0]]
+    previous = sample_gripper_binary(samples[0], normalized_actions=normalized_actions)
+    for sample in samples[1:]:
+        current = sample_gripper_binary(sample, normalized_actions=normalized_actions)
+        if current != previous:
+            if str(sample["step_idx"]) != str(samples[0]["step_idx"]):
+                anchors.append(sample)
+            break
+        previous = current
+    return anchors
+
+
+def qwen_anchor_batch(
+    anchors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "instructions": [str(sample["instruction"]) for sample in anchors],
+        "qwen_images": [[primary_image_for_qwen(sample)] for sample in anchors],
+    }
+
+
+def t5_episode_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"instructions": [str(samples[0]["instruction"])]}
+
+
+def anchor_index_for_step(
+    step_idx: int,
+    anchors: list[dict[str, Any]],
+) -> int:
+    anchor_steps = [int(anchor["step_idx"]) for anchor in anchors]
+    selected = 0
+    for index, anchor_step in enumerate(anchor_steps):
+        if anchor_step <= step_idx:
+            selected = index
+        else:
+            break
+    return selected
+
+
+def save_episode_anchor_records(
+    *,
+    split_dir: Path,
+    manifest_handle: Any,
+    start_index: int,
+    batch: dict[str, Any],
+    anchors: list[dict[str, Any]],
+    qwen_kv_by_anchor: torch.Tensor,
+    lang_tokens: torch.Tensor,
+    lang_mask: torch.Tensor,
+    save_padded_features: bool,
+    cache_image_slots: bool,
+) -> int:
+    batch_size = len(batch["metadata"])
+    episode_lang_tokens = lang_tokens[0]
+    episode_lang_mask = lang_mask[0]
+    if not save_padded_features:
+        episode_lang_tokens = compact_tokens(episode_lang_tokens, episode_lang_mask)
+        episode_lang_mask = torch.ones(
+            episode_lang_tokens.shape[0],
+            dtype=torch.bool,
+            device=episode_lang_tokens.device,
+        )
+
+    for batch_index in range(batch_size):
+        global_index = start_index + batch_index
+        metadata = batch["metadata"][batch_index]
+        step_idx = int(metadata["step_idx"])
+        anchor_index = anchor_index_for_step(step_idx, anchors)
+        anchor = anchors[anchor_index]
+        filename = f"sample_{global_index:09d}.pt"
+        path = split_dir / filename
+        record = {
+            "qwen_kv": qwen_kv_by_anchor[anchor_index].cpu(),
+            "lang_tokens": episode_lang_tokens.cpu(),
+            "lang_mask": episode_lang_mask.cpu(),
+            "state": batch["state"][batch_index].cpu(),
+            "actions": batch["actions"][batch_index].cpu(),
+            "action_time_mask": batch["action_time_mask"][batch_index].cpu(),
+            "action_dim_mask": batch["action_dim_mask"][batch_index].cpu(),
+            "ctrl_freq": float(batch["ctrl_freq"][batch_index].item()),
+            "qwen_cache_scope": "episode_anchors",
+            "qwen_anchor_step_idx": str(anchor["step_idx"]),
+            "qwen_anchor_kind": "first_step" if anchor_index == 0 else "first_gripper_change",
+            **metadata,
+        }
+        if cache_image_slots:
+            record["image_slot_jpegs"] = batch["image_slot_jpegs"][batch_index]
+            record["image_slot_mask"] = batch["siglip_slot_mask"][batch_index].cpu()
+        torch.save(record, path)
+        manifest_handle.write(
+            json.dumps(
+                {
+                    "path": filename,
+                    "dataset_id": metadata["dataset_id"],
+                    "episode_id": metadata["episode_id"],
+                    "step_idx": metadata["step_idx"],
+                    "image_count": metadata["image_count"],
+                    "image_slot_count": metadata["image_slot_count"],
+                    "lang_token_count": int(episode_lang_tokens.shape[0]),
+                    "img_token_count": None,
+                    "has_img_tokens": False,
+                    "has_image_slots": cache_image_slots,
+                    "qwen_cache_scope": "episode_anchors",
+                    "qwen_anchor_step_idx": str(anchor["step_idx"]),
+                    "qwen_anchor_kind": "first_step" if anchor_index == 0 else "first_gripper_change",
+                }
+            )
+            + "\n"
+        )
+    return start_index + batch_size
+
+
+def precompute_split_episode_anchors(
+    *,
+    split_name: str,
+    dataset: Any,
+    output_dir: Path,
+    cfg: Any,
+    args: argparse.Namespace,
+    models: dict[str, Any],
+    device: torch.device,
+) -> None:
+    if args.feature_set != "qwen_t5":
+        raise ValueError("episode_anchors currently supports --feature-set qwen_t5 only")
+
+    split_dir = output_dir / split_name
+    manifest_path = prepare_split_output(split_dir, overwrite=args.overwrite)
+    tmp_manifest_path = split_dir / "manifest.jsonl.tmp"
+
+    sample_count = 0
+    episode_count = 0
+    skipped_no_image = 0
+    with tmp_manifest_path.open("w", encoding="utf-8") as manifest:
+        progress = tqdm(
+            iter_episode_sample_groups(dataset),
+            desc=f"precompute {split_name} episodes",
+            unit="episode",
+        )
+        for episode_samples in progress:
+            if args.max_batches_per_split is not None and episode_count >= args.max_batches_per_split:
+                break
+            if args.max_samples_per_split is not None and sample_count >= args.max_samples_per_split:
+                break
+
+            batch = standardized_collate_fn(
+                episode_samples,
+                max_images_per_sample=args.max_images_per_sample,
+                image_history_size=args.image_history_size,
+                image_jpeg_quality=args.image_jpeg_quality,
+                skip_no_image=not args.keep_no_image,
+            )
+            if batch is None:
+                skipped_no_image += len(episode_samples)
+                continue
+
+            kept_samples = list(batch["kept_samples"])
+
+            if args.max_samples_per_split is not None:
+                keep = min(args.max_samples_per_split - sample_count, len(batch["metadata"]))
+                if keep <= 0:
+                    break
+                for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
+                    batch[key] = batch[key][:keep]
+                batch["metadata"] = batch["metadata"][:keep]
+                batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
+                batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]
+                kept_samples = kept_samples[:keep]
+
+            anchors = select_episode_qwen_anchors(
+                kept_samples,
+                normalized_actions=not args.no_normalize_actions,
+            )
+            qwen_kv_by_anchor = extract_qwen_kv(
+                qwen_anchor_batch(anchors),
+                models["qwen_processor"],
+                models["qwen_vlm"],
+                device=device,
+                layer_index=args.qwen_layer_index,
+                max_new_tokens=args.qwen_max_new_tokens,
+                expected_dim=cfg.model.qwen_kv_dim,
+                stop_at_think_end=args.qwen_stop_at_think,
+                prompt_template=args.qwen_trajectory_prompt_template,
+                enable_thinking=args.qwen_enable_thinking,
+            )
+            lang_tokens, lang_mask = extract_t5_features(
+                t5_episode_batch(kept_samples),
+                models["t5_tokenizer"],
+                models["t5_encoder"],
+                max_lang_tokens=cfg.model.max_lang_tokens,
+                expected_dim=cfg.model.lang_token_dim,
+                device=device,
+            )
+
+            sample_count = save_episode_anchor_records(
+                split_dir=split_dir,
+                manifest_handle=manifest,
+                start_index=sample_count,
+                batch=batch,
+                anchors=anchors,
+                qwen_kv_by_anchor=qwen_kv_by_anchor,
+                lang_tokens=lang_tokens,
+                lang_mask=lang_mask,
+                save_padded_features=args.save_padded_features,
+                cache_image_slots=True,
+            )
+            episode_count += 1
+            progress.set_postfix(samples=sample_count, episodes=episode_count)
+
+            if args.empty_cache_every > 0 and episode_count % args.empty_cache_every == 0:
+                torch.cuda.empty_cache()
+
+    shutil.move(str(tmp_manifest_path), str(manifest_path))
+    print(f"[{split_name}] wrote {sample_count} samples from {episode_count} episodes to {split_dir}")
+    if skipped_no_image:
+        print(f"[{split_name}] skipped {skipped_no_image} samples with no available images")
+
+
 def precompute_split(
     *,
     split_name: str,
@@ -641,6 +948,18 @@ def precompute_split(
     models: dict[str, Any],
     device: torch.device,
 ) -> None:
+    if args.qwen_cache_scope == "episode_anchors":
+        precompute_split_episode_anchors(
+            split_name=split_name,
+            dataset=dataset,
+            output_dir=output_dir,
+            cfg=cfg,
+            args=args,
+            models=models,
+            device=device,
+        )
+        return
+
     split_dir = output_dir / split_name
     manifest_path = prepare_split_output(split_dir, overwrite=args.overwrite)
     tmp_manifest_path = split_dir / "manifest.jsonl.tmp"
@@ -680,6 +999,9 @@ def precompute_split(
                 layer_index=args.qwen_layer_index,
                 max_new_tokens=args.qwen_max_new_tokens,
                 expected_dim=cfg.model.qwen_kv_dim,
+                stop_at_think_end=args.qwen_stop_at_think,
+                prompt_template=args.qwen_trajectory_prompt_template,
+                enable_thinking=args.qwen_enable_thinking,
             )
             lang_tokens, lang_mask = extract_t5_features(
                 batch,
@@ -878,6 +1200,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen-model-id", default="shreethar/stage1_unsloth")
     parser.add_argument("--qwen-layer-index", type=int, default=7)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--qwen-cache-scope",
+        choices=["auto", "per_sample", "episode_anchors"],
+        default="auto",
+        help=(
+            "Qwen KV caching granularity. auto uses episode_anchors for --feature-set "
+            "qwen_t5 and per_sample for --feature-set all."
+        ),
+    )
+    parser.add_argument(
+        "--qwen-stop-at-think",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop Qwen generation as soon as every sequence has emitted </think>.",
+    )
+    parser.add_argument(
+        "--qwen-enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Request Qwen thinking mode in the chat template when the processor supports it.",
+    )
+    parser.add_argument(
+        "--qwen-trajectory-prompt-template",
+        default=QWEN_TRAJECTORY_PROMPT_TEMPLATE,
+        help=(
+            "Prompt template for Qwen KV extraction. Must contain {task}."
+        ),
+    )
     parser.add_argument("--attn-implementation", default="sdpa")
 
     parser.add_argument(
@@ -904,6 +1254,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+    if args.qwen_cache_scope == "auto":
+        args.qwen_cache_scope = (
+            "episode_anchors" if args.feature_set == "qwen_t5" else "per_sample"
+        )
+    if args.qwen_cache_scope == "episode_anchors" and args.feature_set != "qwen_t5":
+        raise ValueError("--qwen-cache-scope episode_anchors requires --feature-set qwen_t5")
+    if "{task}" not in args.qwen_trajectory_prompt_template:
+        raise ValueError("--qwen-trajectory-prompt-template must contain {task}")
     seed = cfg.seed if args.seed is None else args.seed
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.device_map == "cuda" and device.type != "cuda":
@@ -946,6 +1304,11 @@ def main() -> None:
         "batch_size": args.batch_size,
         "normalize_actions": not args.no_normalize_actions,
         "feature_set": args.feature_set,
+        "qwen_cache_scope": args.qwen_cache_scope,
+        "qwen_stop_at_think": args.qwen_stop_at_think,
+        "qwen_enable_thinking": args.qwen_enable_thinking,
+        "qwen_image_source": "primary_current_frame",
+        "qwen_trajectory_prompt_template": args.qwen_trajectory_prompt_template,
         "image_history_size": args.image_history_size,
         "max_images_per_sample": args.max_images_per_sample,
         "image_jpeg_quality": args.image_jpeg_quality,
