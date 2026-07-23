@@ -338,6 +338,13 @@ def upload_dataset_selection(
         f"[{repo_id}] {config.dataset_id}: {shard_summary}, "
         f"target={selection.target_episodes}, raw={selection.raw_episode_count}"
     )
+    if selection.missing_files:
+        preview = ", ".join(path.name for path in selection.missing_files[:5])
+        suffix = "" if len(selection.missing_files) <= 5 else f", ... +{len(selection.missing_files) - 5}"
+        print(
+            f"[{repo_id}] {config.dataset_id}: missing {len(selection.missing_files)} "
+            f"selected local shard files: {preview}{suffix}"
+        )
 
     if dry_run:
         print(f"DRY RUN: would upload folder {config.data_dir} -> {data_path_in_repo}")
@@ -536,7 +543,7 @@ def main() -> None:
                 config,
                 part=part,
                 boundary_policy=args.boundary_policy,
-                skip_missing=args.skip_missing,
+                skip_missing=args.skip_missing or args.dry_run,
             )
             selections.append(selection)
             upload_dataset_selection(
