@@ -451,6 +451,11 @@ def prepare_split_output(split_dir: Path, *, overwrite: bool) -> Path:
     return manifest_path
 
 
+def compact_tokens(tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(device=tokens.device, dtype=torch.bool)
+    return tokens[mask].contiguous()
+
+
 def save_batch_records(
     *,
     split_dir: Path,
@@ -462,6 +467,7 @@ def save_batch_records(
     lang_mask: torch.Tensor,
     img_tokens: torch.Tensor,
     img_mask: torch.Tensor,
+    save_padded_features: bool,
 ) -> int:
     batch_size = qwen_kv.shape[0]
     for batch_index in range(batch_size):
@@ -469,12 +475,25 @@ def save_batch_records(
         metadata = batch["metadata"][batch_index]
         filename = f"sample_{global_index:09d}.pt"
         path = split_dir / filename
+        sample_lang_tokens = lang_tokens[batch_index]
+        sample_lang_mask = lang_mask[batch_index]
+        sample_img_tokens = img_tokens[batch_index]
+        sample_img_mask = img_mask[batch_index]
+        if not save_padded_features:
+            sample_lang_tokens = compact_tokens(sample_lang_tokens, sample_lang_mask)
+            sample_img_tokens = compact_tokens(sample_img_tokens, sample_img_mask)
+            sample_lang_mask = torch.ones(
+                sample_lang_tokens.shape[0], dtype=torch.bool, device=sample_lang_tokens.device
+            )
+            sample_img_mask = torch.ones(
+                sample_img_tokens.shape[0], dtype=torch.bool, device=sample_img_tokens.device
+            )
         record = {
             "qwen_kv": qwen_kv[batch_index].cpu(),
-            "lang_tokens": lang_tokens[batch_index].cpu(),
-            "lang_mask": lang_mask[batch_index].cpu(),
-            "img_tokens": img_tokens[batch_index].cpu(),
-            "img_mask": img_mask[batch_index].cpu(),
+            "lang_tokens": sample_lang_tokens.cpu(),
+            "lang_mask": sample_lang_mask.cpu(),
+            "img_tokens": sample_img_tokens.cpu(),
+            "img_mask": sample_img_mask.cpu(),
             "state": batch["state"][batch_index].cpu(),
             "actions": batch["actions"][batch_index].cpu(),
             "action_time_mask": batch["action_time_mask"][batch_index].cpu(),
@@ -490,6 +509,9 @@ def save_batch_records(
                     "dataset_id": metadata["dataset_id"],
                     "episode_id": metadata["episode_id"],
                     "step_idx": metadata["step_idx"],
+                    "image_count": metadata["image_count"],
+                    "lang_token_count": int(sample_lang_tokens.shape[0]),
+                    "img_token_count": int(sample_img_tokens.shape[0]),
                 }
             )
             + "\n"
@@ -583,6 +605,7 @@ def precompute_split(
                 lang_mask=lang_mask,
                 img_tokens=img_tokens,
                 img_mask=img_mask,
+                save_padded_features=args.save_padded_features,
             )
             progress.set_postfix(samples=sample_count, skipped_no_image=skipped_no_image)
 
@@ -704,6 +727,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-normalize-actions", action="store_true")
     parser.add_argument("--max-images-per-sample", type=int, default=3)
     parser.add_argument("--keep-no-image", action="store_true")
+    parser.add_argument(
+        "--save-padded-features",
+        action="store_true",
+        help=(
+            "Save full padded T5/SigLIP tensors. By default, only valid tokens are "
+            "saved and the training collator pads them back in memory."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--empty-cache-every", type=int, default=25)
 
@@ -777,6 +808,7 @@ def main() -> None:
         "droid_stage_count": args.droid_stage_count,
         "batch_size": args.batch_size,
         "normalize_actions": not args.no_normalize_actions,
+        "feature_storage": "padded" if args.save_padded_features else "compact_valid_tokens",
         "qwen_model_id": args.qwen_model_id,
         "qwen_layer_index": args.qwen_layer_index,
         "t5_model_id": resolve_model_id(args.t5_model_id, args.t5_fallback_model_id),
