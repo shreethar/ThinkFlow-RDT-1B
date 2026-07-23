@@ -98,6 +98,46 @@ def map_sequence_index_to_cache_index(
     return max(0, min(int(cache_index), cache_length - 1))
 
 
+def layer_key_values_from_past(
+    past_key_values: Any,
+    *,
+    layer_index: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(past_key_values, tuple):
+        keys = past_key_values[layer_index][0]
+        values = past_key_values[layer_index][1]
+    elif hasattr(past_key_values, "key_cache"):
+        keys = past_key_values.key_cache[layer_index]
+        values = past_key_values.value_cache[layer_index]
+    else:
+        keys = past_key_values.layers[layer_index].keys
+        values = past_key_values.layers[layer_index].values
+    return keys, values
+
+
+def kv_vectors_from_layer_cache(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    target_indices: list[int],
+    expected_dim: int | None,
+) -> torch.Tensor:
+    kv_vectors: list[torch.Tensor] = []
+    cache_len = int(keys.shape[2])
+    for batch_index, target_index in enumerate(target_indices):
+        target_index = max(0, min(int(target_index), cache_len - 1))
+        key_vec = keys[batch_index, :, target_index, :]
+        value_vec = values[batch_index, :, target_index, :]
+        kv_vectors.append(torch.cat([key_vec.reshape(-1), value_vec.reshape(-1)], dim=-1))
+
+    qwen_kv = torch.stack(kv_vectors, dim=0).unsqueeze(1).to(torch.bfloat16)
+    if expected_dim is not None and qwen_kv.shape[-1] != expected_dim:
+        raise ValueError(
+            f"Qwen KV dim mismatch: expected {expected_dim}, got {qwen_kv.shape[-1]}"
+        )
+    return qwen_kv
+
+
 def as_rgb_pil(image: Any) -> Image.Image | None:
     if image is None:
         return None
@@ -334,7 +374,7 @@ def extract_qwen_kv(
     expected_dim: int | None,
     stop_at_think_end: bool = True,
     prompt_template: str | None = QWEN_TRAJECTORY_PROMPT_TEMPLATE,
-    enable_thinking: bool = True,
+    enable_thinking: bool = False,
 ) -> torch.Tensor:
     texts_list: list[str] = []
     images_list: list[list[Image.Image]] = []
@@ -372,6 +412,36 @@ def extract_qwen_kv(
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     eos_token_id = im_end_id if im_end_id is not None else tokenizer.eos_token_id
     think_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+
+    prompt_target_indices: list[int] = []
+    if think_end_ids and "input_ids" in inputs:
+        for ids in inputs["input_ids"]:
+            think_end_pos = find_subsequence(ids, think_end_ids)
+            prompt_target_indices.append(think_end_pos - 1 if think_end_pos != -1 else -1)
+
+    if prompt_target_indices and all(index >= 0 for index in prompt_target_indices):
+        outputs = vlm(
+            **inputs,
+            use_cache=True,
+            return_dict=True,
+        )
+        keys, values = layer_key_values_from_past(
+            outputs.past_key_values,
+            layer_index=layer_index,
+        )
+        return kv_vectors_from_layer_cache(
+            keys,
+            values,
+            target_indices=prompt_target_indices,
+            expected_dim=expected_dim,
+        )
+
+    if prompt_target_indices and any(index >= 0 for index in prompt_target_indices):
+        raise ValueError(
+            "Mixed Qwen prompts where only some samples contain </think> are not supported. "
+            "Use a consistent --qwen-enable-thinking setting for the whole batch."
+        )
+
     stopping_criteria = None
     if stop_at_think_end and think_end_ids:
         stopping_criteria = StoppingCriteriaList([StopAfterSubsequence(think_end_ids)])
@@ -391,20 +461,12 @@ def extract_qwen_kv(
     )
 
     generated_ids = generated.sequences
-    past_key_values = generated.past_key_values
-    if isinstance(past_key_values, tuple):
-        keys = past_key_values[layer_index][0]
-        values = past_key_values[layer_index][1]
-    elif hasattr(past_key_values, "key_cache"):
-        keys = past_key_values.key_cache[layer_index]
-        values = past_key_values.value_cache[layer_index]
-    else:
-        keys = past_key_values.layers[layer_index].keys
-        values = past_key_values.layers[layer_index].values
-
-    kv_vectors: list[torch.Tensor] = []
+    keys, values = layer_key_values_from_past(
+        generated.past_key_values,
+        layer_index=layer_index,
+    )
     cache_len = keys.shape[2]
-
+    target_indices: list[int] = []
     for batch_index in range(generated_ids.shape[0]):
         ids = generated_ids[batch_index]
         prompt_length = int(inputs["attention_mask"][batch_index].sum().item())
@@ -424,17 +486,14 @@ def extract_qwen_kv(
             prompt_length=prompt_length,
             cache_length=int(cache_len),
         )
+        target_indices.append(target_index)
 
-        key_vec = keys[batch_index, :, target_index, :]
-        value_vec = values[batch_index, :, target_index, :]
-        kv_vectors.append(torch.cat([key_vec.reshape(-1), value_vec.reshape(-1)], dim=-1))
-
-    qwen_kv = torch.stack(kv_vectors, dim=0).unsqueeze(1).to(torch.bfloat16)
-    if expected_dim is not None and qwen_kv.shape[-1] != expected_dim:
-        raise ValueError(
-            f"Qwen KV dim mismatch: expected {expected_dim}, got {qwen_kv.shape[-1]}"
-        )
-    return qwen_kv
+    return kv_vectors_from_layer_cache(
+        keys,
+        values,
+        target_indices=target_indices,
+        expected_dim=expected_dim,
+    )
 
 
 @torch.inference_mode()
@@ -1218,7 +1277,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--qwen-enable-thinking",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Request Qwen thinking mode in the chat template when the processor supports it.",
     )
     parser.add_argument(
