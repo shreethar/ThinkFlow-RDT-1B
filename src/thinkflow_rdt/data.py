@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,11 +31,15 @@ ONLINE_SIGLIP_REQUIRED_KEYS = {
 
 class CachedFeatureDataset(Dataset[dict[str, Any]]):
     """
-    Stable indexed dataset backed by one .pt file per timestep.
+    Stable indexed dataset backed by cached feature .pt files.
 
     Each manifest line can be either:
       {"path": "relative/or/absolute/sample.pt"}
     or a plain JSON string containing the path.
+
+    Newer manifests may point at one episode pack per line:
+      {"path": "episode_000000000.pt", "cache_layout": "episode_pack", "num_samples": 64}
+    In that case this dataset expands the episode pack into sample-level items.
     """
 
     def __init__(
@@ -48,7 +53,7 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         if not self.manifest_path.exists():
             raise FileNotFoundError(self.manifest_path)
         self.base_dir = self.manifest_path.parent
-        self.paths: list[Path] = []
+        self.entries: list[dict[str, Any]] = []
         with self.manifest_path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
                 line = line.strip()
@@ -63,20 +68,127 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
                 path = Path(path_value)
                 if not path.is_absolute():
                     path = (self.base_dir / path).resolve()
-                self.paths.append(path)
-        if not self.paths:
+                if isinstance(item, dict) and item.get("cache_layout") == "episode_pack":
+                    num_samples = int(item.get("num_samples", 0))
+                    if num_samples <= 0:
+                        raise ValueError(
+                            f"Episode-pack manifest line {line_number} has invalid "
+                            f"num_samples={num_samples}: {self.manifest_path}"
+                        )
+                    for sample_index in range(num_samples):
+                        self.entries.append(
+                            {
+                                "path": path,
+                                "cache_layout": "episode_pack",
+                                "sample_index": sample_index,
+                            }
+                        )
+                else:
+                    self.entries.append(
+                        {
+                            "path": path,
+                            "cache_layout": "sample",
+                            "sample_index": None,
+                        }
+                    )
+        if not self.entries:
             raise ValueError(f"Manifest is empty: {self.manifest_path}")
+        self.paths = [entry["path"] for entry in self.entries]
+        self._pack_cache: OrderedDict[Path, dict[str, Any]] = OrderedDict()
+        self._pack_cache_size = 8
 
     def __len__(self) -> int:
-        return len(self.paths)
+        return len(self.entries)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        path = self.paths[index]
-        sample = torch.load(path, map_location="cpu", weights_only=False)
+        entry = self.entries[index]
+        path = entry["path"]
+        if entry["cache_layout"] == "episode_pack":
+            pack = self._load_episode_pack(path)
+            sample = self._sample_from_episode_pack(
+                pack,
+                int(entry["sample_index"]),
+                path=path,
+            )
+        else:
+            sample = torch.load(path, map_location="cpu", weights_only=False)
         missing = self.required_keys.difference(sample)
         if missing:
             raise KeyError(f"{path} is missing keys: {sorted(missing)}")
         sample["_path"] = str(path)
+        return sample
+
+    def _load_episode_pack(self, path: Path) -> dict[str, Any]:
+        cached = self._pack_cache.get(path)
+        if cached is not None:
+            self._pack_cache.move_to_end(path)
+            return cached
+        pack = torch.load(path, map_location="cpu", weights_only=False)
+        if pack.get("cache_layout") != "episode_pack":
+            raise ValueError(f"{path} is not an episode_pack cache file")
+        self._pack_cache[path] = pack
+        self._pack_cache.move_to_end(path)
+        while len(self._pack_cache) > self._pack_cache_size:
+            self._pack_cache.popitem(last=False)
+        return pack
+
+    def _sample_from_episode_pack(
+        self,
+        pack: dict[str, Any],
+        sample_index: int,
+        *,
+        path: Path,
+    ) -> dict[str, Any]:
+        num_samples = int(pack["num_samples"])
+        if sample_index < 0 or sample_index >= num_samples:
+            raise IndexError(f"sample_index {sample_index} out of range for {path}")
+
+        anchor_indices = torch.as_tensor(pack["sample_anchor_index"], dtype=torch.long)
+        anchor_index = int(anchor_indices[sample_index].item())
+        qwen_anchor_kv = torch.as_tensor(pack["qwen_anchor_kv"])
+        if anchor_index < 0 or anchor_index >= int(qwen_anchor_kv.shape[0]):
+            raise IndexError(f"anchor_index {anchor_index} out of range for {path}")
+
+        image_pool = list(pack.get("image_jpegs", []))
+        sample_image_indices = torch.as_tensor(pack["sample_image_indices"], dtype=torch.long)
+        image_indices = sample_image_indices[sample_index].flatten().tolist()
+        image_slot_jpegs = []
+        for image_index in image_indices:
+            if image_index < 0 or image_index >= len(image_pool):
+                raise IndexError(f"image index {image_index} out of range for {path}")
+            image_slot_jpegs.append(image_pool[image_index])
+
+        step_idx_values = pack.get("sample_step_idx")
+        step_idx = (
+            str(step_idx_values[sample_index])
+            if step_idx_values is not None
+            else str(sample_index)
+        )
+        ctrl_freq = pack.get("ctrl_freq", 0.0)
+        if isinstance(ctrl_freq, torch.Tensor) and ctrl_freq.ndim > 0:
+            ctrl_freq = float(ctrl_freq[sample_index].item())
+        else:
+            ctrl_freq = float(ctrl_freq)
+
+        sample = {
+            "qwen_kv": qwen_anchor_kv[anchor_index],
+            "lang_tokens": pack["lang_tokens"],
+            "lang_mask": pack["lang_mask"],
+            "state": pack["state"][sample_index],
+            "actions": pack["actions"][sample_index],
+            "action_time_mask": pack["action_time_mask"][sample_index],
+            "action_dim_mask": pack["action_dim_mask"][sample_index],
+            "ctrl_freq": ctrl_freq,
+            "image_slot_jpegs": image_slot_jpegs,
+            "image_slot_mask": pack["sample_image_mask"][sample_index],
+            "dataset_id": pack.get("dataset_id"),
+            "episode_id": pack.get("episode_id"),
+            "step_idx": step_idx,
+            "qwen_cache_scope": pack.get("qwen_cache_scope", "episode_anchors"),
+            "qwen_anchor_step_idx": str(pack["qwen_anchor_step_idx"][anchor_index]),
+            "qwen_anchor_kind": str(pack["qwen_anchor_kind"][anchor_index]),
+            "qwen_anchor_count": int(qwen_anchor_kv.shape[0]),
+        }
         return sample
 
 

@@ -931,6 +931,117 @@ def save_episode_anchor_records(
     return start_index + batch_size
 
 
+def build_episode_image_pool(
+    batch: dict[str, Any],
+) -> tuple[list[bytes], torch.Tensor]:
+    image_to_index: dict[bytes, int] = {}
+    image_pool: list[bytes] = []
+    sample_image_indices: list[list[int]] = []
+
+    for sample_slots in batch["image_slot_jpegs"]:
+        slot_indices: list[int] = []
+        for payload in sample_slots:
+            image_index = image_to_index.get(payload)
+            if image_index is None:
+                image_index = len(image_pool)
+                image_to_index[payload] = image_index
+                image_pool.append(payload)
+            slot_indices.append(image_index)
+        sample_image_indices.append(slot_indices)
+
+    return image_pool, torch.as_tensor(sample_image_indices, dtype=torch.long)
+
+
+def save_episode_anchor_pack(
+    *,
+    split_dir: Path,
+    manifest_handle: Any,
+    episode_index: int,
+    start_index: int,
+    batch: dict[str, Any],
+    anchors: list[dict[str, Any]],
+    qwen_kv_by_anchor: torch.Tensor,
+    lang_tokens: torch.Tensor,
+    lang_mask: torch.Tensor,
+    save_padded_features: bool,
+) -> int:
+    batch_size = len(batch["metadata"])
+    episode_lang_tokens = lang_tokens[0]
+    episode_lang_mask = lang_mask[0]
+    if not save_padded_features:
+        episode_lang_tokens = compact_tokens(episode_lang_tokens, episode_lang_mask)
+        episode_lang_mask = torch.ones(
+            episode_lang_tokens.shape[0],
+            dtype=torch.bool,
+            device=episode_lang_tokens.device,
+        )
+
+    image_pool, sample_image_indices = build_episode_image_pool(batch)
+    sample_anchor_indices = [
+        anchor_index_for_step(int(metadata["step_idx"]), anchors)
+        for metadata in batch["metadata"]
+    ]
+    first_metadata = batch["metadata"][0]
+    filename = f"episode_{episode_index:09d}.pt"
+    path = split_dir / filename
+
+    record = {
+        "cache_layout": "episode_pack",
+        "dataset_id": first_metadata["dataset_id"],
+        "episode_id": first_metadata["episode_id"],
+        "num_samples": batch_size,
+        "sample_start_index": start_index,
+        "sample_step_idx": [str(metadata["step_idx"]) for metadata in batch["metadata"]],
+        "sample_anchor_index": torch.as_tensor(sample_anchor_indices, dtype=torch.long),
+        "qwen_cache_scope": "episode_anchors",
+        "qwen_anchor_kv": qwen_kv_by_anchor.cpu(),
+        "qwen_anchor_step_idx": [str(anchor["step_idx"]) for anchor in anchors],
+        "qwen_anchor_kind": [
+            anchor_kind(anchor_index, anchor)
+            for anchor_index, anchor in enumerate(anchors)
+        ],
+        "lang_tokens": episode_lang_tokens.cpu(),
+        "lang_mask": episode_lang_mask.cpu(),
+        "state": batch["state"].cpu(),
+        "actions": batch["actions"].cpu(),
+        "action_time_mask": batch["action_time_mask"].cpu(),
+        "action_dim_mask": batch["action_dim_mask"].cpu(),
+        "ctrl_freq": batch["ctrl_freq"].cpu(),
+        "image_jpegs": image_pool,
+        "sample_image_indices": sample_image_indices.cpu(),
+        "sample_image_mask": batch["siglip_slot_mask"].cpu(),
+        "sample_image_count": torch.as_tensor(
+            [int(metadata["image_count"]) for metadata in batch["metadata"]],
+            dtype=torch.long,
+        ),
+        "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
+    }
+    torch.save(record, path)
+    manifest_handle.write(
+        json.dumps(
+            {
+                "path": filename,
+                "cache_layout": "episode_pack",
+                "dataset_id": first_metadata["dataset_id"],
+                "episode_id": first_metadata["episode_id"],
+                "num_samples": batch_size,
+                "sample_start_index": start_index,
+                "sample_stop_index": start_index + batch_size,
+                "sample_step_start": str(batch["metadata"][0]["step_idx"]),
+                "sample_step_stop": str(batch["metadata"][-1]["step_idx"]),
+                "lang_token_count": int(episode_lang_tokens.shape[0]),
+                "qwen_anchor_count": len(anchors),
+                "image_pool_count": len(image_pool),
+                "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
+                "has_img_tokens": False,
+                "has_image_slots": True,
+            }
+        )
+        + "\n"
+    )
+    return start_index + batch_size
+
+
 def precompute_split_episode_anchors(
     *,
     split_name: str,
@@ -1013,18 +1124,32 @@ def precompute_split_episode_anchors(
                 device=device,
             )
 
-            sample_count = save_episode_anchor_records(
-                split_dir=split_dir,
-                manifest_handle=manifest,
-                start_index=sample_count,
-                batch=batch,
-                anchors=anchors,
-                qwen_kv_by_anchor=qwen_kv_by_anchor,
-                lang_tokens=lang_tokens,
-                lang_mask=lang_mask,
-                save_padded_features=args.save_padded_features,
-                cache_image_slots=True,
-            )
+            if args.cache_layout == "episode_packs":
+                sample_count = save_episode_anchor_pack(
+                    split_dir=split_dir,
+                    manifest_handle=manifest,
+                    episode_index=episode_count,
+                    start_index=sample_count,
+                    batch=batch,
+                    anchors=anchors,
+                    qwen_kv_by_anchor=qwen_kv_by_anchor,
+                    lang_tokens=lang_tokens,
+                    lang_mask=lang_mask,
+                    save_padded_features=args.save_padded_features,
+                )
+            else:
+                sample_count = save_episode_anchor_records(
+                    split_dir=split_dir,
+                    manifest_handle=manifest,
+                    start_index=sample_count,
+                    batch=batch,
+                    anchors=anchors,
+                    qwen_kv_by_anchor=qwen_kv_by_anchor,
+                    lang_tokens=lang_tokens,
+                    lang_mask=lang_mask,
+                    save_padded_features=args.save_padded_features,
+                    cache_image_slots=True,
+                )
             episode_count += 1
             progress.set_postfix(samples=sample_count, episodes=episode_count)
 
@@ -1281,6 +1406,15 @@ def parse_args() -> argparse.Namespace:
             "plus compressed image slots for online SigLIP during training."
         ),
     )
+    parser.add_argument(
+        "--cache-layout",
+        choices=["auto", "sample_records", "episode_packs"],
+        default="auto",
+        help=(
+            "Feature cache layout. auto uses episode_packs for episode-anchor "
+            "qwen_t5 caches and sample_records otherwise."
+        ),
+    )
     parser.add_argument("--image-history-size", type=int, default=2)
     parser.add_argument("--max-images-per-sample", type=int, default=6)
     parser.add_argument("--image-jpeg-quality", type=int, default=90)
@@ -1366,8 +1500,16 @@ def main() -> None:
         args.qwen_cache_scope = (
             "episode_anchors" if args.feature_set == "qwen_t5" else "per_sample"
         )
+    if args.cache_layout == "auto":
+        args.cache_layout = (
+            "episode_packs"
+            if args.qwen_cache_scope == "episode_anchors"
+            else "sample_records"
+        )
     if args.qwen_cache_scope == "episode_anchors" and args.feature_set != "qwen_t5":
         raise ValueError("--qwen-cache-scope episode_anchors requires --feature-set qwen_t5")
+    if args.cache_layout == "episode_packs" and args.qwen_cache_scope != "episode_anchors":
+        raise ValueError("--cache-layout episode_packs requires --qwen-cache-scope episode_anchors")
     if args.qwen_anchors_per_episode <= 0:
         raise ValueError("--qwen-anchors-per-episode must be positive")
     if "{task}" not in args.qwen_trajectory_prompt_template:
@@ -1414,6 +1556,7 @@ def main() -> None:
         "batch_size": args.batch_size,
         "normalize_actions": not args.no_normalize_actions,
         "feature_set": args.feature_set,
+        "cache_layout": args.cache_layout,
         "qwen_cache_scope": args.qwen_cache_scope,
         "qwen_anchors_per_episode": args.qwen_anchors_per_episode,
         "qwen_stop_at_think": args.qwen_stop_at_think,
