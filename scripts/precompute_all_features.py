@@ -773,23 +773,60 @@ def sample_gripper_binary(sample: dict[str, Any], *, normalized_actions: bool) -
     return int(value >= threshold)
 
 
+def sample_step_index(sample: dict[str, Any]) -> int:
+    return int(sample["step_idx"])
+
+
+def anchor_kind(anchor_index: int, anchor: dict[str, Any]) -> str:
+    if anchor_index == 0:
+        return "first_step"
+    return str(anchor.get("_qwen_anchor_kind", "uniform"))
+
+
 def select_episode_qwen_anchors(
     samples: list[dict[str, Any]],
     *,
     normalized_actions: bool,
+    max_anchors: int,
 ) -> list[dict[str, Any]]:
     if not samples:
         return []
-    anchors = [samples[0]]
+    if max_anchors <= 0:
+        raise ValueError("max_anchors must be positive")
+
+    selected_by_step: dict[int, dict[str, Any]] = {}
+
+    first_anchor = dict(samples[0])
+    first_anchor["_qwen_anchor_kind"] = "first_step"
+    selected_by_step[sample_step_index(first_anchor)] = first_anchor
+
     previous = sample_gripper_binary(samples[0], normalized_actions=normalized_actions)
     for sample in samples[1:]:
         current = sample_gripper_binary(sample, normalized_actions=normalized_actions)
         if current != previous:
-            if str(sample["step_idx"]) != str(samples[0]["step_idx"]):
-                anchors.append(sample)
+            if sample_step_index(sample) not in selected_by_step and len(selected_by_step) < max_anchors:
+                gripper_anchor = dict(sample)
+                gripper_anchor["_qwen_anchor_kind"] = "first_gripper_change"
+                selected_by_step[sample_step_index(gripper_anchor)] = gripper_anchor
             break
         previous = current
-    return anchors
+
+    remaining = max_anchors - len(selected_by_step)
+    if remaining > 0 and len(samples) > 1:
+        uniform_positions = np.linspace(0, len(samples) - 1, num=max_anchors, dtype=np.int64)
+        for position in uniform_positions:
+            sample = samples[int(position)]
+            step_idx = sample_step_index(sample)
+            if step_idx in selected_by_step:
+                continue
+            uniform_anchor = dict(sample)
+            uniform_anchor["_qwen_anchor_kind"] = "uniform"
+            selected_by_step[step_idx] = uniform_anchor
+            if len(selected_by_step) >= max_anchors:
+                break
+
+    anchors = [selected_by_step[step_idx] for step_idx in sorted(selected_by_step)]
+    return anchors[:max_anchors]
 
 
 def qwen_anchor_batch(
@@ -861,8 +898,9 @@ def save_episode_anchor_records(
             "action_dim_mask": batch["action_dim_mask"][batch_index].cpu(),
             "ctrl_freq": float(batch["ctrl_freq"][batch_index].item()),
             "qwen_cache_scope": "episode_anchors",
+            "qwen_anchor_count": len(anchors),
             "qwen_anchor_step_idx": str(anchor["step_idx"]),
-            "qwen_anchor_kind": "first_step" if anchor_index == 0 else "first_gripper_change",
+            "qwen_anchor_kind": anchor_kind(anchor_index, anchor),
             **metadata,
         }
         if cache_image_slots:
@@ -883,8 +921,9 @@ def save_episode_anchor_records(
                     "has_img_tokens": False,
                     "has_image_slots": cache_image_slots,
                     "qwen_cache_scope": "episode_anchors",
+                    "qwen_anchor_count": len(anchors),
                     "qwen_anchor_step_idx": str(anchor["step_idx"]),
-                    "qwen_anchor_kind": "first_step" if anchor_index == 0 else "first_gripper_change",
+                    "qwen_anchor_kind": anchor_kind(anchor_index, anchor),
                 }
             )
             + "\n"
@@ -951,6 +990,7 @@ def precompute_split_episode_anchors(
             anchors = select_episode_qwen_anchors(
                 kept_samples,
                 normalized_actions=not args.no_normalize_actions,
+                max_anchors=args.qwen_anchors_per_episode,
             )
             qwen_kv_by_anchor = extract_qwen_kv(
                 qwen_anchor_batch(anchors),
@@ -1269,6 +1309,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--qwen-anchors-per-episode",
+        type=int,
+        default=8,
+        help=(
+            "Maximum Qwen primary-image anchors per episode in episode_anchors mode. "
+            "Uses first step, first gripper change when present, then uniform samples."
+        ),
+    )
+    parser.add_argument(
         "--qwen-stop-at-think",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1319,6 +1368,8 @@ def main() -> None:
         )
     if args.qwen_cache_scope == "episode_anchors" and args.feature_set != "qwen_t5":
         raise ValueError("--qwen-cache-scope episode_anchors requires --feature-set qwen_t5")
+    if args.qwen_anchors_per_episode <= 0:
+        raise ValueError("--qwen-anchors-per-episode must be positive")
     if "{task}" not in args.qwen_trajectory_prompt_template:
         raise ValueError("--qwen-trajectory-prompt-template must contain {task}")
     seed = cfg.seed if args.seed is None else args.seed
@@ -1364,6 +1415,7 @@ def main() -> None:
         "normalize_actions": not args.no_normalize_actions,
         "feature_set": args.feature_set,
         "qwen_cache_scope": args.qwen_cache_scope,
+        "qwen_anchors_per_episode": args.qwen_anchors_per_episode,
         "qwen_stop_at_think": args.qwen_stop_at_think,
         "qwen_enable_thinking": args.qwen_enable_thinking,
         "qwen_image_source": "primary_current_frame",
