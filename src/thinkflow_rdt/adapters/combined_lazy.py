@@ -282,37 +282,41 @@ class LazyStandardizedDataset(TorchIterableDataset):
 
     def _sample_from_episode(self, episode: Any, step_index: int) -> dict[str, Any]:
         if self.dataset_id == "bc_z":
-            return bcz_sample_from_episode(
+            sample = bcz_sample_from_episode(
                 episode,
                 step_index,
                 dataset_id=self.dataset_id,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
             )
+            return add_image_history(sample, episode, step_index)
         if self.dataset_id == "bridge":
-            return bridge_sample_from_episode(
+            sample = bridge_sample_from_episode(
                 episode,
                 step_index,
                 dataset_id=self.dataset_id,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
             )
+            return add_image_history(sample, episode, step_index)
         if self.dataset_id in {"fractal", "kuka"}:
-            return _single_camera_sample_from_episode(
+            sample = _single_camera_sample_from_episode(
                 episode,
                 step_index,
                 dataset_id=self.dataset_id,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
             )
+            return add_image_history(sample, episode, step_index)
         if self.dataset_id == "droid":
-            return _droid_sample_from_episode(
+            sample = _droid_sample_from_episode(
                 episode,
                 step_index,
                 dataset_id=self.dataset_id,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
             )
+            return add_image_history(sample, episode, step_index)
         raise KeyError(f"Unknown dataset_id: {self.dataset_id}")
 
 
@@ -405,6 +409,76 @@ def build_lazy_combined_standardized_splits(
 def build_combined_standardized_splits(*args: Any, **kwargs: Any) -> dict[str, LazyCombinedStandardizedDataset]:
     """Alias with the eager builder's name, scoped to this lazy module."""
     return build_lazy_combined_standardized_splits(*args, **kwargs)
+
+
+def add_image_history(
+    sample: dict[str, Any],
+    episode: Any,
+    step_index: int,
+    *,
+    history_size: int = 2,
+) -> dict[str, Any]:
+    """
+    Add official-RDT-style image history while preserving the current `images` field.
+
+    The order is previous/current timesteps, each with primary/wrist/secondary views.
+    For the first step we duplicate the current image payload for shape stability, but
+    mark the previous timestep invalid in `image_history_mask`.
+    """
+    if history_size != 2:
+        raise ValueError("Only history_size=2 is currently supported")
+
+    previous_index = max(0, int(step_index) - 1)
+    timestep_indices = (previous_index, int(step_index))
+    history: list[dict[str, Image.Image | None]] = []
+    history_mask: list[dict[str, int]] = []
+    for history_pos, image_index in enumerate(timestep_indices):
+        is_valid_timestep = history_pos > 0 or step_index > 0
+        frame = {
+            "primary": _episode_image_at(episode, "primary", image_index),
+            "wrist": _episode_image_at(episode, "wrist", image_index),
+            "secondary": _episode_image_at(episode, "secondary", image_index),
+        }
+        history.append(frame)
+        history_mask.append(
+            {
+                key: int(is_valid_timestep and value is not None)
+                for key, value in frame.items()
+            }
+        )
+
+    sample["image_history"] = history
+    sample["image_history_mask"] = history_mask
+    return sample
+
+
+def _episode_image_at(episode: Any, key: str, index: int) -> Image.Image | None:
+    if key == "primary":
+        if hasattr(episode, "primary_images"):
+            return _image_value_to_pil(episode.primary_images[index])
+        if hasattr(episode, "images"):
+            return _image_value_to_pil(episode.images[index])
+        return None
+    if key == "wrist":
+        return _image_value_to_pil(episode.wrist_images[index]) if hasattr(episode, "wrist_images") else None
+    if key == "secondary":
+        return (
+            _image_value_to_pil(episode.secondary_images[index])
+            if hasattr(episode, "secondary_images")
+            else None
+        )
+    raise KeyError(key)
+
+
+def _image_value_to_pil(image: Any) -> Image.Image | None:
+    if image is None:
+        return None
+    if isinstance(image, Image.Image):
+        return image.convert("RGB")
+    array = np.asarray(image)
+    if array.size == 0 or not np.any(array):
+        return None
+    return Image.fromarray(array.astype(np.uint8)).convert("RGB")
 
 
 def default_lazy_standardized_dataset_configs(

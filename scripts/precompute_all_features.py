@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shutil
@@ -89,7 +90,21 @@ def as_rgb_pil(image: Any) -> Image.Image | None:
     return Image.fromarray(array.astype(np.uint8)).convert("RGB")
 
 
-def selected_images_for_sample(
+def blank_rgb_image(size: int = 384) -> Image.Image:
+    return Image.new("RGB", (size, size), color=(0, 0, 0))
+
+
+def image_to_jpeg_bytes(image: Image.Image, *, quality: int = 90) -> bytes:
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=quality, optimize=True)
+    return buffer.getvalue()
+
+
+def jpeg_bytes_to_image(payload: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(payload)).convert("RGB")
+
+
+def selected_current_images_for_sample(
     sample: dict[str, Any],
     *,
     max_images_per_sample: int,
@@ -105,32 +120,96 @@ def selected_images_for_sample(
     return selected
 
 
-def blank_rgb_image(size: int = 384) -> Image.Image:
-    return Image.new("RGB", (size, size), color=(0, 0, 0))
+def image_history_for_sample(
+    sample: dict[str, Any],
+    *,
+    image_history_size: int,
+) -> tuple[list[dict[str, Image.Image | None]], list[dict[str, int]]]:
+    if "image_history" in sample:
+        raw_history = list(sample["image_history"])[-image_history_size:]
+        raw_masks = list(sample.get("image_history_mask", []))[-image_history_size:]
+    else:
+        raw_history = [sample.get("images", {})]
+        raw_masks = [sample.get("image_mask", {})]
+
+    if not raw_history:
+        raw_history = [sample.get("images", {})]
+        raw_masks = [sample.get("image_mask", {})]
+
+    while len(raw_history) < image_history_size:
+        raw_history.insert(0, raw_history[0])
+        raw_masks.insert(0, {key: 0 for key in IMAGE_KEYS})
+
+    history: list[dict[str, Image.Image | None]] = []
+    masks: list[dict[str, int]] = []
+    for frame_index, raw_frame in enumerate(raw_history[-image_history_size:]):
+        raw_mask = raw_masks[frame_index] if frame_index < len(raw_masks) else {}
+        frame: dict[str, Image.Image | None] = {}
+        mask: dict[str, int] = {}
+        for key in IMAGE_KEYS:
+            image = as_rgb_pil(raw_frame.get(key))
+            frame[key] = image
+            mask[key] = int(bool(raw_mask.get(key, image is not None)) and image is not None)
+        history.append(frame)
+        masks.append(mask)
+    return history, masks
+
+
+def image_slots_for_sample(
+    sample: dict[str, Any],
+    *,
+    image_history_size: int,
+    max_images_per_sample: int,
+) -> tuple[list[Image.Image], list[bool], list[Image.Image]]:
+    history, masks = image_history_for_sample(
+        sample,
+        image_history_size=image_history_size,
+    )
+    slots: list[Image.Image] = []
+    slot_mask: list[bool] = []
+    qwen_images: list[Image.Image] = []
+    for frame, mask in zip(history, masks):
+        for key in IMAGE_KEYS:
+            image = frame.get(key)
+            valid = bool(mask.get(key, 0)) and image is not None
+            slots.append(image if image is not None else blank_rgb_image())
+            slot_mask.append(valid)
+            if valid and image is not None:
+                qwen_images.append(image)
+            if len(slots) >= max_images_per_sample:
+                return slots, slot_mask, qwen_images
+    return slots, slot_mask, qwen_images
 
 
 def standardized_collate_fn(
     samples: list[dict[str, Any]],
     *,
     max_images_per_sample: int,
+    image_history_size: int,
+    image_jpeg_quality: int,
     skip_no_image: bool,
 ) -> dict[str, Any] | None:
     kept: list[dict[str, Any]] = []
-    image_groups: list[list[Image.Image]] = []
+    qwen_image_groups: list[list[Image.Image]] = []
+    siglip_image_slots: list[list[Image.Image]] = []
+    siglip_slot_masks: list[list[bool]] = []
     skipped_no_image = 0
 
     for sample in samples:
-        selected_images = selected_images_for_sample(
+        slots, slot_mask, qwen_images = image_slots_for_sample(
             sample,
+            image_history_size=image_history_size,
             max_images_per_sample=max_images_per_sample,
         )
-        if not selected_images and skip_no_image:
+        if not any(slot_mask) and skip_no_image:
             skipped_no_image += 1
             continue
-        if not selected_images:
-            selected_images = [blank_rgb_image()]
+        if not qwen_images:
+            qwen_images = [blank_rgb_image()]
         kept.append(sample)
-        image_groups.append(selected_images)
+        qwen_image_groups.append(qwen_images)
+        siglip_image_slots.append(slots)
+        siglip_slot_masks.append(slot_mask)
 
     if not kept:
         return None
@@ -138,7 +217,13 @@ def standardized_collate_fn(
     dataset_ids = [str(sample["dataset_id"]) for sample in kept]
     return {
         "instructions": [str(sample["instruction"]) for sample in kept],
-        "images": image_groups,
+        "qwen_images": qwen_image_groups,
+        "siglip_image_slots": siglip_image_slots,
+        "siglip_slot_mask": torch.as_tensor(siglip_slot_masks, dtype=torch.bool),
+        "image_slot_jpegs": [
+            [image_to_jpeg_bytes(image, quality=image_jpeg_quality) for image in slots]
+            for slots in siglip_image_slots
+        ],
         "state": torch.stack(
             [torch.as_tensor(sample["state"], dtype=torch.float32) for sample in kept]
         ),
@@ -169,9 +254,10 @@ def standardized_collate_fn(
                 "dataset_id": dataset_id,
                 "episode_id": str(sample["episode_id"]),
                 "step_idx": str(sample["step_idx"]),
-                "image_count": len(images),
+                "image_count": int(sum(slot_mask)),
+                "image_slot_count": len(slot_mask),
             }
-            for sample, dataset_id, images in zip(kept, dataset_ids, image_groups)
+            for sample, dataset_id, slot_mask in zip(kept, dataset_ids, siglip_slot_masks)
         ],
         "skipped_no_image": skipped_no_image,
     }
@@ -203,7 +289,7 @@ def extract_qwen_kv(
     texts_list: list[str] = []
     images_list: list[list[Image.Image]] = []
 
-    for instruction, images in zip(batch["instructions"], batch["images"]):
+    for instruction, images in zip(batch["instructions"], batch["qwen_images"]):
         content = [{"type": "image", "image": image} for image in images]
         content.append({"type": "text", "text": instruction})
         messages = [{"role": "user", "content": content}]
@@ -350,16 +436,20 @@ def extract_siglip_features(
     expected_dim: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    flat_images, spans = nested_images_to_flat(batch["images"])
+    image_slots: list[list[Image.Image]] = batch["siglip_image_slots"]
+    slot_mask = torch.as_tensor(batch["siglip_slot_mask"], dtype=torch.bool, device=device)
+    flat_images = [image for slots in image_slots for image in slots]
+    batch_size = len(image_slots)
+    slots_per_sample = max((len(slots) for slots in image_slots), default=0)
     if not flat_images:
         output = torch.zeros(
-            len(spans),
+            batch_size,
             max_img_tokens,
             expected_dim,
             device=device,
             dtype=torch.bfloat16,
         )
-        mask = torch.zeros(len(spans), max_img_tokens, dtype=torch.bool, device=device)
+        mask = torch.zeros(batch_size, max_img_tokens, dtype=torch.bool, device=device)
         return output, mask
 
     inputs = processor(images=flat_images, return_tensors="pt")
@@ -373,17 +463,21 @@ def extract_siglip_features(
             f"SigLIP hidden dim mismatch: expected {expected_dim}, got {image_features.shape[-1]}"
         )
     tokens_per_image = int(image_features.shape[1])
-    max_images_in_batch = max((stop - start for start, stop in spans), default=0)
-    required_tokens = max_images_in_batch * tokens_per_image
+    required_tokens = slots_per_sample * tokens_per_image
     if required_tokens > max_img_tokens:
         raise ValueError(
             "SigLIP image token budget is too small for the selected image count: "
-            f"{max_images_in_batch} images x {tokens_per_image} tokens/image = "
+            f"{slots_per_sample} image slots x {tokens_per_image} tokens/image = "
             f"{required_tokens}, but cfg.model.image_tokens={max_img_tokens}. "
             "Increase cfg.model.image_tokens or lower --max-images-per-sample."
         )
 
-    batch_size = len(spans)
+    image_features = image_features.reshape(
+        batch_size,
+        slots_per_sample,
+        tokens_per_image,
+        image_features.shape[-1],
+    )
     output = torch.zeros(
         batch_size,
         max_img_tokens,
@@ -393,13 +487,15 @@ def extract_siglip_features(
     )
     mask_out = torch.zeros(batch_size, max_img_tokens, dtype=torch.bool, device=device)
 
-    for sample_index, (start, stop) in enumerate(spans):
-        if start == stop:
-            continue
-        sample_features = image_features[start:stop].reshape(-1, image_features.shape[-1])
-        valid_tokens = int(sample_features.shape[0])
-        output[sample_index, :valid_tokens] = sample_features
-        mask_out[sample_index, :valid_tokens] = True
+    for sample_index in range(batch_size):
+        for slot_index in range(slots_per_sample):
+            token_start = slot_index * tokens_per_image
+            token_stop = token_start + tokens_per_image
+            if bool(slot_mask[sample_index, slot_index]):
+                output[sample_index, token_start:token_stop] = image_features[
+                    sample_index, slot_index
+                ]
+                mask_out[sample_index, token_start:token_stop] = True
 
     return output.to(torch.bfloat16), mask_out
 
@@ -465,9 +561,10 @@ def save_batch_records(
     qwen_kv: torch.Tensor,
     lang_tokens: torch.Tensor,
     lang_mask: torch.Tensor,
-    img_tokens: torch.Tensor,
-    img_mask: torch.Tensor,
+    img_tokens: torch.Tensor | None,
+    img_mask: torch.Tensor | None,
     save_padded_features: bool,
+    cache_image_slots: bool,
 ) -> int:
     batch_size = qwen_kv.shape[0]
     for batch_index in range(batch_size):
@@ -477,23 +574,25 @@ def save_batch_records(
         path = split_dir / filename
         sample_lang_tokens = lang_tokens[batch_index]
         sample_lang_mask = lang_mask[batch_index]
-        sample_img_tokens = img_tokens[batch_index]
-        sample_img_mask = img_mask[batch_index]
+        sample_img_tokens = img_tokens[batch_index] if img_tokens is not None else None
+        sample_img_mask = img_mask[batch_index] if img_mask is not None else None
         if not save_padded_features:
             sample_lang_tokens = compact_tokens(sample_lang_tokens, sample_lang_mask)
-            sample_img_tokens = compact_tokens(sample_img_tokens, sample_img_mask)
+            if sample_img_tokens is not None and sample_img_mask is not None:
+                sample_img_tokens = compact_tokens(sample_img_tokens, sample_img_mask)
             sample_lang_mask = torch.ones(
                 sample_lang_tokens.shape[0], dtype=torch.bool, device=sample_lang_tokens.device
             )
-            sample_img_mask = torch.ones(
-                sample_img_tokens.shape[0], dtype=torch.bool, device=sample_img_tokens.device
-            )
+            if sample_img_tokens is not None:
+                sample_img_mask = torch.ones(
+                    sample_img_tokens.shape[0],
+                    dtype=torch.bool,
+                    device=sample_img_tokens.device,
+                )
         record = {
             "qwen_kv": qwen_kv[batch_index].cpu(),
             "lang_tokens": sample_lang_tokens.cpu(),
             "lang_mask": sample_lang_mask.cpu(),
-            "img_tokens": sample_img_tokens.cpu(),
-            "img_mask": sample_img_mask.cpu(),
             "state": batch["state"][batch_index].cpu(),
             "actions": batch["actions"][batch_index].cpu(),
             "action_time_mask": batch["action_time_mask"][batch_index].cpu(),
@@ -501,6 +600,12 @@ def save_batch_records(
             "ctrl_freq": float(batch["ctrl_freq"][batch_index].item()),
             **metadata,
         }
+        if sample_img_tokens is not None and sample_img_mask is not None:
+            record["img_tokens"] = sample_img_tokens.cpu()
+            record["img_mask"] = sample_img_mask.cpu()
+        if cache_image_slots:
+            record["image_slot_jpegs"] = batch["image_slot_jpegs"][batch_index]
+            record["image_slot_mask"] = batch["siglip_slot_mask"][batch_index].cpu()
         torch.save(record, path)
         manifest_handle.write(
             json.dumps(
@@ -510,8 +615,15 @@ def save_batch_records(
                     "episode_id": metadata["episode_id"],
                     "step_idx": metadata["step_idx"],
                     "image_count": metadata["image_count"],
+                    "image_slot_count": metadata["image_slot_count"],
                     "lang_token_count": int(sample_lang_tokens.shape[0]),
-                    "img_token_count": int(sample_img_tokens.shape[0]),
+                    "img_token_count": (
+                        int(sample_img_tokens.shape[0])
+                        if sample_img_tokens is not None
+                        else None
+                    ),
+                    "has_img_tokens": sample_img_tokens is not None,
+                    "has_image_slots": cache_image_slots,
                 }
             )
             + "\n"
@@ -541,6 +653,8 @@ def precompute_split(
         collate_fn=partial(
             standardized_collate_fn,
             max_images_per_sample=args.max_images_per_sample,
+            image_history_size=args.image_history_size,
+            image_jpeg_quality=args.image_jpeg_quality,
             skip_no_image=not args.keep_no_image,
         ),
     )
@@ -575,25 +689,33 @@ def precompute_split(
                 expected_dim=cfg.model.lang_token_dim,
                 device=device,
             )
-            img_tokens, img_mask = extract_siglip_features(
-                batch,
-                models["siglip_processor"],
-                models["siglip_encoder"],
-                max_img_tokens=cfg.model.image_tokens,
-                expected_dim=cfg.model.img_token_dim,
-                device=device,
-            )
+            if args.feature_set == "all":
+                img_tokens, img_mask = extract_siglip_features(
+                    batch,
+                    models["siglip_processor"],
+                    models["siglip_encoder"],
+                    max_img_tokens=cfg.model.image_tokens,
+                    expected_dim=cfg.model.img_token_dim,
+                    device=device,
+                )
+            else:
+                img_tokens = None
+                img_mask = None
 
             if args.max_samples_per_split is not None:
                 keep = min(args.max_samples_per_split - sample_count, qwen_kv.shape[0])
                 qwen_kv = qwen_kv[:keep]
                 lang_tokens = lang_tokens[:keep]
                 lang_mask = lang_mask[:keep]
-                img_tokens = img_tokens[:keep]
-                img_mask = img_mask[:keep]
+                if img_tokens is not None:
+                    img_tokens = img_tokens[:keep]
+                if img_mask is not None:
+                    img_mask = img_mask[:keep]
                 for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
                     batch[key] = batch[key][:keep]
                 batch["metadata"] = batch["metadata"][:keep]
+                batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
+                batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]
 
             sample_count = save_batch_records(
                 split_dir=split_dir,
@@ -606,6 +728,7 @@ def precompute_split(
                 img_tokens=img_tokens,
                 img_mask=img_mask,
                 save_padded_features=args.save_padded_features,
+                cache_image_slots=args.feature_set == "qwen_t5",
             )
             progress.set_postfix(samples=sample_count, skipped_no_image=skipped_no_image)
 
@@ -646,21 +769,24 @@ def load_models(args: argparse.Namespace, cfg: Any, device: torch.device) -> dic
             f"T5 d_model {t5_encoder.config.d_model} != cfg.model.lang_token_dim {cfg.model.lang_token_dim}"
         )
 
-    print("Loading SigLIP vision encoder...")
-    siglip_model_id = resolve_model_id(args.siglip_model_id, args.siglip_fallback_model_id)
-    siglip_processor = SiglipImageProcessor.from_pretrained(siglip_model_id)
-    siglip_encoder = SiglipVisionModel.from_pretrained(
-        siglip_model_id,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device_map,
-    )
-    siglip_encoder.eval()
-    siglip_encoder.requires_grad_(False)
-    if getattr(siglip_encoder.config, "hidden_size", cfg.model.img_token_dim) != cfg.model.img_token_dim:
-        raise ValueError(
-            "SigLIP hidden_size "
-            f"{siglip_encoder.config.hidden_size} != cfg.model.img_token_dim {cfg.model.img_token_dim}"
+    siglip_processor = None
+    siglip_encoder = None
+    if args.feature_set == "all":
+        print("Loading SigLIP vision encoder...")
+        siglip_model_id = resolve_model_id(args.siglip_model_id, args.siglip_fallback_model_id)
+        siglip_processor = SiglipImageProcessor.from_pretrained(siglip_model_id)
+        siglip_encoder = SiglipVisionModel.from_pretrained(
+            siglip_model_id,
+            torch_dtype=torch.bfloat16,
+            device_map=args.device_map,
         )
+        siglip_encoder.eval()
+        siglip_encoder.requires_grad_(False)
+        if getattr(siglip_encoder.config, "hidden_size", cfg.model.img_token_dim) != cfg.model.img_token_dim:
+            raise ValueError(
+                "SigLIP hidden_size "
+                f"{siglip_encoder.config.hidden_size} != cfg.model.img_token_dim {cfg.model.img_token_dim}"
+            )
 
     return {
         "qwen_processor": qwen_processor,
@@ -725,7 +851,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--no-normalize-actions", action="store_true")
-    parser.add_argument("--max-images-per-sample", type=int, default=3)
+    parser.add_argument(
+        "--feature-set",
+        choices=["all", "qwen_t5"],
+        default="all",
+        help=(
+            "all caches Qwen, T5, and SigLIP features; qwen_t5 caches Qwen/T5 "
+            "plus compressed image slots for online SigLIP during training."
+        ),
+    )
+    parser.add_argument("--image-history-size", type=int, default=2)
+    parser.add_argument("--max-images-per-sample", type=int, default=6)
+    parser.add_argument("--image-jpeg-quality", type=int, default=90)
     parser.add_argument("--keep-no-image", action="store_true")
     parser.add_argument(
         "--save-padded-features",
@@ -808,6 +945,10 @@ def main() -> None:
         "droid_stage_count": args.droid_stage_count,
         "batch_size": args.batch_size,
         "normalize_actions": not args.no_normalize_actions,
+        "feature_set": args.feature_set,
+        "image_history_size": args.image_history_size,
+        "max_images_per_sample": args.max_images_per_sample,
+        "image_jpeg_quality": args.image_jpeg_quality,
         "feature_storage": "padded" if args.save_padded_features else "compact_valid_tokens",
         "qwen_model_id": args.qwen_model_id,
         "qwen_layer_index": args.qwen_layer_index,

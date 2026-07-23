@@ -17,6 +17,15 @@ REQUIRED_KEYS = {
     "actions",
     "ctrl_freq",
 }
+ONLINE_SIGLIP_REQUIRED_KEYS = {
+    "qwen_kv",
+    "lang_tokens",
+    "image_slot_jpegs",
+    "image_slot_mask",
+    "state",
+    "actions",
+    "ctrl_freq",
+}
 
 
 class CachedFeatureDataset(Dataset[dict[str, Any]]):
@@ -28,8 +37,14 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
     or a plain JSON string containing the path.
     """
 
-    def __init__(self, manifest_path: str | Path):
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        *,
+        required_keys: set[str] | frozenset[str] | None = None,
+    ):
         self.manifest_path = Path(manifest_path).expanduser().resolve()
+        self.required_keys = set(REQUIRED_KEYS if required_keys is None else required_keys)
         if not self.manifest_path.exists():
             raise FileNotFoundError(self.manifest_path)
         self.base_dir = self.manifest_path.parent
@@ -58,7 +73,7 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         path = self.paths[index]
         sample = torch.load(path, map_location="cpu", weights_only=False)
-        missing = REQUIRED_KEYS.difference(sample)
+        missing = self.required_keys.difference(sample)
         if missing:
             raise KeyError(f"{path} is missing keys: {sorted(missing)}")
         sample["_path"] = str(path)
@@ -195,3 +210,101 @@ class RDTBatchCollator:
             )
 
         return {key: torch.stack(values, dim=0) for key, values in batch.items()}
+
+
+@dataclass
+class RDTOnlineSiglipBatchCollator:
+    max_lang_tokens: int
+    pred_horizon: int
+    feature_dim: int
+    state_dim: int
+    action_dim: int
+    lang_token_dim: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.lang_token_dim is None:
+            self.lang_token_dim = self.feature_dim
+        self._base = RDTBatchCollator(
+            max_lang_tokens=self.max_lang_tokens,
+            image_tokens=1,
+            pred_horizon=self.pred_horizon,
+            feature_dim=self.feature_dim,
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            lang_token_dim=self.lang_token_dim,
+            img_token_dim=1,
+        )
+
+    def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
+        tensor_batch: dict[str, list[torch.Tensor]] = {
+            "qwen_kv": [],
+            "lang_tokens": [],
+            "lang_mask": [],
+            "state": [],
+            "actions": [],
+            "action_time_mask": [],
+            "action_dim_mask": [],
+            "ctrl_freq": [],
+            "image_slot_mask": [],
+        }
+        image_slot_jpegs: list[list[bytes]] = []
+
+        for sample in samples:
+            lang, default_lang_mask = self._base._pad_sequence(
+                sample["lang_tokens"], self.max_lang_tokens, self.lang_token_dim
+            )
+            if "lang_mask" in sample:
+                supplied = torch.as_tensor(sample["lang_mask"], dtype=torch.bool)
+                supplied = supplied[: self.max_lang_tokens]
+                default_lang_mask[: supplied.shape[0]] &= supplied
+
+            qwen_kv = torch.as_tensor(sample["qwen_kv"], dtype=torch.float32)
+            if qwen_kv.ndim == 1:
+                qwen_kv = qwen_kv.unsqueeze(0)
+            if qwen_kv.ndim != 2:
+                raise ValueError(
+                    f"Expected qwen_kv [tokens, dim] or [dim], got {tuple(qwen_kv.shape)}"
+                )
+
+            state = torch.as_tensor(sample["state"], dtype=torch.float32).flatten()
+            if state.numel() != self.state_dim:
+                raise ValueError(
+                    f"Expected state dim {self.state_dim}, got {state.numel()} "
+                    f"in {sample.get('_path', '<memory>')}"
+                )
+
+            actions, action_time_mask = self._base._pad_actions(
+                sample["actions"], sample.get("action_time_mask")
+            )
+            action_dim_mask = torch.as_tensor(
+                sample.get("action_dim_mask", torch.ones(self.action_dim)),
+                dtype=torch.float32,
+            ).flatten()
+            if action_dim_mask.numel() != self.action_dim:
+                raise ValueError("action_dim_mask has the wrong width")
+
+            slot_mask = torch.as_tensor(sample["image_slot_mask"], dtype=torch.bool).flatten()
+            image_slots = list(sample["image_slot_jpegs"])
+            if len(image_slots) != int(slot_mask.numel()):
+                raise ValueError(
+                    f"image_slot_jpegs length {len(image_slots)} != mask length {slot_mask.numel()}"
+                )
+
+            tensor_batch["qwen_kv"].append(qwen_kv)
+            tensor_batch["lang_tokens"].append(lang.to(torch.float32))
+            tensor_batch["lang_mask"].append(default_lang_mask)
+            tensor_batch["state"].append(state)
+            tensor_batch["actions"].append(actions)
+            tensor_batch["action_time_mask"].append(action_time_mask)
+            tensor_batch["action_dim_mask"].append(action_dim_mask)
+            tensor_batch["ctrl_freq"].append(
+                torch.tensor(float(sample["ctrl_freq"]), dtype=torch.float32)
+            )
+            tensor_batch["image_slot_mask"].append(slot_mask)
+            image_slot_jpegs.append(image_slots)
+
+        batch: dict[str, Any] = {
+            key: torch.stack(values, dim=0) for key, values in tensor_batch.items()
+        }
+        batch["image_slot_jpegs"] = image_slot_jpegs
+        return batch

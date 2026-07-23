@@ -12,7 +12,7 @@ model:
   lang_token_dim: 4096
   img_token_dim: 1152
   max_lang_tokens: 128
-  image_tokens: 2187
+  image_tokens: 4374
   hidden_size: 2048
   depth: 28
   num_heads: 32

@@ -72,7 +72,8 @@ def install_checkpointed_forward(rdt_core: nn.Module) -> None:
 def _copy_selected_pretrained_weights(target_runner, source_runner, cfg: ExperimentConfig) -> dict[str, int]:
     """
     Copy the pretrained RDT core while deliberately leaving new Qwen interfaces,
-    custom condition positional embeddings, state adaptor, and 7D output layer fresh.
+    incompatible condition positional embeddings, state adaptor, and 7D output
+    layer fresh.
     """
     source = source_runner.state_dict()
     target = target_runner.state_dict()
@@ -81,6 +82,7 @@ def _copy_selected_pretrained_weights(target_runner, source_runner, cfg: Experim
         "model.t_embedder.",
         "model.freq_embedder.",
         "model.x_pos_embed",
+        "model.img_cond_pos_embed",
         "model.final_layer.norm_final.",
     )
     if cfg.model.copy_pretrained_final_fc1:
