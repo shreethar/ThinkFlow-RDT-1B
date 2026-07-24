@@ -842,6 +842,15 @@ def t5_episode_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return {"instructions": [str(samples[0]["instruction"])]}
 
 
+def t5_episode_batch_from_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "instructions": [
+            str(item["kept_samples"][0]["instruction"])
+            for item in items
+        ]
+    }
+
+
 def anchor_index_for_step(
     step_idx: int,
     anchors: list[dict[str, Any]],
@@ -929,6 +938,60 @@ def save_episode_anchor_records(
             + "\n"
         )
     return start_index + batch_size
+
+
+def truncate_episode_batch(
+    batch: dict[str, Any],
+    kept_samples: list[dict[str, Any]],
+    *,
+    keep: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if keep >= len(batch["metadata"]):
+        return batch, kept_samples
+    for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
+        batch[key] = batch[key][:keep]
+    batch["metadata"] = batch["metadata"][:keep]
+    batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
+    batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]
+    batch["kept_samples"] = batch["kept_samples"][:keep]
+    return batch, kept_samples[:keep]
+
+
+def prepare_episode_anchor_item(
+    *,
+    episode_samples: list[dict[str, Any]],
+    args: argparse.Namespace,
+    remaining_samples: int | None,
+) -> dict[str, Any] | None:
+    batch = standardized_collate_fn(
+        episode_samples,
+        max_images_per_sample=args.max_images_per_sample,
+        image_history_size=args.image_history_size,
+        image_jpeg_quality=args.image_jpeg_quality,
+        skip_no_image=not args.keep_no_image,
+    )
+    if batch is None:
+        return None
+
+    kept_samples = list(batch["kept_samples"])
+    if remaining_samples is not None:
+        keep = min(remaining_samples, len(batch["metadata"]))
+        if keep <= 0:
+            return None
+        batch, kept_samples = truncate_episode_batch(batch, kept_samples, keep=keep)
+
+    anchors = select_episode_qwen_anchors(
+        kept_samples,
+        normalized_actions=not args.no_normalize_actions,
+        max_anchors=args.qwen_anchors_per_episode,
+    )
+    return {
+        "batch": batch,
+        "kept_samples": kept_samples,
+        "anchors": anchors,
+        "sample_count": len(batch["metadata"]),
+        "skipped_no_image": int(batch.get("skipped_no_image", 0)),
+    }
 
 
 def build_episode_image_pool(
@@ -1042,6 +1105,86 @@ def save_episode_anchor_pack(
     return start_index + batch_size
 
 
+def save_prepared_episode_anchor_items(
+    *,
+    items: list[dict[str, Any]],
+    split_dir: Path,
+    manifest_handle: Any,
+    start_episode_index: int,
+    start_sample_index: int,
+    cfg: Any,
+    args: argparse.Namespace,
+    models: dict[str, Any],
+    device: torch.device,
+) -> int:
+    if not items:
+        return start_sample_index
+
+    all_anchors: list[dict[str, Any]] = []
+    anchor_spans: list[tuple[int, int]] = []
+    for item in items:
+        start = len(all_anchors)
+        all_anchors.extend(item["anchors"])
+        anchor_spans.append((start, len(all_anchors)))
+
+    qwen_kv_all = extract_qwen_kv(
+        qwen_anchor_batch(all_anchors),
+        models["qwen_processor"],
+        models["qwen_vlm"],
+        device=device,
+        layer_index=args.qwen_layer_index,
+        max_new_tokens=args.qwen_max_new_tokens,
+        expected_dim=cfg.model.qwen_kv_dim,
+        stop_at_think_end=args.qwen_stop_at_think,
+        prompt_template=args.qwen_trajectory_prompt_template,
+        enable_thinking=args.qwen_enable_thinking,
+    )
+    lang_tokens_all, lang_mask_all = extract_t5_features(
+        t5_episode_batch_from_items(items),
+        models["t5_tokenizer"],
+        models["t5_encoder"],
+        max_lang_tokens=cfg.model.max_lang_tokens,
+        expected_dim=cfg.model.lang_token_dim,
+        device=device,
+    )
+
+    sample_index = start_sample_index
+    for item_index, item in enumerate(items):
+        anchor_start, anchor_stop = anchor_spans[item_index]
+        qwen_kv_by_anchor = qwen_kv_all[anchor_start:anchor_stop]
+        lang_tokens = lang_tokens_all[item_index : item_index + 1]
+        lang_mask = lang_mask_all[item_index : item_index + 1]
+        episode_index = start_episode_index + item_index
+
+        if args.cache_layout == "episode_packs":
+            sample_index = save_episode_anchor_pack(
+                split_dir=split_dir,
+                manifest_handle=manifest_handle,
+                episode_index=episode_index,
+                start_index=sample_index,
+                batch=item["batch"],
+                anchors=item["anchors"],
+                qwen_kv_by_anchor=qwen_kv_by_anchor,
+                lang_tokens=lang_tokens,
+                lang_mask=lang_mask,
+                save_padded_features=args.save_padded_features,
+            )
+        else:
+            sample_index = save_episode_anchor_records(
+                split_dir=split_dir,
+                manifest_handle=manifest_handle,
+                start_index=sample_index,
+                batch=item["batch"],
+                anchors=item["anchors"],
+                qwen_kv_by_anchor=qwen_kv_by_anchor,
+                lang_tokens=lang_tokens,
+                lang_mask=lang_mask,
+                save_padded_features=args.save_padded_features,
+                cache_image_slots=True,
+            )
+    return sample_index
+
+
 def precompute_split_episode_anchors(
     *,
     split_name: str,
@@ -1063,98 +1206,75 @@ def precompute_split_episode_anchors(
     episode_count = 0
     skipped_no_image = 0
     with tmp_manifest_path.open("w", encoding="utf-8") as manifest:
+        pending_items: list[dict[str, Any]] = []
+        pending_sample_count = 0
         progress = tqdm(
             iter_episode_sample_groups(dataset),
             desc=f"precompute {split_name} episodes",
             unit="episode",
         )
         for episode_samples in progress:
-            if args.max_batches_per_split is not None and episode_count >= args.max_batches_per_split:
+            pending_episode_count = episode_count + len(pending_items)
+            if args.max_batches_per_split is not None and pending_episode_count >= args.max_batches_per_split:
                 break
-            if args.max_samples_per_split is not None and sample_count >= args.max_samples_per_split:
+            if args.max_samples_per_split is not None and sample_count + pending_sample_count >= args.max_samples_per_split:
                 break
 
-            batch = standardized_collate_fn(
-                episode_samples,
-                max_images_per_sample=args.max_images_per_sample,
-                image_history_size=args.image_history_size,
-                image_jpeg_quality=args.image_jpeg_quality,
-                skip_no_image=not args.keep_no_image,
+            remaining_samples = None
+            if args.max_samples_per_split is not None:
+                remaining_samples = args.max_samples_per_split - sample_count - pending_sample_count
+            item = prepare_episode_anchor_item(
+                episode_samples=episode_samples,
+                args=args,
+                remaining_samples=remaining_samples,
             )
-            if batch is None:
+            if item is None:
                 skipped_no_image += len(episode_samples)
                 continue
 
-            kept_samples = list(batch["kept_samples"])
+            skipped_no_image += int(item["skipped_no_image"])
+            pending_items.append(item)
+            pending_sample_count += int(item["sample_count"])
 
-            if args.max_samples_per_split is not None:
-                keep = min(args.max_samples_per_split - sample_count, len(batch["metadata"]))
-                if keep <= 0:
-                    break
-                for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
-                    batch[key] = batch[key][:keep]
-                batch["metadata"] = batch["metadata"][:keep]
-                batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
-                batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]
-                kept_samples = kept_samples[:keep]
-
-            anchors = select_episode_qwen_anchors(
-                kept_samples,
-                normalized_actions=not args.no_normalize_actions,
-                max_anchors=args.qwen_anchors_per_episode,
-            )
-            qwen_kv_by_anchor = extract_qwen_kv(
-                qwen_anchor_batch(anchors),
-                models["qwen_processor"],
-                models["qwen_vlm"],
-                device=device,
-                layer_index=args.qwen_layer_index,
-                max_new_tokens=args.qwen_max_new_tokens,
-                expected_dim=cfg.model.qwen_kv_dim,
-                stop_at_think_end=args.qwen_stop_at_think,
-                prompt_template=args.qwen_trajectory_prompt_template,
-                enable_thinking=args.qwen_enable_thinking,
-            )
-            lang_tokens, lang_mask = extract_t5_features(
-                t5_episode_batch(kept_samples),
-                models["t5_tokenizer"],
-                models["t5_encoder"],
-                max_lang_tokens=cfg.model.max_lang_tokens,
-                expected_dim=cfg.model.lang_token_dim,
-                device=device,
-            )
-
-            if args.cache_layout == "episode_packs":
-                sample_count = save_episode_anchor_pack(
+            if len(pending_items) >= args.episode_batch_size:
+                sample_count = save_prepared_episode_anchor_items(
+                    items=pending_items,
                     split_dir=split_dir,
                     manifest_handle=manifest,
-                    episode_index=episode_count,
-                    start_index=sample_count,
-                    batch=batch,
-                    anchors=anchors,
-                    qwen_kv_by_anchor=qwen_kv_by_anchor,
-                    lang_tokens=lang_tokens,
-                    lang_mask=lang_mask,
-                    save_padded_features=args.save_padded_features,
+                    start_episode_index=episode_count,
+                    start_sample_index=sample_count,
+                    cfg=cfg,
+                    args=args,
+                    models=models,
+                    device=device,
                 )
-            else:
-                sample_count = save_episode_anchor_records(
-                    split_dir=split_dir,
-                    manifest_handle=manifest,
-                    start_index=sample_count,
-                    batch=batch,
-                    anchors=anchors,
-                    qwen_kv_by_anchor=qwen_kv_by_anchor,
-                    lang_tokens=lang_tokens,
-                    lang_mask=lang_mask,
-                    save_padded_features=args.save_padded_features,
-                    cache_image_slots=True,
-                )
-            episode_count += 1
-            progress.set_postfix(samples=sample_count, episodes=episode_count)
+                episode_count += len(pending_items)
+                pending_items = []
+                pending_sample_count = 0
+                progress.set_postfix(samples=sample_count, episodes=episode_count)
 
-            if args.empty_cache_every > 0 and episode_count % args.empty_cache_every == 0:
+            if (
+                args.empty_cache_every > 0
+                and not pending_items
+                and episode_count > 0
+                and episode_count % args.empty_cache_every == 0
+            ):
                 torch.cuda.empty_cache()
+
+        if pending_items:
+            sample_count = save_prepared_episode_anchor_items(
+                items=pending_items,
+                split_dir=split_dir,
+                manifest_handle=manifest,
+                start_episode_index=episode_count,
+                start_sample_index=sample_count,
+                cfg=cfg,
+                args=args,
+                models=models,
+                device=device,
+            )
+            episode_count += len(pending_items)
+            progress.set_postfix(samples=sample_count, episodes=episode_count)
 
     shutil.move(str(tmp_manifest_path), str(manifest_path))
     print(f"[{split_name}] wrote {sample_count} samples from {episode_count} episodes to {split_dir}")
@@ -1394,6 +1514,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples-per-split", type=int, default=None)
     parser.add_argument("--max-batches-per-split", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--episode-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of episodes to batch together for Qwen/T5 inference in "
+            "episode_anchors mode. Does not affect the per-sample DataLoader path."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--no-normalize-actions", action="store_true")
@@ -1510,6 +1639,8 @@ def main() -> None:
         raise ValueError("--qwen-cache-scope episode_anchors requires --feature-set qwen_t5")
     if args.cache_layout == "episode_packs" and args.qwen_cache_scope != "episode_anchors":
         raise ValueError("--cache-layout episode_packs requires --qwen-cache-scope episode_anchors")
+    if args.episode_batch_size <= 0:
+        raise ValueError("--episode-batch-size must be positive")
     if args.qwen_anchors_per_episode <= 0:
         raise ValueError("--qwen-anchors-per-episode must be positive")
     if "{task}" not in args.qwen_trajectory_prompt_template:
@@ -1554,6 +1685,7 @@ def main() -> None:
         "stage_count": args.stage_count,
         "droid_stage_count": args.droid_stage_count,
         "batch_size": args.batch_size,
+        "episode_batch_size": args.episode_batch_size,
         "normalize_actions": not args.no_normalize_actions,
         "feature_set": args.feature_set,
         "cache_layout": args.cache_layout,
