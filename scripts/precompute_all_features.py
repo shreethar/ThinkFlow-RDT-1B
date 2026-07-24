@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any, Iterable
@@ -1057,10 +1058,9 @@ def build_episode_image_pool(
     return image_pool, torch.as_tensor(sample_image_indices, dtype=torch.long)
 
 
-def save_episode_anchor_pack(
+def save_episode_anchor_pack_job(
     *,
     split_dir: Path,
-    manifest_handle: Any,
     episode_index: int,
     start_index: int,
     batch: dict[str, Any],
@@ -1071,7 +1071,7 @@ def save_episode_anchor_pack(
     save_padded_features: bool,
     image_history_size: int,
     image_jpeg_quality: int,
-) -> int:
+) -> tuple[int, str]:
     batch_size = len(batch["metadata"])
     episode_lang_tokens = lang_tokens[0]
     episode_lang_mask = lang_mask[0]
@@ -1128,7 +1128,7 @@ def save_episode_anchor_pack(
         "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
     }
     torch.save(record, path)
-    manifest_handle.write(
+    manifest_line = (
         json.dumps(
             {
                 "path": filename,
@@ -1150,7 +1150,90 @@ def save_episode_anchor_pack(
         )
         + "\n"
     )
+    return batch_size, manifest_line
+
+
+def save_episode_anchor_pack(
+    *,
+    split_dir: Path,
+    manifest_handle: Any,
+    episode_index: int,
+    start_index: int,
+    batch: dict[str, Any],
+    anchors: list[dict[str, Any]],
+    qwen_kv_by_anchor: torch.Tensor,
+    lang_tokens: torch.Tensor,
+    lang_mask: torch.Tensor,
+    save_padded_features: bool,
+    image_history_size: int,
+    image_jpeg_quality: int,
+) -> int:
+    batch_size, manifest_line = save_episode_anchor_pack_job(
+        split_dir=split_dir,
+        episode_index=episode_index,
+        start_index=start_index,
+        batch=batch,
+        anchors=anchors,
+        qwen_kv_by_anchor=qwen_kv_by_anchor,
+        lang_tokens=lang_tokens,
+        lang_mask=lang_mask,
+        save_padded_features=save_padded_features,
+        image_history_size=image_history_size,
+        image_jpeg_quality=image_jpeg_quality,
+    )
+    manifest_handle.write(manifest_line)
     return start_index + batch_size
+
+
+class OrderedAsyncManifestWriter:
+    def __init__(
+        self,
+        manifest_handle: Any,
+        *,
+        max_workers: int,
+        max_pending: int,
+    ) -> None:
+        self.manifest_handle = manifest_handle
+        self.max_pending = max(1, int(max_pending))
+        self.executor = (
+            ThreadPoolExecutor(max_workers=max_workers)
+            if max_workers > 0
+            else None
+        )
+        self.futures: list[Future[tuple[int, str]]] = []
+
+    @property
+    def enabled(self) -> bool:
+        return self.executor is not None
+
+    def submit(self, fn: Any, **kwargs: Any) -> None:
+        if self.executor is None:
+            _batch_size, manifest_line = fn(**kwargs)
+            self.manifest_handle.write(manifest_line)
+            return
+
+        self.futures.append(self.executor.submit(fn, **kwargs))
+        self.drain_ready()
+        while len(self.futures) >= self.max_pending:
+            self.flush_one()
+
+    def flush_one(self) -> None:
+        if not self.futures:
+            return
+        future = self.futures.pop(0)
+        _batch_size, manifest_line = future.result()
+        self.manifest_handle.write(manifest_line)
+
+    def drain_ready(self) -> None:
+        while self.futures and self.futures[0].done():
+            self.flush_one()
+
+    def close(self) -> None:
+        while self.futures:
+            self.flush_one()
+        if self.executor is not None:
+            self.executor.shutdown(wait=True)
+            self.executor = None
 
 
 def save_prepared_episode_anchor_items(
@@ -1164,6 +1247,7 @@ def save_prepared_episode_anchor_items(
     args: argparse.Namespace,
     models: dict[str, Any],
     device: torch.device,
+    async_writer: OrderedAsyncManifestWriter | None = None,
 ) -> int:
     if not items:
         return start_sample_index
@@ -1205,20 +1289,37 @@ def save_prepared_episode_anchor_items(
         episode_index = start_episode_index + item_index
 
         if args.cache_layout == "episode_packs":
-            sample_index = save_episode_anchor_pack(
-                split_dir=split_dir,
-                manifest_handle=manifest_handle,
-                episode_index=episode_index,
-                start_index=sample_index,
-                batch=item["batch"],
-                anchors=item["anchors"],
-                qwen_kv_by_anchor=qwen_kv_by_anchor,
-                lang_tokens=lang_tokens,
-                lang_mask=lang_mask,
-                save_padded_features=args.save_padded_features,
-                image_history_size=args.image_history_size,
-                image_jpeg_quality=args.image_jpeg_quality,
-            )
+            if async_writer is not None and async_writer.enabled:
+                async_writer.submit(
+                    save_episode_anchor_pack_job,
+                    split_dir=split_dir,
+                    episode_index=episode_index,
+                    start_index=sample_index,
+                    batch=item["batch"],
+                    anchors=item["anchors"],
+                    qwen_kv_by_anchor=qwen_kv_by_anchor.detach().cpu(),
+                    lang_tokens=lang_tokens.detach().cpu(),
+                    lang_mask=lang_mask.detach().cpu(),
+                    save_padded_features=args.save_padded_features,
+                    image_history_size=args.image_history_size,
+                    image_jpeg_quality=args.image_jpeg_quality,
+                )
+                sample_index += int(item["sample_count"])
+            else:
+                sample_index = save_episode_anchor_pack(
+                    split_dir=split_dir,
+                    manifest_handle=manifest_handle,
+                    episode_index=episode_index,
+                    start_index=sample_index,
+                    batch=item["batch"],
+                    anchors=item["anchors"],
+                    qwen_kv_by_anchor=qwen_kv_by_anchor,
+                    lang_tokens=lang_tokens,
+                    lang_mask=lang_mask,
+                    save_padded_features=args.save_padded_features,
+                    image_history_size=args.image_history_size,
+                    image_jpeg_quality=args.image_jpeg_quality,
+                )
         else:
             sample_index = save_episode_anchor_records(
                 split_dir=split_dir,
@@ -1256,6 +1357,15 @@ def precompute_split_episode_anchors(
     episode_count = 0
     skipped_no_image = 0
     with tmp_manifest_path.open("w", encoding="utf-8") as manifest:
+        async_writer = OrderedAsyncManifestWriter(
+            manifest,
+            max_workers=(
+                args.async_write_workers
+                if args.cache_layout == "episode_packs"
+                else 0
+            ),
+            max_pending=args.max_pending_writes,
+        )
         pending_items: list[dict[str, Any]] = []
         pending_sample_count = 0
         progress = tqdm(
@@ -1297,6 +1407,7 @@ def precompute_split_episode_anchors(
                     args=args,
                     models=models,
                     device=device,
+                    async_writer=async_writer,
                 )
                 episode_count += len(pending_items)
                 pending_items = []
@@ -1322,9 +1433,12 @@ def precompute_split_episode_anchors(
                 args=args,
                 models=models,
                 device=device,
+                async_writer=async_writer,
             )
             episode_count += len(pending_items)
             progress.set_postfix(samples=sample_count, episodes=episode_count)
+
+        async_writer.close()
 
     shutil.move(str(tmp_manifest_path), str(manifest_path))
     print(f"[{split_name}] wrote {sample_count} samples from {episode_count} episodes to {split_dir}")
@@ -1608,6 +1722,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--empty-cache-every", type=int, default=25)
+    parser.add_argument(
+        "--async-write-workers",
+        type=int,
+        default=0,
+        help=(
+            "Background episode-pack writer threads. Set to 1-2 to overlap JPEG "
+            "packing/torch.save with the next Qwen/T5 batch."
+        ),
+    )
+    parser.add_argument(
+        "--max-pending-writes",
+        type=int,
+        default=32,
+        help="Maximum queued episode-pack writes before the precompute loop waits.",
+    )
 
     parser.add_argument("--qwen-model-id", default="shreethar/stage1_unsloth")
     parser.add_argument("--qwen-layer-index", type=int, default=7)
@@ -1691,6 +1820,10 @@ def main() -> None:
         raise ValueError("--cache-layout episode_packs requires --qwen-cache-scope episode_anchors")
     if args.episode_batch_size <= 0:
         raise ValueError("--episode-batch-size must be positive")
+    if args.async_write_workers < 0:
+        raise ValueError("--async-write-workers cannot be negative")
+    if args.max_pending_writes <= 0:
+        raise ValueError("--max-pending-writes must be positive")
     if args.qwen_anchors_per_episode <= 0:
         raise ValueError("--qwen-anchors-per-episode must be positive")
     if "{task}" not in args.qwen_trajectory_prompt_template:
@@ -1736,6 +1869,8 @@ def main() -> None:
         "droid_stage_count": args.droid_stage_count,
         "batch_size": args.batch_size,
         "episode_batch_size": args.episode_batch_size,
+        "async_write_workers": args.async_write_workers,
+        "max_pending_writes": args.max_pending_writes,
         "normalize_actions": not args.no_normalize_actions,
         "feature_set": args.feature_set,
         "cache_layout": args.cache_layout,
