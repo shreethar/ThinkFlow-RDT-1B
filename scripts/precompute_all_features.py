@@ -5,8 +5,10 @@ import argparse
 import io
 import json
 import os
+import queue
 import shutil
 import sys
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
@@ -1336,6 +1338,112 @@ def save_prepared_episode_anchor_items(
     return sample_index
 
 
+def produce_prepared_episode_anchor_events(
+    *,
+    dataset: Any,
+    args: argparse.Namespace,
+    output_queue: queue.Queue,
+) -> None:
+    prepared_episode_count = 0
+    prepared_sample_count = 0
+    try:
+        for episode_samples in iter_episode_sample_groups(dataset):
+            if (
+                args.max_batches_per_split is not None
+                and prepared_episode_count >= args.max_batches_per_split
+            ):
+                break
+            if (
+                args.max_samples_per_split is not None
+                and prepared_sample_count >= args.max_samples_per_split
+            ):
+                break
+
+            remaining_samples = None
+            if args.max_samples_per_split is not None:
+                remaining_samples = args.max_samples_per_split - prepared_sample_count
+
+            item = prepare_episode_anchor_item(
+                episode_samples=episode_samples,
+                args=args,
+                remaining_samples=remaining_samples,
+            )
+            if item is None:
+                output_queue.put({"kind": "skipped", "count": len(episode_samples)})
+                continue
+
+            output_queue.put({"kind": "item", "item": item})
+            prepared_episode_count += 1
+            prepared_sample_count += int(item["sample_count"])
+    except BaseException as exc:
+        output_queue.put({"kind": "exception", "exception": exc})
+    finally:
+        output_queue.put({"kind": "done"})
+
+
+def iter_prepared_episode_anchor_events(
+    *,
+    dataset: Any,
+    args: argparse.Namespace,
+) -> Iterable[dict[str, Any]]:
+    if args.episode_prefetch_size <= 0:
+        prepared_episode_count = 0
+        prepared_sample_count = 0
+        for episode_samples in iter_episode_sample_groups(dataset):
+            if (
+                args.max_batches_per_split is not None
+                and prepared_episode_count >= args.max_batches_per_split
+            ):
+                break
+            if (
+                args.max_samples_per_split is not None
+                and prepared_sample_count >= args.max_samples_per_split
+            ):
+                break
+
+            remaining_samples = None
+            if args.max_samples_per_split is not None:
+                remaining_samples = args.max_samples_per_split - prepared_sample_count
+
+            item = prepare_episode_anchor_item(
+                episode_samples=episode_samples,
+                args=args,
+                remaining_samples=remaining_samples,
+            )
+            if item is None:
+                yield {"kind": "skipped", "count": len(episode_samples)}
+                continue
+
+            yield {"kind": "item", "item": item}
+            prepared_episode_count += 1
+            prepared_sample_count += int(item["sample_count"])
+        return
+
+    event_queue: queue.Queue = queue.Queue(maxsize=args.episode_prefetch_size)
+    producer = threading.Thread(
+        target=produce_prepared_episode_anchor_events,
+        kwargs={
+            "dataset": dataset,
+            "args": args,
+            "output_queue": event_queue,
+        },
+        name="episode-prefetch-producer",
+        daemon=True,
+    )
+    producer.start()
+    try:
+        while True:
+            event = event_queue.get()
+            kind = event.get("kind")
+            if kind == "done":
+                break
+            if kind == "exception":
+                raise event["exception"]
+            yield event
+    finally:
+        producer.join(timeout=1.0)
+
+
 def precompute_split_episode_anchors(
     *,
     split_name: str,
@@ -1366,37 +1474,51 @@ def precompute_split_episode_anchors(
             ),
             max_pending=args.max_pending_writes,
         )
-        pending_items: list[dict[str, Any]] = []
-        pending_sample_count = 0
-        progress = tqdm(
-            iter_episode_sample_groups(dataset),
-            desc=f"precompute {split_name} episodes",
-            unit="episode",
-        )
-        for episode_samples in progress:
-            pending_episode_count = episode_count + len(pending_items)
-            if args.max_batches_per_split is not None and pending_episode_count >= args.max_batches_per_split:
-                break
-            if args.max_samples_per_split is not None and sample_count + pending_sample_count >= args.max_samples_per_split:
-                break
-
-            remaining_samples = None
-            if args.max_samples_per_split is not None:
-                remaining_samples = args.max_samples_per_split - sample_count - pending_sample_count
-            item = prepare_episode_anchor_item(
-                episode_samples=episode_samples,
-                args=args,
-                remaining_samples=remaining_samples,
+        try:
+            pending_items: list[dict[str, Any]] = []
+            progress = tqdm(
+                iter_prepared_episode_anchor_events(dataset=dataset, args=args),
+                desc=f"precompute {split_name} episodes",
+                unit="episode",
             )
-            if item is None:
-                skipped_no_image += len(episode_samples)
-                continue
+            for event in progress:
+                kind = event.get("kind")
+                if kind == "skipped":
+                    skipped_no_image += int(event.get("count", 0))
+                    continue
+                if kind != "item":
+                    raise RuntimeError(f"Unexpected episode-precompute event: {event}")
 
-            skipped_no_image += int(item["skipped_no_image"])
-            pending_items.append(item)
-            pending_sample_count += int(item["sample_count"])
+                item = event["item"]
+                skipped_no_image += int(item["skipped_no_image"])
+                pending_items.append(item)
 
-            if len(pending_items) >= args.episode_batch_size:
+                if len(pending_items) >= args.episode_batch_size:
+                    sample_count = save_prepared_episode_anchor_items(
+                        items=pending_items,
+                        split_dir=split_dir,
+                        manifest_handle=manifest,
+                        start_episode_index=episode_count,
+                        start_sample_index=sample_count,
+                        cfg=cfg,
+                        args=args,
+                        models=models,
+                        device=device,
+                        async_writer=async_writer,
+                    )
+                    episode_count += len(pending_items)
+                    pending_items = []
+                    progress.set_postfix(samples=sample_count, episodes=episode_count)
+
+                if (
+                    args.empty_cache_every > 0
+                    and not pending_items
+                    and episode_count > 0
+                    and episode_count % args.empty_cache_every == 0
+                ):
+                    torch.cuda.empty_cache()
+
+            if pending_items:
                 sample_count = save_prepared_episode_anchor_items(
                     items=pending_items,
                     split_dir=split_dir,
@@ -1410,35 +1532,9 @@ def precompute_split_episode_anchors(
                     async_writer=async_writer,
                 )
                 episode_count += len(pending_items)
-                pending_items = []
-                pending_sample_count = 0
                 progress.set_postfix(samples=sample_count, episodes=episode_count)
-
-            if (
-                args.empty_cache_every > 0
-                and not pending_items
-                and episode_count > 0
-                and episode_count % args.empty_cache_every == 0
-            ):
-                torch.cuda.empty_cache()
-
-        if pending_items:
-            sample_count = save_prepared_episode_anchor_items(
-                items=pending_items,
-                split_dir=split_dir,
-                manifest_handle=manifest,
-                start_episode_index=episode_count,
-                start_sample_index=sample_count,
-                cfg=cfg,
-                args=args,
-                models=models,
-                device=device,
-                async_writer=async_writer,
-            )
-            episode_count += len(pending_items)
-            progress.set_postfix(samples=sample_count, episodes=episode_count)
-
-        async_writer.close()
+        finally:
+            async_writer.close()
 
     shutil.move(str(tmp_manifest_path), str(manifest_path))
     print(f"[{split_name}] wrote {sample_count} samples from {episode_count} episodes to {split_dir}")
@@ -1687,6 +1783,15 @@ def parse_args() -> argparse.Namespace:
             "episode_anchors mode. Does not affect the per-sample DataLoader path."
         ),
     )
+    parser.add_argument(
+        "--episode-prefetch-size",
+        type=int,
+        default=0,
+        help=(
+            "Prepared-episode queue depth for episode_anchors mode. Set above 0 "
+            "to prepare raw episodes in a background thread while Qwen/T5 runs."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--no-normalize-actions", action="store_true")
@@ -1820,6 +1925,8 @@ def main() -> None:
         raise ValueError("--cache-layout episode_packs requires --qwen-cache-scope episode_anchors")
     if args.episode_batch_size <= 0:
         raise ValueError("--episode-batch-size must be positive")
+    if args.episode_prefetch_size < 0:
+        raise ValueError("--episode-prefetch-size cannot be negative")
     if args.async_write_workers < 0:
         raise ValueError("--async-write-workers cannot be negative")
     if args.max_pending_writes <= 0:
@@ -1869,6 +1976,7 @@ def main() -> None:
         "droid_stage_count": args.droid_stage_count,
         "batch_size": args.batch_size,
         "episode_batch_size": args.episode_batch_size,
+        "episode_prefetch_size": args.episode_prefetch_size,
         "async_write_workers": args.async_write_workers,
         "max_pending_writes": args.max_pending_writes,
         "normalize_actions": not args.no_normalize_actions,
