@@ -276,6 +276,7 @@ def standardized_collate_fn(
     image_history_size: int,
     image_jpeg_quality: int,
     skip_no_image: bool,
+    encode_image_slots: bool = True,
 ) -> dict[str, Any] | None:
     kept: list[dict[str, Any]] = []
     qwen_image_groups: list[list[Image.Image]] = []
@@ -309,7 +310,7 @@ def standardized_collate_fn(
         "image_slot_jpegs": [
             [image_to_jpeg_bytes(image, quality=image_jpeg_quality) for image in slots]
             for slots in siglip_image_slots
-        ],
+        ] if encode_image_slots else None,
         "state": torch.stack(
             [torch.as_tensor(sample["state"], dtype=torch.float32) for sample in kept]
         ),
@@ -951,7 +952,9 @@ def truncate_episode_batch(
     for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
         batch[key] = batch[key][:keep]
     batch["metadata"] = batch["metadata"][:keep]
-    batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
+    if batch["image_slot_jpegs"] is not None:
+        batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
+    batch["siglip_image_slots"] = batch["siglip_image_slots"][:keep]
     batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]
     batch["kept_samples"] = batch["kept_samples"][:keep]
     return batch, kept_samples[:keep]
@@ -969,6 +972,7 @@ def prepare_episode_anchor_item(
         image_history_size=args.image_history_size,
         image_jpeg_quality=args.image_jpeg_quality,
         skip_no_image=not args.keep_no_image,
+        encode_image_slots=args.cache_layout != "episode_packs",
     )
     if batch is None:
         return None
@@ -994,20 +998,58 @@ def prepare_episode_anchor_item(
     }
 
 
+def logical_image_slot_key(
+    *,
+    step_idx: int,
+    slot_index: int,
+    image_history_size: int,
+) -> tuple[int, str]:
+    frame_pos = slot_index // len(IMAGE_KEYS)
+    image_key = IMAGE_KEYS[slot_index % len(IMAGE_KEYS)]
+    relative_offset = frame_pos - (image_history_size - 1)
+    return max(0, step_idx + relative_offset), image_key
+
+
 def build_episode_image_pool(
     batch: dict[str, Any],
+    *,
+    image_history_size: int,
+    image_jpeg_quality: int,
 ) -> tuple[list[bytes], torch.Tensor]:
-    image_to_index: dict[bytes, int] = {}
+    key_to_index: dict[tuple[int, str] | tuple[str], int] = {}
     image_pool: list[bytes] = []
     sample_image_indices: list[list[int]] = []
+    blank_payload = image_to_jpeg_bytes(blank_rgb_image(), quality=image_jpeg_quality)
 
-    for sample_slots in batch["image_slot_jpegs"]:
+    for sample_index, (metadata, sample_slots) in enumerate(
+        zip(batch["metadata"], batch["siglip_image_slots"])
+    ):
+        slot_mask = batch["siglip_slot_mask"][sample_index]
+        try:
+            step_idx = int(metadata["step_idx"])
+        except (TypeError, ValueError):
+            step_idx = sample_index
         slot_indices: list[int] = []
-        for payload in sample_slots:
-            image_index = image_to_index.get(payload)
+        for slot_index, image in enumerate(sample_slots):
+            valid = bool(slot_mask[slot_index])
+            if valid:
+                pool_key = logical_image_slot_key(
+                    step_idx=step_idx,
+                    slot_index=slot_index,
+                    image_history_size=image_history_size,
+                )
+            else:
+                pool_key = ("blank",)
+
+            image_index = key_to_index.get(pool_key)
             if image_index is None:
                 image_index = len(image_pool)
-                image_to_index[payload] = image_index
+                key_to_index[pool_key] = image_index
+                payload = (
+                    image_to_jpeg_bytes(image, quality=image_jpeg_quality)
+                    if valid
+                    else blank_payload
+                )
                 image_pool.append(payload)
             slot_indices.append(image_index)
         sample_image_indices.append(slot_indices)
@@ -1027,6 +1069,8 @@ def save_episode_anchor_pack(
     lang_tokens: torch.Tensor,
     lang_mask: torch.Tensor,
     save_padded_features: bool,
+    image_history_size: int,
+    image_jpeg_quality: int,
 ) -> int:
     batch_size = len(batch["metadata"])
     episode_lang_tokens = lang_tokens[0]
@@ -1039,7 +1083,11 @@ def save_episode_anchor_pack(
             device=episode_lang_tokens.device,
         )
 
-    image_pool, sample_image_indices = build_episode_image_pool(batch)
+    image_pool, sample_image_indices = build_episode_image_pool(
+        batch,
+        image_history_size=image_history_size,
+        image_jpeg_quality=image_jpeg_quality,
+    )
     sample_anchor_indices = [
         anchor_index_for_step(int(metadata["step_idx"]), anchors)
         for metadata in batch["metadata"]
@@ -1168,6 +1216,8 @@ def save_prepared_episode_anchor_items(
                 lang_tokens=lang_tokens,
                 lang_mask=lang_mask,
                 save_padded_features=args.save_padded_features,
+                image_history_size=args.image_history_size,
+                image_jpeg_quality=args.image_jpeg_quality,
             )
         else:
             sample_index = save_episode_anchor_records(
