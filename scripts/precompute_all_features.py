@@ -1669,7 +1669,8 @@ def precompute_split(
 
 def load_models(args: argparse.Namespace, cfg: Any, device: torch.device) -> dict[str, Any]:
     print("Loading Qwen VLM...")
-    qwen_processor = AutoProcessor.from_pretrained(args.qwen_model_id)
+    qwen_processor_id = args.qwen_processor_id or args.qwen_model_id
+    qwen_processor = AutoProcessor.from_pretrained(qwen_processor_id)
     qwen_processor.tokenizer.padding_side = "left"
     qwen_vlm = AutoModelForImageTextToText.from_pretrained(
         args.qwen_model_id,
@@ -1844,6 +1845,14 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--qwen-model-id", default="shreethar/stage1_unsloth")
+    parser.add_argument(
+        "--qwen-processor-id",
+        default=None,
+        help=(
+            "Optional processor/tokenizer path for Qwen-VL. Use this when "
+            "--qwen-model-id points to a checkpoint containing only model weights."
+        ),
+    )
     parser.add_argument("--qwen-layer-index", type=int, default=7)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
     parser.add_argument(
@@ -1993,6 +2002,7 @@ def main() -> None:
         "image_jpeg_quality": args.image_jpeg_quality,
         "feature_storage": "padded" if args.save_padded_features else "compact_valid_tokens",
         "qwen_model_id": args.qwen_model_id,
+        "qwen_processor_id": args.qwen_processor_id or args.qwen_model_id,
         "qwen_layer_index": args.qwen_layer_index,
         "t5_model_id": resolve_model_id(args.t5_model_id, args.t5_fallback_model_id),
         "siglip_model_id": resolve_model_id(
