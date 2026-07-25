@@ -109,6 +109,7 @@ class TimingProfiler:
         eps = completed_episodes / elapsed
         samples_per_sec = completed_samples / elapsed
         ordered_names = (
+            "event_next",
             "event_wait",
             "prepare_total",
             "prepare_collate",
@@ -1594,6 +1595,10 @@ def precompute_split_episode_anchors(
     sample_count = 0
     episode_count = 0
     skipped_no_image = 0
+    profiler = TimingProfiler(
+        enabled=args.profile_timing,
+        report_every_episodes=args.profile_every_episodes,
+    )
     with tmp_manifest_path.open("w", encoding="utf-8") as manifest:
         async_writer = OrderedAsyncManifestWriter(
             manifest,
@@ -1603,15 +1608,26 @@ def precompute_split_episode_anchors(
                 else 0
             ),
             max_pending=args.max_pending_writes,
+            profiler=profiler,
         )
         try:
             pending_items: list[dict[str, Any]] = []
             progress = tqdm(
-                iter_prepared_episode_anchor_events(dataset=dataset, args=args),
                 desc=f"precompute {split_name} episodes",
                 unit="episode",
             )
-            for event in progress:
+            event_iter = iter(iter_prepared_episode_anchor_events(dataset=dataset, args=args))
+            while True:
+                event_wait_start = time.perf_counter()
+                try:
+                    event = next(event_iter)
+                except StopIteration:
+                    break
+                event_timing_name = (
+                    "event_wait" if args.episode_prefetch_size > 0 else "event_next"
+                )
+                profiler.add(event_timing_name, time.perf_counter() - event_wait_start)
+                progress.update(1)
                 kind = event.get("kind")
                 if kind == "skipped":
                     skipped_no_image += int(event.get("count", 0))
@@ -1620,6 +1636,7 @@ def precompute_split_episode_anchors(
                     raise RuntimeError(f"Unexpected episode-precompute event: {event}")
 
                 item = event["item"]
+                profiler.add_many(item.get("timings"))
                 skipped_no_image += int(item["skipped_no_image"])
                 pending_items.append(item)
 
@@ -1635,10 +1652,17 @@ def precompute_split_episode_anchors(
                         models=models,
                         device=device,
                         async_writer=async_writer,
+                        profiler=profiler,
                     )
                     episode_count += len(pending_items)
                     pending_items = []
+                    async_writer.drain_ready()
                     progress.set_postfix(samples=sample_count, episodes=episode_count)
+                    profiler.maybe_report(
+                        split_name=split_name,
+                        completed_episodes=episode_count,
+                        completed_samples=sample_count,
+                    )
 
                 if (
                     args.empty_cache_every > 0
@@ -1660,11 +1684,26 @@ def precompute_split_episode_anchors(
                     models=models,
                     device=device,
                     async_writer=async_writer,
+                    profiler=profiler,
                 )
                 episode_count += len(pending_items)
+                async_writer.drain_ready()
                 progress.set_postfix(samples=sample_count, episodes=episode_count)
+                profiler.maybe_report(
+                    split_name=split_name,
+                    completed_episodes=episode_count,
+                    completed_samples=sample_count,
+                )
         finally:
+            if "progress" in locals():
+                progress.close()
             async_writer.close()
+            profiler.maybe_report(
+                split_name=split_name,
+                completed_episodes=episode_count,
+                completed_samples=sample_count,
+                force=True,
+            )
 
     shutil.move(str(tmp_manifest_path), str(manifest_path))
     print(f"[{split_name}] wrote {sample_count} samples from {episode_count} episodes to {split_dir}")
@@ -1973,6 +2012,17 @@ def parse_args() -> argparse.Namespace:
         default=32,
         help="Maximum queued episode-pack writes before the precompute loop waits.",
     )
+    parser.add_argument(
+        "--profile-timing",
+        action="store_true",
+        help="Print rolling timing totals for episode prep, Qwen, T5, and cache writes.",
+    )
+    parser.add_argument(
+        "--profile-every-episodes",
+        type=int,
+        default=100,
+        help="When --profile-timing is set, print one timing line every N episodes.",
+    )
 
     parser.add_argument("--qwen-model-id", default="shreethar/stage1_unsloth")
     parser.add_argument(
@@ -2070,6 +2120,8 @@ def main() -> None:
         raise ValueError("--async-write-workers cannot be negative")
     if args.max_pending_writes <= 0:
         raise ValueError("--max-pending-writes must be positive")
+    if args.profile_every_episodes <= 0:
+        raise ValueError("--profile-every-episodes must be positive")
     if args.qwen_anchors_per_episode <= 0:
         raise ValueError("--qwen-anchors-per-episode must be positive")
     if "{task}" not in args.qwen_trajectory_prompt_template:
