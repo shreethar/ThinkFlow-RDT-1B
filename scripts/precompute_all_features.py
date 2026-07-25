@@ -466,6 +466,7 @@ def extract_qwen_kv(
     stop_at_think_end: bool = True,
     prompt_template: str | None = QWEN_TRAJECTORY_PROMPT_TEMPLATE,
     enable_thinking: bool = False,
+    profile_counts: dict[str, int] | None = None,
 ) -> torch.Tensor:
     texts_list: list[str] = []
     images_list: list[list[Image.Image]] = []
@@ -511,6 +512,10 @@ def extract_qwen_kv(
             prompt_target_indices.append(think_end_pos - 1 if think_end_pos != -1 else -1)
 
     if prompt_target_indices and all(index >= 0 for index in prompt_target_indices):
+        if profile_counts is not None:
+            profile_counts["qwen_forward_prompts"] = profile_counts.get("qwen_forward_prompts", 0) + len(texts_list)
+            if "attention_mask" in inputs:
+                profile_counts["qwen_prompt_tokens"] = profile_counts.get("qwen_prompt_tokens", 0) + int(inputs["attention_mask"].sum().item())
         outputs = vlm(
             **inputs,
             use_cache=True,
@@ -552,6 +557,14 @@ def extract_qwen_kv(
     )
 
     generated_ids = generated.sequences
+    if profile_counts is not None:
+        batch_size = int(generated_ids.shape[0])
+        input_width = int(inputs["input_ids"].shape[1])
+        generated_width = max(0, int(generated_ids.shape[1]) - input_width)
+        profile_counts["qwen_generate_prompts"] = profile_counts.get("qwen_generate_prompts", 0) + batch_size
+        profile_counts["qwen_generated_tokens"] = profile_counts.get("qwen_generated_tokens", 0) + (generated_width * batch_size)
+        if "attention_mask" in inputs:
+            profile_counts["qwen_prompt_tokens"] = profile_counts.get("qwen_prompt_tokens", 0) + int(inputs["attention_mask"].sum().item())
     keys, values = layer_key_values_from_past(
         generated.past_key_values,
         layer_index=layer_index,
@@ -1382,6 +1395,7 @@ def save_prepared_episode_anchor_items(
         anchor_spans.append((start, len(all_anchors)))
 
     qwen_start = time.perf_counter()
+    qwen_profile_counts: dict[str, int] = {}
     qwen_kv_all = extract_qwen_kv(
         qwen_anchor_batch(all_anchors),
         models["qwen_processor"],
@@ -1393,11 +1407,14 @@ def save_prepared_episode_anchor_items(
         stop_at_think_end=args.qwen_stop_at_think,
         prompt_template=args.qwen_trajectory_prompt_template,
         enable_thinking=args.qwen_enable_thinking,
+        profile_counts=qwen_profile_counts,
     )
     if profiler is not None:
         synchronize_if_cuda(device)
         profiler.add("qwen", time.perf_counter() - qwen_start)
         profiler.count("qwen_prompts", len(all_anchors))
+        for name, value in qwen_profile_counts.items():
+            profiler.count(name, value)
 
     t5_start = time.perf_counter()
     lang_tokens_all, lang_mask_all = extract_t5_features(
