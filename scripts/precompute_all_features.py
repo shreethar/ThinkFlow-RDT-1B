@@ -9,6 +9,7 @@ import queue
 import shutil
 import sys
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
@@ -60,6 +61,91 @@ QWEN_TRAJECTORY_PROMPT_TEMPLATE = (
     "[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]\n\n"
     "Task: The task is {task}. What is the trajectory that the end effector should take?"
 )
+
+
+class TimingProfiler:
+    def __init__(self, *, enabled: bool, report_every_episodes: int) -> None:
+        self.enabled = bool(enabled)
+        self.report_every_episodes = max(1, int(report_every_episodes))
+        self.start_time = time.perf_counter()
+        self.last_report_episode = 0
+        self.totals: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+
+    def add(self, name: str, seconds: float) -> None:
+        if not self.enabled:
+            return
+        self.totals[name] = self.totals.get(name, 0.0) + float(seconds)
+
+    def add_many(self, timings: dict[str, float] | None) -> None:
+        if not self.enabled or not timings:
+            return
+        for name, seconds in timings.items():
+            self.add(name, seconds)
+
+    def count(self, name: str, amount: int) -> None:
+        if not self.enabled:
+            return
+        self.counts[name] = self.counts.get(name, 0) + int(amount)
+
+    def maybe_report(
+        self,
+        *,
+        split_name: str,
+        completed_episodes: int,
+        completed_samples: int,
+        force: bool = False,
+    ) -> None:
+        if not self.enabled:
+            return
+        if (
+            not force
+            and completed_episodes - self.last_report_episode < self.report_every_episodes
+        ):
+            return
+
+        self.last_report_episode = completed_episodes
+        elapsed = max(time.perf_counter() - self.start_time, 1e-9)
+        eps = completed_episodes / elapsed
+        samples_per_sec = completed_samples / elapsed
+        ordered_names = (
+            "event_wait",
+            "prepare_total",
+            "prepare_collate",
+            "prepare_anchors",
+            "qwen",
+            "t5",
+            "writer_wait",
+            "jpeg_pool",
+            "torch_save",
+            "episode_pack_total",
+        )
+        timing_parts = [
+            f"{name}={self.totals[name]:.2f}s"
+            for name in ordered_names
+            if name in self.totals
+        ]
+        other_timing_parts = [
+            f"{name}={seconds:.2f}s"
+            for name, seconds in sorted(self.totals.items())
+            if name not in ordered_names
+        ]
+        count_parts = [
+            f"{name}={value}"
+            for name, value in sorted(self.counts.items())
+        ]
+        print(
+            "[timing] "
+            f"split={split_name} episodes={completed_episodes} samples={completed_samples} "
+            f"wall={elapsed:.2f}s eps={eps:.3f} samples/s={samples_per_sec:.1f} "
+            + " ".join(timing_parts + other_timing_parts + count_parts),
+            flush=True,
+        )
+
+
+def synchronize_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
 
 class StopAfterSubsequence(StoppingCriteria):
@@ -969,6 +1055,9 @@ def prepare_episode_anchor_item(
     args: argparse.Namespace,
     remaining_samples: int | None,
 ) -> dict[str, Any] | None:
+    prepare_start = time.perf_counter()
+    timings: dict[str, float] = {}
+    collate_start = time.perf_counter()
     batch = standardized_collate_fn(
         episode_samples,
         max_images_per_sample=args.max_images_per_sample,
@@ -977,6 +1066,7 @@ def prepare_episode_anchor_item(
         skip_no_image=not args.keep_no_image,
         encode_image_slots=args.cache_layout != "episode_packs",
     )
+    timings["prepare_collate"] = time.perf_counter() - collate_start
     if batch is None:
         return None
 
@@ -987,17 +1077,21 @@ def prepare_episode_anchor_item(
             return None
         batch, kept_samples = truncate_episode_batch(batch, kept_samples, keep=keep)
 
+    anchor_start = time.perf_counter()
     anchors = select_episode_qwen_anchors(
         kept_samples,
         normalized_actions=not args.no_normalize_actions,
         max_anchors=args.qwen_anchors_per_episode,
     )
+    timings["prepare_anchors"] = time.perf_counter() - anchor_start
+    timings["prepare_total"] = time.perf_counter() - prepare_start
     return {
         "batch": batch,
         "kept_samples": kept_samples,
         "anchors": anchors,
         "sample_count": len(batch["metadata"]),
         "skipped_no_image": int(batch.get("skipped_no_image", 0)),
+        "timings": timings,
     }
 
 
@@ -1073,7 +1167,9 @@ def save_episode_anchor_pack_job(
     save_padded_features: bool,
     image_history_size: int,
     image_jpeg_quality: int,
-) -> tuple[int, str]:
+) -> tuple[int, str, dict[str, float]]:
+    job_start = time.perf_counter()
+    timings: dict[str, float] = {}
     batch_size = len(batch["metadata"])
     episode_lang_tokens = lang_tokens[0]
     episode_lang_mask = lang_mask[0]
@@ -1085,11 +1181,13 @@ def save_episode_anchor_pack_job(
             device=episode_lang_tokens.device,
         )
 
+    jpeg_start = time.perf_counter()
     image_pool, sample_image_indices = build_episode_image_pool(
         batch,
         image_history_size=image_history_size,
         image_jpeg_quality=image_jpeg_quality,
     )
+    timings["jpeg_pool"] = time.perf_counter() - jpeg_start
     sample_anchor_indices = [
         anchor_index_for_step(int(metadata["step_idx"]), anchors)
         for metadata in batch["metadata"]
@@ -1129,7 +1227,9 @@ def save_episode_anchor_pack_job(
         ),
         "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
     }
+    save_start = time.perf_counter()
     torch.save(record, path)
+    timings["torch_save"] = time.perf_counter() - save_start
     manifest_line = (
         json.dumps(
             {
@@ -1152,7 +1252,8 @@ def save_episode_anchor_pack_job(
         )
         + "\n"
     )
-    return batch_size, manifest_line
+    timings["episode_pack_total"] = time.perf_counter() - job_start
+    return batch_size, manifest_line, timings
 
 
 def save_episode_anchor_pack(
@@ -1170,7 +1271,7 @@ def save_episode_anchor_pack(
     image_history_size: int,
     image_jpeg_quality: int,
 ) -> int:
-    batch_size, manifest_line = save_episode_anchor_pack_job(
+    batch_size, manifest_line, _timings = save_episode_anchor_pack_job(
         split_dir=split_dir,
         episode_index=episode_index,
         start_index=start_index,
@@ -1194,15 +1295,17 @@ class OrderedAsyncManifestWriter:
         *,
         max_workers: int,
         max_pending: int,
+        profiler: TimingProfiler | None = None,
     ) -> None:
         self.manifest_handle = manifest_handle
         self.max_pending = max(1, int(max_pending))
+        self.profiler = profiler
         self.executor = (
             ThreadPoolExecutor(max_workers=max_workers)
             if max_workers > 0
             else None
         )
-        self.futures: list[Future[tuple[int, str]]] = []
+        self.futures: list[Future[tuple[int, str, dict[str, float]]]] = []
 
     @property
     def enabled(self) -> bool:
@@ -1210,8 +1313,7 @@ class OrderedAsyncManifestWriter:
 
     def submit(self, fn: Any, **kwargs: Any) -> None:
         if self.executor is None:
-            _batch_size, manifest_line = fn(**kwargs)
-            self.manifest_handle.write(manifest_line)
+            self._handle_result(fn(**kwargs))
             return
 
         self.futures.append(self.executor.submit(fn, **kwargs))
@@ -1223,7 +1325,23 @@ class OrderedAsyncManifestWriter:
         if not self.futures:
             return
         future = self.futures.pop(0)
-        _batch_size, manifest_line = future.result()
+        wait_start = time.perf_counter()
+        result = future.result()
+        if self.profiler is not None:
+            self.profiler.add("writer_wait", time.perf_counter() - wait_start)
+        self._handle_result(result)
+
+    def _handle_result(self, result: tuple[Any, ...]) -> None:
+        if len(result) == 2:
+            _batch_size, manifest_line = result
+            timings = None
+        elif len(result) == 3:
+            _batch_size, manifest_line, timings = result
+        else:
+            raise ValueError(f"Unexpected writer result shape: {len(result)}")
+        if self.profiler is not None:
+            self.profiler.add_many(timings)
+            self.profiler.count("episode_packs_written", 1)
         self.manifest_handle.write(manifest_line)
 
     def drain_ready(self) -> None:
@@ -1250,6 +1368,7 @@ def save_prepared_episode_anchor_items(
     models: dict[str, Any],
     device: torch.device,
     async_writer: OrderedAsyncManifestWriter | None = None,
+    profiler: TimingProfiler | None = None,
 ) -> int:
     if not items:
         return start_sample_index
@@ -1261,6 +1380,7 @@ def save_prepared_episode_anchor_items(
         all_anchors.extend(item["anchors"])
         anchor_spans.append((start, len(all_anchors)))
 
+    qwen_start = time.perf_counter()
     qwen_kv_all = extract_qwen_kv(
         qwen_anchor_batch(all_anchors),
         models["qwen_processor"],
@@ -1273,6 +1393,12 @@ def save_prepared_episode_anchor_items(
         prompt_template=args.qwen_trajectory_prompt_template,
         enable_thinking=args.qwen_enable_thinking,
     )
+    if profiler is not None:
+        synchronize_if_cuda(device)
+        profiler.add("qwen", time.perf_counter() - qwen_start)
+        profiler.count("qwen_prompts", len(all_anchors))
+
+    t5_start = time.perf_counter()
     lang_tokens_all, lang_mask_all = extract_t5_features(
         t5_episode_batch_from_items(items),
         models["t5_tokenizer"],
@@ -1281,6 +1407,10 @@ def save_prepared_episode_anchor_items(
         expected_dim=cfg.model.lang_token_dim,
         device=device,
     )
+    if profiler is not None:
+        synchronize_if_cuda(device)
+        profiler.add("t5", time.perf_counter() - t5_start)
+        profiler.count("t5_episodes", len(items))
 
     sample_index = start_sample_index
     for item_index, item in enumerate(items):
@@ -1291,7 +1421,7 @@ def save_prepared_episode_anchor_items(
         episode_index = start_episode_index + item_index
 
         if args.cache_layout == "episode_packs":
-            if async_writer is not None and async_writer.enabled:
+            if async_writer is not None:
                 async_writer.submit(
                     save_episode_anchor_pack_job,
                     split_dir=split_dir,

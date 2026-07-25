@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -422,6 +424,14 @@ def iter_bcz_raw_episodes(
     builder = tfds.builder_from_directory(str(data_dir))
     shard_paths = find_local_shards(data_dir, split=split, shard_pattern=shard_pattern)
     if shard_paths:
+        if any(".array_record-" in path.name for path in shard_paths):
+            yield from iter_bcz_array_record_slices(
+                builder,
+                data_dir=data_dir,
+                split=split,
+                shard_paths=shard_paths,
+            )
+            return
         dataset = tf.data.TFRecordDataset([str(path) for path in shard_paths]).map(
             builder.info.features.deserialize_example,
             num_parallel_calls=tf.data.AUTOTUNE,
@@ -450,10 +460,76 @@ def find_local_shards(
             return sorted(path for path in pattern_path.parent.glob(pattern_path.name))
         return sorted(data_dir.glob(shard_pattern))
 
+    split_array_records = sorted(data_dir.glob(f"*{split}*.array_record*"))
+    if split_array_records:
+        return split_array_records
+    array_records = sorted(data_dir.glob("*.array_record*"))
+    if array_records:
+        return array_records
+
     split_shards = sorted(data_dir.glob(f"*{split}*.tfrecord*"))
     if split_shards:
         return split_shards
     return sorted(data_dir.glob("*.tfrecord*"))
+
+
+def iter_bcz_array_record_slices(
+    builder: Any,
+    *,
+    data_dir: Path,
+    split: str,
+    shard_paths: list[Path],
+):
+    shard_indices = sorted(
+        index
+        for path in shard_paths
+        if (index := parse_shard_index(path.name)) is not None
+    )
+    if not shard_indices:
+        yield from builder.as_data_source(split=split)
+        return
+
+    shard_lengths = read_split_shard_lengths(data_dir / "dataset_info.json", split=split)
+    for start_shard, stop_shard in contiguous_ranges(shard_indices):
+        if start_shard >= len(shard_lengths):
+            continue
+        stop_shard = min(stop_shard, len(shard_lengths) - 1)
+        start_episode = int(sum(shard_lengths[:start_shard]))
+        stop_episode = int(sum(shard_lengths[: stop_shard + 1]))
+        if stop_episode <= start_episode:
+            continue
+        split_spec = f"{split}[{start_episode}:{stop_episode}]"
+        yield from builder.as_data_source(split=split_spec)
+
+
+def parse_shard_index(filename: str) -> int | None:
+    match = re.search(r"-(\d{5})-of-\d+", filename)
+    return int(match.group(1)) if match else None
+
+
+def contiguous_ranges(indices: list[int]) -> list[tuple[int, int]]:
+    if not indices:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = previous = indices[0]
+    for index in indices[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        ranges.append((start, previous))
+        start = previous = index
+    ranges.append((start, previous))
+    return ranges
+
+
+def read_split_shard_lengths(dataset_info_path: Path, *, split: str) -> list[int]:
+    with dataset_info_path.open("r", encoding="utf-8") as handle:
+        dataset_info = json.load(handle)
+    splits = dataset_info.get("splits", [])
+    for split_info in splits:
+        if split_info.get("name") == split:
+            return [int(value) for value in split_info.get("shardLengths", [])]
+    raise KeyError(f"Split {split!r} not found in {dataset_info_path}")
 
 
 def bcz_episode_id(raw_episode: Any, episode_index: int, *, split: str) -> str:
