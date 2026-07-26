@@ -169,9 +169,17 @@ def build_config(args: argparse.Namespace):
         ),
         report_to=str(optional_override(args.report_to, cfg.training.report_to)),
     )
+    model_cfg = cfg.model
+    if args.no_gradient_checkpointing:
+        model_cfg = replace(model_cfg, gradient_checkpointing=False)
+    if args.image_tokens is not None:
+        model_cfg = replace(model_cfg, image_tokens=int(args.image_tokens))
+    if args.pred_horizon is not None:
+        model_cfg = replace(model_cfg, pred_horizon=int(args.pred_horizon))
     cfg = replace(
         cfg,
         output_dir=output_dir,
+        model=model_cfg,
         data=data_cfg,
         training=training_cfg,
     )
@@ -256,6 +264,30 @@ def parse_args() -> argparse.Namespace:
         "--persistent-workers",
         action=argparse.BooleanOptionalAction,
         default=None,
+    )
+    parser.add_argument(
+        "--no-gradient-checkpointing",
+        action="store_true",
+        help=(
+            "Disable RDT block gradient checkpointing. Faster if VRAM allows it, "
+            "but memory use increases."
+        ),
+    )
+    parser.add_argument(
+        "--image-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Override cfg.model.image_tokens. Cached img_tokens are truncated by "
+            "the collator, which can speed training at some quality cost. Use only "
+            "with fully precomputed image-token caches, not --online-siglip."
+        ),
+    )
+    parser.add_argument(
+        "--pred-horizon",
+        type=int,
+        default=None,
+        help="Override cfg.model.pred_horizon; cached action horizons are truncated/padded.",
     )
     return parser.parse_args()
 
