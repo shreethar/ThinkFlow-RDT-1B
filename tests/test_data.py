@@ -118,3 +118,63 @@ def test_cached_feature_dataset_reads_episode_pack(tmp_path):
     assert sample["qwen_kv"].unique().item() == 2.0
     assert sample["image_slot_jpegs"] == [b"image-b", b"image-a"]
     assert sample["image_slot_mask"].tolist() == [True, True]
+
+
+def test_cached_feature_dataset_reads_sample_shard(tmp_path):
+    shard_path = tmp_path / "shard_000000000.pt"
+    manifest_path = tmp_path / "manifest.jsonl"
+    torch.save(
+        {
+            "cache_layout": "sample_shard",
+            "feature_type": "latent_student_spatial_kv",
+            "num_samples": 2,
+            "qwen_kv": torch.stack(
+                [torch.ones(5, 8), torch.full((5, 8), 3.0)],
+                dim=0,
+            ),
+            "lang_tokens": [torch.randn(2, 4), torch.randn(3, 4)],
+            "lang_mask": [torch.ones(2, dtype=torch.bool), torch.ones(3, dtype=torch.bool)],
+            "sample_lang_index": torch.tensor([0, 1]),
+            "state": torch.randn(2, 7),
+            "actions": torch.randn(2, 5, 7),
+            "action_time_mask": torch.ones(2, 5, dtype=torch.bool),
+            "action_dim_mask": torch.ones(2, 7),
+            "ctrl_freq": torch.tensor([10.0, 3.0]),
+            "metadata": [
+                {"dataset_id": "dummy", "episode_id": "ep_a", "step_idx": "1"},
+                {"dataset_id": "dummy", "episode_id": "ep_a", "step_idx": "2"},
+            ],
+            "image_jpegs": [b"image-a", b"image-b"],
+            "sample_image_indices": torch.tensor([[0, 1], [1, 0]]),
+            "sample_image_mask": torch.tensor([[True, False], [True, True]]),
+            "latent_waypoints": torch.randn(2, 5, 2),
+        },
+        shard_path,
+    )
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "path": shard_path.name,
+                "cache_layout": "sample_shard",
+                "num_samples": 2,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    dataset = CachedFeatureDataset(
+        manifest_path,
+        required_keys=ONLINE_SIGLIP_REQUIRED_KEYS,
+    )
+
+    assert len(dataset) == 2
+    sample = dataset[1]
+    assert sample["episode_id"] == "ep_a"
+    assert sample["step_idx"] == "2"
+    assert sample["qwen_kv"].shape == (5, 8)
+    assert sample["qwen_kv"].unique().item() == 3.0
+    assert sample["lang_tokens"].shape == (3, 4)
+    assert sample["image_slot_jpegs"] == [b"image-b", b"image-a"]
+    assert sample["image_slot_mask"].tolist() == [True, True]
+    assert sample["latent_waypoints"].shape == (5, 2)

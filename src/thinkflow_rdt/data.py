@@ -40,6 +40,11 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
     Newer manifests may point at one episode pack per line:
       {"path": "episode_000000000.pt", "cache_layout": "episode_pack", "num_samples": 64}
     In that case this dataset expands the episode pack into sample-level items.
+
+    Batched shard manifests are also supported:
+      {"path": "shard_000000000.pt", "cache_layout": "sample_shard", "num_samples": 64}
+    Those are expanded the same way, while still allowing arbitrary training
+    batch sizes.
     """
 
     def __init__(
@@ -68,18 +73,18 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
                 path = Path(path_value)
                 if not path.is_absolute():
                     path = (self.base_dir / path).resolve()
-                if isinstance(item, dict) and item.get("cache_layout") == "episode_pack":
+                if isinstance(item, dict) and item.get("cache_layout") in {"episode_pack", "sample_shard"}:
                     num_samples = int(item.get("num_samples", 0))
                     if num_samples <= 0:
                         raise ValueError(
-                            f"Episode-pack manifest line {line_number} has invalid "
+                            f"{item.get('cache_layout')} manifest line {line_number} has invalid "
                             f"num_samples={num_samples}: {self.manifest_path}"
                         )
                     for sample_index in range(num_samples):
                         self.entries.append(
                             {
                                 "path": path,
-                                "cache_layout": "episode_pack",
+                                "cache_layout": item.get("cache_layout"),
                                 "sample_index": sample_index,
                             }
                         )
@@ -110,6 +115,13 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
                 int(entry["sample_index"]),
                 path=path,
             )
+        elif entry["cache_layout"] == "sample_shard":
+            pack = self._load_sample_shard(path)
+            sample = self._sample_from_sample_shard(
+                pack,
+                int(entry["sample_index"]),
+                path=path,
+            )
         else:
             sample = torch.load(path, map_location="cpu", weights_only=False)
         missing = self.required_keys.difference(sample)
@@ -126,6 +138,20 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         pack = torch.load(path, map_location="cpu", weights_only=False)
         if pack.get("cache_layout") != "episode_pack":
             raise ValueError(f"{path} is not an episode_pack cache file")
+        self._pack_cache[path] = pack
+        self._pack_cache.move_to_end(path)
+        while len(self._pack_cache) > self._pack_cache_size:
+            self._pack_cache.popitem(last=False)
+        return pack
+
+    def _load_sample_shard(self, path: Path) -> dict[str, Any]:
+        cached = self._pack_cache.get(path)
+        if cached is not None:
+            self._pack_cache.move_to_end(path)
+            return cached
+        pack = torch.load(path, map_location="cpu", weights_only=False)
+        if pack.get("cache_layout") != "sample_shard":
+            raise ValueError(f"{path} is not a sample_shard cache file")
         self._pack_cache[path] = pack
         self._pack_cache.move_to_end(path)
         while len(self._pack_cache) > self._pack_cache_size:
@@ -189,6 +215,86 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             "qwen_anchor_kind": str(pack["qwen_anchor_kind"][anchor_index]),
             "qwen_anchor_count": int(qwen_anchor_kv.shape[0]),
         }
+        return sample
+
+    def _sample_from_sample_shard(
+        self,
+        pack: dict[str, Any],
+        sample_index: int,
+        *,
+        path: Path,
+    ) -> dict[str, Any]:
+        num_samples = int(pack["num_samples"])
+        if sample_index < 0 or sample_index >= num_samples:
+            raise IndexError(f"sample_index {sample_index} out of range for {path}")
+
+        metadata_values = pack.get("metadata", [{} for _ in range(num_samples)])
+        metadata = metadata_values[sample_index] if sample_index < len(metadata_values) else {}
+
+        lang_tokens = pack.get("lang_tokens")
+        lang_mask = pack.get("lang_mask")
+        if lang_tokens is not None:
+            sample_lang_index = pack.get("sample_lang_index")
+            lang_index = (
+                int(torch.as_tensor(sample_lang_index)[sample_index].item())
+                if sample_lang_index is not None
+                else sample_index
+            )
+            if isinstance(lang_tokens, list):
+                lang_tokens = lang_tokens[lang_index]
+                lang_mask = lang_mask[lang_index] if isinstance(lang_mask, list) else lang_mask
+            else:
+                lang_tokens = lang_tokens[lang_index]
+                lang_mask = lang_mask[lang_index] if lang_mask is not None else None
+
+        image_slot_jpegs = pack.get("image_slot_jpegs")
+        if image_slot_jpegs is not None:
+            image_slot_jpegs = list(image_slot_jpegs[sample_index])
+        elif "image_jpegs" in pack and "sample_image_indices" in pack:
+            image_pool = list(pack["image_jpegs"])
+            image_indices = torch.as_tensor(pack["sample_image_indices"], dtype=torch.long)[
+                sample_index
+            ].flatten().tolist()
+            image_slot_jpegs = []
+            for image_index in image_indices:
+                if image_index < 0 or image_index >= len(image_pool):
+                    raise IndexError(f"image index {image_index} out of range for {path}")
+                image_slot_jpegs.append(image_pool[image_index])
+
+        image_slot_mask = pack.get("image_slot_mask")
+        if image_slot_mask is None:
+            image_slot_mask = pack.get("sample_image_mask")
+        if image_slot_mask is not None:
+            image_slot_mask = image_slot_mask[sample_index]
+
+        ctrl_freq = pack.get("ctrl_freq", 0.0)
+        if isinstance(ctrl_freq, torch.Tensor) and ctrl_freq.ndim > 0:
+            ctrl_freq = float(ctrl_freq[sample_index].item())
+        else:
+            ctrl_freq = float(ctrl_freq)
+
+        sample = {
+            "qwen_kv": torch.as_tensor(pack["qwen_kv"])[sample_index],
+            "state": pack["state"][sample_index],
+            "actions": pack["actions"][sample_index],
+            "action_time_mask": pack["action_time_mask"][sample_index],
+            "action_dim_mask": pack["action_dim_mask"][sample_index],
+            "ctrl_freq": ctrl_freq,
+            "dataset_id": metadata.get("dataset_id"),
+            "episode_id": metadata.get("episode_id"),
+            "step_idx": str(metadata.get("step_idx", sample_index)),
+            "cache_layout": "sample_shard",
+        }
+        if lang_tokens is not None:
+            sample["lang_tokens"] = lang_tokens
+        if lang_mask is not None:
+            sample["lang_mask"] = lang_mask
+        if image_slot_jpegs is not None:
+            sample["image_slot_jpegs"] = image_slot_jpegs
+        if image_slot_mask is not None:
+            sample["image_slot_mask"] = image_slot_mask
+        if "latent_waypoints" in pack:
+            sample["latent_waypoints"] = pack["latent_waypoints"][sample_index]
         return sample
 
 

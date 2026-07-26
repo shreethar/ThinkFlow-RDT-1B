@@ -250,7 +250,12 @@ class SFTConditionedRDT(nn.Module):
         lang_cond = torch.cat([qwen_c, lang_cond], dim=1)
         
         # Create masks
-        qwen_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=qwen_c.device)
+        qwen_mask = torch.ones(
+            batch_size,
+            qwen_c.shape[1],
+            dtype=torch.bool,
+            device=qwen_c.device,
+        )
         lang_mask_final = torch.cat([qwen_mask, lang_mask], dim=1)
         
         prediction = self.runner.model(
@@ -298,7 +303,12 @@ class SFTConditionedRDT(nn.Module):
         
         # Create masks
         batch_size = states.shape[0]
-        qwen_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=states.device)
+        qwen_mask = torch.ones(
+            batch_size,
+            qwen_c.shape[1],
+            dtype=torch.bool,
+            device=qwen_c.device,
+        )
         lang_mask_final = torch.cat([qwen_mask, lang_mask], dim=1)
         noisy = torch.randn(
             states.shape[0],

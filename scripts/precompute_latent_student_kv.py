@@ -1,0 +1,748 @@
+#!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import AutoProcessor, T5EncoderModel, T5Tokenizer
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from precompute_all_features import (  # noqa: E402
+    IMAGE_KEYS,
+    QWEN_TRAJECTORY_PROMPT_TEMPLATE,
+    SPLIT_NAMES,
+    apply_qwen_chat_template,
+    build_lazy_configs,
+    compact_tokens,
+    format_qwen_trajectory_prompt,
+    image_to_jpeg_bytes,
+    layer_key_values_from_past,
+    prepare_split_output,
+    resolve_model_id,
+    standardized_collate_fn,
+)
+from thinkflow_rdt.adapters.combined_lazy import build_combined_standardized_splits  # noqa: E402
+from thinkflow_rdt.config import load_config  # noqa: E402
+
+
+def import_latent_student(code_dir: Path | None) -> type[Any]:
+    if code_dir is not None:
+        resolved = code_dir.expanduser().resolve()
+        if str(resolved) not in sys.path:
+            sys.path.insert(0, str(resolved))
+    try:
+        from models.latent_student import LatentStudent
+    except ImportError as exc:
+        raise ImportError(
+            "Could not import models.latent_student.LatentStudent. "
+            "Pass --latent-student-code-dir /path/to/VLA-FYP/train/stage2."
+        ) from exc
+    return LatentStudent
+
+
+def tokenizer_end_think_id(tokenizer: Any) -> int:
+    token_id = tokenizer.convert_tokens_to_ids("</think>")
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if token_id is None or token_id == unk_id:
+        encoded = tokenizer.encode("</think>", add_special_tokens=False)
+        if not encoded:
+            raise ValueError("Tokenizer could not encode </think>")
+        token_id = encoded[-1]
+    return int(token_id)
+
+
+def load_local_spatial_parameters_if_present(student: Any, model_id: str) -> None:
+    model_path = Path(model_id).expanduser()
+    spatial_path = model_path / "spatial_parameters.pt"
+    if not spatial_path.exists():
+        return
+    state = torch.load(spatial_path, map_location="cpu", weights_only=False)
+    if "spatial_tokens" in state:
+        student.spatial_tokens.data.copy_(state["spatial_tokens"])
+    if "spatial_mlp" in state:
+        student.spatial_mlp.load_state_dict(state["spatial_mlp"])
+    print(f"Loaded local spatial parameters from {spatial_path}")
+
+
+def load_student_and_processor(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any]:
+    processor_id = args.processor_id or args.student_model_id
+    processor = AutoProcessor.from_pretrained(processor_id, trust_remote_code=True)
+    if hasattr(processor, "tokenizer"):
+        processor.tokenizer.padding_side = "left"
+    end_think_id = tokenizer_end_think_id(processor.tokenizer)
+
+    LatentStudent = import_latent_student(args.latent_student_code_dir)
+    student = LatentStudent.from_pretrained(
+        args.student_model_id,
+        end_think_token_id=end_think_id,
+        M=args.latent_count,
+        K=args.spatial_token_count,
+    )
+    load_local_spatial_parameters_if_present(student, args.student_model_id)
+    student.eval()
+    student.requires_grad_(False)
+    student.to(device)
+    return student, processor
+
+
+def load_t5(args: argparse.Namespace, cfg: Any) -> tuple[Any, Any]:
+    t5_model_id = resolve_model_id(args.t5_model_id, args.t5_fallback_model_id)
+    tokenizer = T5Tokenizer.from_pretrained(t5_model_id)
+    encoder = T5EncoderModel.from_pretrained(
+        t5_model_id,
+        torch_dtype=torch.bfloat16,
+        device_map=args.device_map,
+    )
+    encoder.eval()
+    encoder.requires_grad_(False)
+    if encoder.config.d_model != cfg.model.lang_token_dim:
+        raise ValueError(
+            f"T5 d_model {encoder.config.d_model} != cfg.model.lang_token_dim {cfg.model.lang_token_dim}"
+        )
+    return tokenizer, encoder
+
+
+def batch_to_latent_student_inputs(
+    batch: dict[str, Any],
+    processor: Any,
+    *,
+    prompt_template: str,
+    device: torch.device,
+) -> dict[str, Any]:
+    texts: list[str] = []
+    images: list[list[Image.Image]] = []
+    for instruction, image_group in zip(batch["instructions"], batch["qwen_images"]):
+        qwen_instruction = format_qwen_trajectory_prompt(instruction, prompt_template)
+        content = [{"type": "image", "image": image} for image in image_group]
+        content.append({"type": "text", "text": qwen_instruction})
+        messages = [{"role": "user", "content": content}]
+        texts.append(
+            apply_qwen_chat_template(
+                processor,
+                messages,
+                enable_thinking=True,
+            )
+        )
+        images.append(image_group)
+
+    inputs = processor(
+        text=texts,
+        images=images,
+        padding=True,
+        return_tensors="pt",
+    )
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+
+
+def flatten_spatial_layer_kv(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    spatial_token_count: int,
+    expected_dim: int,
+) -> torch.Tensor:
+    if keys.ndim != 4 or values.ndim != 4:
+        raise ValueError(
+            f"Expected K/V caches [B, H, T, D], got {tuple(keys.shape)} and {tuple(values.shape)}"
+        )
+    if keys.shape != values.shape:
+        raise ValueError(f"Key/value cache shapes differ: {tuple(keys.shape)} vs {tuple(values.shape)}")
+    if keys.shape[2] < spatial_token_count:
+        raise ValueError(
+            f"Cache length {keys.shape[2]} is smaller than spatial_token_count={spatial_token_count}"
+        )
+
+    key_tokens = keys[:, :, -spatial_token_count:, :].permute(0, 2, 1, 3).contiguous()
+    value_tokens = values[:, :, -spatial_token_count:, :].permute(0, 2, 1, 3).contiguous()
+    flat = torch.cat(
+        [key_tokens.flatten(start_dim=2), value_tokens.flatten(start_dim=2)],
+        dim=-1,
+    ).to(torch.bfloat16)
+    if flat.shape[-1] != expected_dim:
+        raise ValueError(f"Expected latent KV dim {expected_dim}, got {flat.shape[-1]}")
+    return flat
+
+
+@torch.inference_mode()
+def extract_latent_student_spatial_kv(
+    batch: dict[str, Any],
+    *,
+    student: Any,
+    processor: Any,
+    device: torch.device,
+    layer_index: int,
+    expected_dim: int,
+    spatial_token_count: int,
+    prompt_template: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    inputs = batch_to_latent_student_inputs(
+        batch,
+        processor,
+        prompt_template=prompt_template,
+        device=device,
+    )
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    pixel_values = inputs.get("pixel_values")
+    image_grid_thw = inputs.get("image_grid_thw")
+    pixel_values_videos = inputs.get("pixel_values_videos")
+    video_grid_thw = inputs.get("video_grid_thw")
+
+    prefix_embeds, seed_hidden = student.encode_prefix(
+        input_ids,
+        pixel_values,
+        image_grid_thw,
+        attention_mask,
+        pixel_values_videos,
+        video_grid_thw,
+    )
+
+    batch_size = int(input_ids.shape[0])
+    current_embeds = prefix_embeds
+    current_mask = attention_mask
+    current_token = seed_hidden
+
+    for _ in range(int(student.M)):
+        current_embeds = torch.cat([current_embeds, current_token.unsqueeze(1)], dim=1)
+        current_mask = torch.cat(
+            [
+                current_mask,
+                torch.ones(batch_size, 1, device=device, dtype=current_mask.dtype),
+            ],
+            dim=1,
+        )
+        out = student._language_model(
+            inputs_embeds=current_embeds,
+            attention_mask=current_mask,
+            use_cache=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        current_token = out.last_hidden_state[:, -1, :]
+
+    end_think_embed = student._embed_tokens(
+        torch.full(
+            (batch_size, 1),
+            int(student.end_think_token_id),
+            device=device,
+            dtype=torch.long,
+        )
+    ).to(dtype=current_embeds.dtype)
+    spatial_embeds = (
+        student.spatial_tokens.unsqueeze(0)
+        .expand(batch_size, -1, -1)
+        .to(device=device, dtype=current_embeds.dtype)
+    )
+    if spatial_embeds.shape[1] != spatial_token_count:
+        raise ValueError(
+            f"Student has {spatial_embeds.shape[1]} spatial tokens, expected {spatial_token_count}"
+        )
+
+    tail_embeds = torch.cat([end_think_embed, spatial_embeds], dim=1)
+    tail_mask = torch.ones(
+        batch_size,
+        spatial_token_count + 1,
+        device=device,
+        dtype=current_mask.dtype,
+    )
+    full_embeds = torch.cat([current_embeds, tail_embeds], dim=1)
+    full_mask = torch.cat([current_mask, tail_mask], dim=1)
+
+    final_out = student._language_model(
+        inputs_embeds=full_embeds,
+        attention_mask=full_mask,
+        use_cache=True,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    keys, values = layer_key_values_from_past(
+        final_out.past_key_values,
+        layer_index=layer_index,
+    )
+    spatial_kv = flatten_spatial_layer_kv(
+        keys,
+        values,
+        spatial_token_count=spatial_token_count,
+        expected_dim=expected_dim,
+    )
+    spatial_hidden = final_out.last_hidden_state[:, -spatial_token_count:, :]
+    waypoints = student.spatial_mlp(spatial_hidden).to(torch.float32)
+    return spatial_kv, waypoints
+
+
+def unique_instruction_indices(instructions: list[str]) -> tuple[list[str], torch.Tensor]:
+    index_by_instruction: dict[str, int] = {}
+    unique: list[str] = []
+    sample_indices: list[int] = []
+    for instruction in instructions:
+        key = str(instruction)
+        if key not in index_by_instruction:
+            index_by_instruction[key] = len(unique)
+            unique.append(key)
+        sample_indices.append(index_by_instruction[key])
+    return unique, torch.as_tensor(sample_indices, dtype=torch.long)
+
+
+def build_shard_image_pool(
+    batch: dict[str, Any],
+    *,
+    image_history_size: int,
+    image_jpeg_quality: int,
+) -> tuple[list[bytes], torch.Tensor]:
+    key_to_index: dict[tuple[str, ...], int] = {}
+    image_pool: list[bytes] = []
+    sample_image_indices: list[list[int]] = []
+    blank_payload = image_to_jpeg_bytes(Image.new("RGB", (384, 384), color=(0, 0, 0)), quality=image_jpeg_quality)
+
+    for sample_index, (metadata, sample_slots) in enumerate(
+        zip(batch["metadata"], batch["siglip_image_slots"])
+    ):
+        slot_mask = batch["siglip_slot_mask"][sample_index]
+        dataset_id = str(metadata["dataset_id"])
+        episode_id = str(metadata["episode_id"])
+        try:
+            step_idx = int(metadata["step_idx"])
+        except (TypeError, ValueError):
+            step_idx = sample_index
+
+        slot_indices: list[int] = []
+        for slot_index, image in enumerate(sample_slots):
+            valid = bool(slot_mask[slot_index])
+            if valid:
+                frame_pos = slot_index // len(IMAGE_KEYS)
+                image_key = IMAGE_KEYS[slot_index % len(IMAGE_KEYS)]
+                relative_offset = frame_pos - (image_history_size - 1)
+                logical_step_idx = max(0, step_idx + relative_offset)
+                pool_key = (
+                    dataset_id,
+                    episode_id,
+                    str(logical_step_idx),
+                    image_key,
+                )
+            else:
+                pool_key = ("blank",)
+
+            image_index = key_to_index.get(pool_key)
+            if image_index is None:
+                image_index = len(image_pool)
+                key_to_index[pool_key] = image_index
+                image_pool.append(
+                    image_to_jpeg_bytes(image, quality=image_jpeg_quality)
+                    if valid
+                    else blank_payload
+                )
+            slot_indices.append(image_index)
+        sample_image_indices.append(slot_indices)
+
+    return image_pool, torch.as_tensor(sample_image_indices, dtype=torch.long)
+
+
+def compact_lang_pool(
+    lang_tokens: torch.Tensor,
+    lang_mask: torch.Tensor,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    tokens_list: list[torch.Tensor] = []
+    mask_list: list[torch.Tensor] = []
+    for index in range(lang_tokens.shape[0]):
+        compact = compact_tokens(lang_tokens[index], lang_mask[index])
+        tokens_list.append(compact.cpu())
+        mask_list.append(torch.ones(compact.shape[0], dtype=torch.bool))
+    return tokens_list, mask_list
+
+
+def save_sample_shard(
+    *,
+    split_dir: Path,
+    shard_index: int,
+    sample_start_index: int,
+    batch: dict[str, Any],
+    latent_kv: torch.Tensor,
+    waypoints: torch.Tensor,
+    lang_tokens: torch.Tensor | None,
+    lang_mask: torch.Tensor | None,
+    sample_lang_index: torch.Tensor | None,
+    image_history_size: int,
+    image_jpeg_quality: int,
+    cache_image_slots: bool,
+    save_padded_features: bool,
+) -> tuple[int, str]:
+    batch_size = int(latent_kv.shape[0])
+    filename = f"shard_{shard_index:09d}.pt"
+    path = split_dir / filename
+
+    record: dict[str, Any] = {
+        "cache_layout": "sample_shard",
+        "feature_type": "latent_student_spatial_kv",
+        "num_samples": batch_size,
+        "sample_start_index": sample_start_index,
+        "sample_stop_index": sample_start_index + batch_size,
+        "qwen_kv": latent_kv.cpu(),
+        "latent_waypoints": waypoints.cpu(),
+        "state": batch["state"].cpu(),
+        "actions": batch["actions"].cpu(),
+        "action_time_mask": batch["action_time_mask"].cpu(),
+        "action_dim_mask": batch["action_dim_mask"].cpu(),
+        "ctrl_freq": batch["ctrl_freq"].cpu(),
+        "metadata": list(batch["metadata"]),
+        "instructions": [str(instruction) for instruction in batch["instructions"]],
+    }
+
+    if lang_tokens is not None and lang_mask is not None and sample_lang_index is not None:
+        if save_padded_features:
+            record["lang_tokens"] = lang_tokens.cpu()
+            record["lang_mask"] = lang_mask.cpu()
+        else:
+            token_list, mask_list = compact_lang_pool(lang_tokens, lang_mask)
+            record["lang_tokens"] = token_list
+            record["lang_mask"] = mask_list
+        record["sample_lang_index"] = sample_lang_index.cpu()
+
+    if cache_image_slots:
+        image_pool, sample_image_indices = build_shard_image_pool(
+            batch,
+            image_history_size=image_history_size,
+            image_jpeg_quality=image_jpeg_quality,
+        )
+        record["image_jpegs"] = image_pool
+        record["sample_image_indices"] = sample_image_indices.cpu()
+        record["sample_image_mask"] = batch["siglip_slot_mask"].cpu()
+        record["image_slot_count"] = int(batch["siglip_slot_mask"].shape[1])
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(record, tmp_path)
+    os.replace(tmp_path, path)
+
+    first_metadata = batch["metadata"][0]
+    last_metadata = batch["metadata"][-1]
+    manifest_line = (
+        json.dumps(
+            {
+                "path": filename,
+                "cache_layout": "sample_shard",
+                "feature_type": "latent_student_spatial_kv",
+                "num_samples": batch_size,
+                "sample_start_index": sample_start_index,
+                "sample_stop_index": sample_start_index + batch_size,
+                "first_dataset_id": first_metadata["dataset_id"],
+                "first_episode_id": first_metadata["episode_id"],
+                "first_step_idx": first_metadata["step_idx"],
+                "last_dataset_id": last_metadata["dataset_id"],
+                "last_episode_id": last_metadata["episode_id"],
+                "last_step_idx": last_metadata["step_idx"],
+                "qwen_token_count": int(latent_kv.shape[1]),
+                "qwen_kv_dim": int(latent_kv.shape[2]),
+                "has_lang_tokens": lang_tokens is not None,
+                "has_image_slots": cache_image_slots,
+            }
+        )
+        + "\n"
+    )
+    return batch_size, manifest_line
+
+
+def precompute_split(
+    *,
+    split_name: str,
+    dataset: Any,
+    output_dir: Path,
+    cfg: Any,
+    args: argparse.Namespace,
+    student: Any,
+    processor: Any,
+    t5_tokenizer: Any | None,
+    t5_encoder: Any | None,
+    device: torch.device,
+) -> None:
+    split_dir = output_dir / split_name
+    manifest_path = prepare_split_output(split_dir, overwrite=args.overwrite)
+    tmp_manifest_path = split_dir / "manifest.jsonl.tmp"
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        collate_fn=lambda samples: standardized_collate_fn(
+            samples,
+            max_images_per_sample=args.max_images_per_sample,
+            image_history_size=args.image_history_size,
+            image_jpeg_quality=args.image_jpeg_quality,
+            skip_no_image=not args.keep_no_image,
+            encode_image_slots=False,
+        ),
+    )
+
+    sample_count = 0
+    skipped_no_image = 0
+    shard_count = 0
+    start_time = time.perf_counter()
+    with tmp_manifest_path.open("w", encoding="utf-8") as manifest:
+        progress = tqdm(dataloader, desc=f"latent-kv {split_name}", unit="shard")
+        for batch_index, batch in enumerate(progress):
+            if args.max_batches_per_split is not None and batch_index >= args.max_batches_per_split:
+                break
+            if batch is None:
+                continue
+            if args.max_samples_per_split is not None and sample_count >= args.max_samples_per_split:
+                break
+            if args.max_samples_per_split is not None:
+                keep = args.max_samples_per_split - sample_count
+                if keep <= 0:
+                    break
+                if keep < len(batch["metadata"]):
+                    for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
+                        batch[key] = batch[key][:keep]
+                    batch["metadata"] = batch["metadata"][:keep]
+                    batch["instructions"] = batch["instructions"][:keep]
+                    batch["qwen_images"] = batch["qwen_images"][:keep]
+                    batch["siglip_image_slots"] = batch["siglip_image_slots"][:keep]
+                    batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]
+                    batch["kept_samples"] = batch["kept_samples"][:keep]
+
+            skipped_no_image += int(batch.get("skipped_no_image", 0))
+            kv_start = time.perf_counter()
+            latent_kv, waypoints = extract_latent_student_spatial_kv(
+                batch,
+                student=student,
+                processor=processor,
+                device=device,
+                layer_index=args.layer_index,
+                expected_dim=cfg.model.qwen_kv_dim,
+                spatial_token_count=args.spatial_token_count,
+                prompt_template=args.prompt_template,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            kv_seconds = time.perf_counter() - kv_start
+
+            lang_tokens = None
+            lang_mask = None
+            sample_lang_index = None
+            t5_seconds = 0.0
+            if args.include_t5:
+                unique_instructions, sample_lang_index = unique_instruction_indices(batch["instructions"])
+                t5_batch = {"instructions": unique_instructions}
+                t5_start = time.perf_counter()
+                lang_tokens, lang_mask = precompute_t5_features(
+                    t5_batch,
+                    t5_tokenizer,
+                    t5_encoder,
+                    max_lang_tokens=cfg.model.max_lang_tokens,
+                    expected_dim=cfg.model.lang_token_dim,
+                    device=device,
+                )
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t5_seconds = time.perf_counter() - t5_start
+
+            save_start = time.perf_counter()
+            saved, manifest_line = save_sample_shard(
+                split_dir=split_dir,
+                shard_index=shard_count,
+                sample_start_index=sample_count,
+                batch=batch,
+                latent_kv=latent_kv,
+                waypoints=waypoints,
+                lang_tokens=lang_tokens,
+                lang_mask=lang_mask,
+                sample_lang_index=sample_lang_index,
+                image_history_size=args.image_history_size,
+                image_jpeg_quality=args.image_jpeg_quality,
+                cache_image_slots=args.cache_image_slots,
+                save_padded_features=args.save_padded_features,
+            )
+            save_seconds = time.perf_counter() - save_start
+            manifest.write(manifest_line)
+            sample_count += saved
+            shard_count += 1
+            progress.set_postfix(
+                samples=sample_count,
+                kv=f"{kv_seconds:.2f}s",
+                t5=f"{t5_seconds:.2f}s",
+                save=f"{save_seconds:.2f}s",
+            )
+
+            if args.empty_cache_every > 0 and shard_count % args.empty_cache_every == 0:
+                torch.cuda.empty_cache()
+
+    shutil.move(str(tmp_manifest_path), str(manifest_path))
+    elapsed = max(time.perf_counter() - start_time, 1e-9)
+    print(
+        f"[{split_name}] wrote {sample_count} samples in {shard_count} shards "
+        f"to {split_dir} ({sample_count / elapsed:.1f} samples/s)"
+    )
+    if skipped_no_image:
+        print(f"[{split_name}] skipped {skipped_no_image} samples with no available images")
+
+
+def precompute_t5_features(*args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    from precompute_all_features import extract_t5_features
+
+    return extract_t5_features(*args, **kwargs)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Precompute b2 LatentStudent spatial-token KV caches as batched shards."
+        )
+    )
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--root", type=Path, default=REPO_ROOT / "dataset" / "mock_dataset")
+    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "cache_latent_student")
+    parser.add_argument("--split", action="append", choices=SPLIT_NAMES)
+    parser.add_argument(
+        "--dataset",
+        action="append",
+        choices=["bc_z", "bridge", "droid", "fractal", "kuka"],
+    )
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--stage", type=int, choices=[1, 2, 3], default=None)
+    parser.add_argument("--stage-count", type=int, default=3)
+    parser.add_argument("--droid-stage-count", type=int, default=2)
+    parser.add_argument("--no-stage-subdir", action="store_true")
+    parser.add_argument("--max-episodes", type=int, default=None)
+    parser.add_argument("--max-samples-per-split", type=int, default=None)
+    parser.add_argument("--max-batches-per-split", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--no-normalize-actions", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--empty-cache-every", type=int, default=25)
+
+    parser.add_argument("--student-model-id", default="shreethar/LatentStudent-ckpt-240")
+    parser.add_argument("--processor-id", default=None)
+    parser.add_argument("--latent-student-code-dir", type=Path, default=None)
+    parser.add_argument("--latent-count", type=int, default=6)
+    parser.add_argument("--spatial-token-count", type=int, default=5)
+    parser.add_argument("--layer-index", type=int, default=7)
+    parser.add_argument("--prompt-template", default=QWEN_TRAJECTORY_PROMPT_TEMPLATE)
+    parser.add_argument("--device-map", default="auto")
+
+    parser.add_argument("--include-t5", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--t5-model-id",
+        default="/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v1_1-xxl",
+    )
+    parser.add_argument("--t5-fallback-model-id", default="google/t5-v1_1-xxl")
+    parser.add_argument("--save-padded-features", action="store_true")
+
+    parser.add_argument("--image-history-size", type=int, default=2)
+    parser.add_argument("--max-images-per-sample", type=int, default=6)
+    parser.add_argument("--image-jpeg-quality", type=int, default=85)
+    parser.add_argument("--keep-no-image", action="store_true")
+    parser.add_argument("--cache-image-slots", action=argparse.BooleanOptionalAction, default=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_config(args.config)
+    seed = cfg.seed if args.seed is None else args.seed
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device_map == "cuda" and device.type != "cuda":
+        args.device_map = "cpu"
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.spatial_token_count <= 0:
+        raise ValueError("--spatial-token-count must be positive")
+    if "{task}" not in args.prompt_template:
+        raise ValueError("--prompt-template must contain {task}")
+
+    print(f"Using latent-student extraction device: {device}")
+    print(f"Using transformers device_map for T5: {args.device_map}")
+
+    configs = build_lazy_configs(
+        root=args.root.expanduser().resolve(),
+        dataset_ids=args.dataset,
+        max_episodes=args.max_episodes,
+    )
+    splits = build_combined_standardized_splits(
+        configs=configs,
+        seed=seed,
+        stage=args.stage,
+        stage_count=args.stage_count,
+        droid_stage_count=args.droid_stage_count,
+        horizon=cfg.model.pred_horizon,
+        normalize_actions=not args.no_normalize_actions,
+    )
+
+    student, processor = load_student_and_processor(args, device)
+    t5_tokenizer = None
+    t5_encoder = None
+    if args.include_t5:
+        print("Loading T5 encoder...")
+        t5_tokenizer, t5_encoder = load_t5(args, cfg)
+
+    output_dir = args.output_dir
+    if args.stage is not None and not args.no_stage_subdir:
+        output_dir = output_dir / f"stage_{args.stage}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    split_names = args.split or list(SPLIT_NAMES)
+    metadata = {
+        "feature_type": "latent_student_spatial_kv",
+        "config": args.config,
+        "root": str(args.root),
+        "splits": split_names,
+        "datasets": [config.dataset_id for config in configs],
+        "seed": seed,
+        "stage": args.stage,
+        "normalize_actions": not args.no_normalize_actions,
+        "student_model_id": args.student_model_id,
+        "processor_id": args.processor_id or args.student_model_id,
+        "latent_count": args.latent_count,
+        "spatial_token_count": args.spatial_token_count,
+        "layer_index": args.layer_index,
+        "qwen_kv_dim": cfg.model.qwen_kv_dim,
+        "include_t5": args.include_t5,
+        "cache_image_slots": args.cache_image_slots,
+        "image_history_size": args.image_history_size,
+        "max_images_per_sample": args.max_images_per_sample,
+        "image_jpeg_quality": args.image_jpeg_quality,
+        "cache_layout": "sample_shard",
+        "batch_size": args.batch_size,
+    }
+    (output_dir / "precompute_metadata.json").write_text(
+        json.dumps(metadata, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    for split_name in split_names:
+        precompute_split(
+            split_name=split_name,
+            dataset=splits[split_name],
+            output_dir=output_dir,
+            cfg=cfg,
+            args=args,
+            student=student,
+            processor=processor,
+            t5_tokenizer=t5_tokenizer,
+            t5_encoder=t5_encoder,
+            device=device,
+        )
+
+    print("Latent-student KV precomputation finished successfully.")
+
+
+if __name__ == "__main__":
+    main()
