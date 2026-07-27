@@ -1,0 +1,80 @@
+{
+  "repo_id": "shreethar/FYP-Stage-3-part-1",
+  "local_dir": "/home/ubuntu/ThinkFlow-RDT-1B/dataset/hf_parts/part_1",
+  "config": "configs/b0_rdt1b_lora.yaml",
+  "splits": [
+    "train",
+    "validation",
+    "test"
+  ],
+  "datasets": [
+    "bc_z",
+    "bridge",
+    "droid",
+    "fractal",
+    "kuka"
+  ],
+  "count_policy": {
+    "max_samples_per_episode": 64,
+    "filter_empty_language": true,
+    "image_history_size": 2,
+    "max_images_per_sample": 6,
+    "image_tokens": 4374,
+    "pred_horizon": 64
+  },
+  "total_steps": null,
+  "probe": {
+    "probe_episodes": 100,
+    "probe_steps": 5850,
+    "probe_dataset_step_counts": {
+      "bc_z": 5850
+    },
+    "image_slot_count_histogram": {
+      "6": 5850
+    },
+    "valid_image_count_histogram": {
+      "1": 100,
+      "2": 5750
+    },
+    "per_step": {
+      "record_pt": {
+        "mean_bytes": 11260358.155555556,
+        "mean_mib": 10.738714366488987,
+        "max_bytes": 11260681,
+        "max_mib": 10.739022254943848
+      },
+      "qwen_kv_raw": {
+        "mean_bytes": 4096.0,
+        "mean_mib": 0.00390625,
+        "max_bytes": 4096,
+        "max_mib": 0.00390625
+      },
+      "t5_raw": {
+        "mean_bytes": 1048704.0,
+        "mean_mib": 1.0001220703125,
+        "max_bytes": 1048704,
+        "max_mib": 1.0001220703125
+      },
+      "siglip_raw": {
+        "mean_bytes": 10082070.0,
+        "mean_mib": 9.615011215209961,
+        "max_bytes": 10082070,
+        "max_mib": 9.615011215209961
+      },
+      "state_action_raw": {
+        "mean_bytes": 1912.0,
+        "mean_mib": 0.00182342529296875,
+        "max_bytes": 1912,
+        "max_mib": 0.00182342529296875
+      }
+    },
+    "per_episode": {
+      "mean_steps": 58.5,
+      "max_steps": 64,
+      "mean_bytes": 658730952.1,
+      "mean_mib": 628.2147904396057,
+      "max_bytes": 720683584,
+      "max_mib": 687.2974243164062
+    }
+  }
+}
