@@ -71,17 +71,31 @@ def tokenizer_end_think_id(tokenizer: Any) -> int:
     return int(token_id)
 
 
-def load_local_spatial_parameters_if_present(student: Any, model_id: str) -> None:
-    model_path = Path(model_id).expanduser()
-    spatial_path = model_path / "spatial_parameters.pt"
+def load_spatial_parameters(student: Any, spatial_path: str | Path) -> None:
+    spatial_path = Path(spatial_path).expanduser()
     if not spatial_path.exists():
-        return
+        raise FileNotFoundError(spatial_path)
     state = torch.load(spatial_path, map_location="cpu", weights_only=False)
     if "spatial_tokens" in state:
         student.spatial_tokens.data.copy_(state["spatial_tokens"])
+    else:
+        raise KeyError(f"{spatial_path} is missing spatial_tokens")
     if "spatial_mlp" in state:
         student.spatial_mlp.load_state_dict(state["spatial_mlp"])
-    print(f"Loaded local spatial parameters from {spatial_path}")
+    else:
+        raise KeyError(f"{spatial_path} is missing spatial_mlp")
+    print(f"Loaded spatial parameters from {spatial_path}")
+
+
+def load_local_spatial_parameters_if_present(student: Any, model_id: str) -> None:
+    model_path = Path(model_id).expanduser()
+    if not model_path.exists():
+        return
+    for filename in ("spatial_parameters.pt", "training_state.pt"):
+        spatial_path = model_path / filename
+        if spatial_path.exists():
+            load_spatial_parameters(student, spatial_path)
+            return
 
 
 def load_student_and_processor(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any]:
@@ -98,7 +112,17 @@ def load_student_and_processor(args: argparse.Namespace, device: torch.device) -
         M=args.latent_count,
         K=args.spatial_token_count,
     )
-    load_local_spatial_parameters_if_present(student, args.student_model_id)
+    if args.spatial_parameters_path is not None:
+        load_spatial_parameters(student, args.spatial_parameters_path)
+    else:
+        load_local_spatial_parameters_if_present(student, args.student_model_id)
+    spatial_shape = tuple(student.spatial_tokens.shape)
+    if spatial_shape[0] != args.spatial_token_count:
+        raise ValueError(
+            f"Loaded student spatial token count {spatial_shape[0]} does not match "
+            f"--spatial-token-count {args.spatial_token_count}"
+        )
+    print(f"Using latent student spatial_tokens shape={spatial_shape}")
     student.eval()
     student.requires_grad_(False)
     student.to(device)
@@ -665,6 +689,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student-model-id", default="shreethar/LatentStudent-ckpt-240")
     parser.add_argument("--processor-id", default=None)
     parser.add_argument("--latent-student-code-dir", type=Path, default=None)
+    parser.add_argument(
+        "--spatial-parameters-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional explicit spatial_parameters.pt or training_state.pt. "
+            "Use this for local checkpoints whose spatial tokens are not bundled "
+            "inside LatentStudent.from_pretrained()."
+        ),
+    )
     parser.add_argument("--latent-count", type=int, default=6)
     parser.add_argument("--spatial-token-count", type=int, default=5)
     parser.add_argument("--layer-index", type=int, default=7)
@@ -751,6 +785,9 @@ def main() -> None:
         "gripper_change_scope": args.gripper_change_scope,
         "student_model_id": args.student_model_id,
         "processor_id": args.processor_id or args.student_model_id,
+        "spatial_parameters_path": (
+            str(args.spatial_parameters_path) if args.spatial_parameters_path is not None else None
+        ),
         "latent_count": args.latent_count,
         "spatial_token_count": args.spatial_token_count,
         "layer_index": args.layer_index,
