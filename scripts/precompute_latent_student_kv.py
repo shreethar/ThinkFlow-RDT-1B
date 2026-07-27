@@ -37,6 +37,11 @@ from precompute_all_features import (  # noqa: E402
     standardized_collate_fn,
 )
 from thinkflow_rdt.adapters.combined_lazy import build_combined_standardized_splits  # noqa: E402
+from thinkflow_rdt.adapters.sample_filtering import (  # noqa: E402
+    DEFAULT_GRIPPER_WINDOW_AFTER,
+    DEFAULT_GRIPPER_WINDOW_BEFORE,
+    DEFAULT_MAX_SAMPLES_PER_EPISODE,
+)
 from thinkflow_rdt.config import load_config  # noqa: E402
 
 
@@ -622,6 +627,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--max-samples-per-split", type=int, default=None)
     parser.add_argument("--max-batches-per-split", type=int, default=None)
+    parser.add_argument(
+        "--max-samples-per-episode",
+        type=int,
+        default=DEFAULT_MAX_SAMPLES_PER_EPISODE,
+    )
+    parser.add_argument(
+        "--gripper-window-before",
+        type=int,
+        default=DEFAULT_GRIPPER_WINDOW_BEFORE,
+    )
+    parser.add_argument(
+        "--gripper-window-after",
+        type=int,
+        default=DEFAULT_GRIPPER_WINDOW_AFTER,
+        help=(
+            "Number of selected steps from the gripper-change step onward. "
+            "Use 11 to keep the change step plus 10 after it."
+        ),
+    )
+    parser.add_argument(
+        "--gripper-change-scope",
+        choices=["all", "first"],
+        default="all",
+        help=(
+            "Which gripper transitions receive priority sampling windows. "
+            "Use 'first' for one wider approach/closure-focused window plus uniform fill."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--pin-memory", action="store_true")
@@ -684,6 +717,10 @@ def main() -> None:
         droid_stage_count=args.droid_stage_count,
         horizon=cfg.model.pred_horizon,
         normalize_actions=not args.no_normalize_actions,
+        max_samples_per_episode=args.max_samples_per_episode,
+        gripper_window_before=args.gripper_window_before,
+        gripper_window_after=args.gripper_window_after,
+        gripper_change_scope=args.gripper_change_scope,
     )
 
     student, processor = load_student_and_processor(args, device)
@@ -708,6 +745,10 @@ def main() -> None:
         "seed": seed,
         "stage": args.stage,
         "normalize_actions": not args.no_normalize_actions,
+        "max_samples_per_episode": args.max_samples_per_episode,
+        "gripper_window_before": args.gripper_window_before,
+        "gripper_window_after": args.gripper_window_after,
+        "gripper_change_scope": args.gripper_change_scope,
         "student_model_id": args.student_model_id,
         "processor_id": args.processor_id or args.student_model_id,
         "latent_count": args.latent_count,
