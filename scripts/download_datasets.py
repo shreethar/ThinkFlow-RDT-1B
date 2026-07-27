@@ -7,24 +7,24 @@ REPO_ROOT = Path(__file__).parent.parent
 
 # Map of dataset name to (info_file, episode_target, gs_prefix)
 TARGETS = {
-    # "bridge": (
-    #     REPO_ROOT / "dataset/mock_dataset/bridge_dataset/data/dataset_info.json",
-    #     25000,
-    #     "gs://gresearch/robotics/bridge_data_v2/0.0.1/bridge_data_v2-train.tfrecord-{shard:05d}-of-01024"
-    # ),
-    # "fractal": (
-    #     REPO_ROOT / "dataset/mock_dataset/fractal_dataset/data/dataset_info.json",
-    #     25000,
-    #     "gs://gresearch/robotics/fractal20220817_data/0.1.0/fractal20220817_data-train.tfrecord-{shard:05d}-of-01024"
-    # ),
-    # "kuka": (
-    #     REPO_ROOT / "dataset/mock_dataset/kuka_dataset/data/dataset_info.json",
-    #     25000,
-    #     "gs://gresearch/robotics/kuka/0.1.0/kuka-train.tfrecord-{shard:05d}-of-01024"
-    # ),
+    "bridge": (
+        REPO_ROOT / "dataset/mock_dataset/bridge_dataset/data/dataset_info.json",
+        35000,
+        "gs://gresearch/robotics/bridge_data_v2/0.0.1/bridge_data_v2-train.tfrecord-{shard:05d}-of-01024"
+    ),
+    "fractal": (
+        REPO_ROOT / "dataset/mock_dataset/fractal_dataset/data/dataset_info.json",
+        25000,
+        "gs://gresearch/robotics/fractal20220817_data/0.1.0/fractal20220817_data-train.tfrecord-{shard:05d}-of-01024"
+    ),
+    "kuka": (
+        REPO_ROOT / "dataset/mock_dataset/kuka_dataset/data/dataset_info.json",
+        50000,
+        "gs://gresearch/robotics/kuka/0.1.0/kuka-train.tfrecord-{shard:05d}-of-01024"
+    ),
     "droid": (
         REPO_ROOT / "dataset/mock_dataset/droid_dataset/data/dataset_info.json",
-        15000,
+        30000,
         "gs://gresearch/robotics/droid/1.0.1/droid_101-train.tfrecord-{shard:05d}-of-02048"
     ),
     "bc_z": (
