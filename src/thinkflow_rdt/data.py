@@ -4,10 +4,10 @@ import json
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection, Iterator
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 REQUIRED_KEYS = {
@@ -43,8 +43,12 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
 
     Batched shard manifests are also supported:
       {"path": "shard_000000000.pt", "cache_layout": "sample_shard", "num_samples": 64}
-    Those are expanded the same way, while still allowing arbitrary training
-    batch sizes.
+    Shards are likewise expanded into sample-level items while retaining file-local
+    ranges for efficient sampling.
+
+    ``excluded_dataset_ids`` filters entries using manifest metadata, without
+    opening their cache files. Plain-string entries have no dataset metadata and
+    therefore cannot be filtered this way.
     """
 
     def __init__(
@@ -52,19 +56,34 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         manifest_path: str | Path,
         *,
         required_keys: set[str] | frozenset[str] | None = None,
+        excluded_dataset_ids: Collection[str] | None = None,
     ):
         self.manifest_path = Path(manifest_path).expanduser().resolve()
         self.required_keys = set(REQUIRED_KEYS if required_keys is None else required_keys)
+        if isinstance(excluded_dataset_ids, str):
+            excluded_dataset_ids = (excluded_dataset_ids,)
+        self.excluded_dataset_ids = frozenset(
+            str(dataset_id) for dataset_id in (excluded_dataset_ids or ())
+        )
         if not self.manifest_path.exists():
             raise FileNotFoundError(self.manifest_path)
         self.base_dir = self.manifest_path.parent
         self.entries: list[dict[str, Any]] = []
+        manifest_entry_ranges: list[range] = []
+        manifest_entry_dataset_ids: list[str | None] = []
+        episode_pack_ranges: list[range] = []
         with self.manifest_path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
                 line = line.strip()
                 if not line:
                     continue
                 item = json.loads(line)
+                if (
+                    isinstance(item, dict)
+                    and item.get("dataset_id") is not None
+                    and str(item["dataset_id"]) in self.excluded_dataset_ids
+                ):
+                    continue
                 path_value = item if isinstance(item, str) else item.get("path")
                 if not path_value:
                     raise ValueError(
@@ -73,21 +92,25 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
                 path = Path(path_value)
                 if not path.is_absolute():
                     path = (self.base_dir / path).resolve()
-                if isinstance(item, dict) and item.get("cache_layout") in {"episode_pack", "sample_shard"}:
+                range_start = len(self.entries)
+                cache_layout = item.get("cache_layout") if isinstance(item, dict) else None
+                if cache_layout in {"episode_pack", "sample_shard"}:
                     num_samples = int(item.get("num_samples", 0))
                     if num_samples <= 0:
                         raise ValueError(
-                            f"{item.get('cache_layout')} manifest line {line_number} has invalid "
+                            f"{cache_layout} manifest line {line_number} has invalid "
                             f"num_samples={num_samples}: {self.manifest_path}"
                         )
                     for sample_index in range(num_samples):
                         self.entries.append(
                             {
                                 "path": path,
-                                "cache_layout": item.get("cache_layout"),
+                                "cache_layout": cache_layout,
                                 "sample_index": sample_index,
                             }
                         )
+                    if cache_layout == "episode_pack":
+                        episode_pack_ranges.append(range(range_start, len(self.entries)))
                 else:
                     self.entries.append(
                         {
@@ -96,8 +119,24 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
                             "sample_index": None,
                         }
                     )
+                manifest_entry_ranges.append(range(range_start, len(self.entries)))
+                manifest_entry_dataset_ids.append(
+                    str(item["dataset_id"])
+                    if isinstance(item, dict) and item.get("dataset_id") is not None
+                    else None
+                )
         if not self.entries:
+            if self.excluded_dataset_ids:
+                raise ValueError(
+                    f"Manifest has no entries after filtering: {self.manifest_path}"
+                )
             raise ValueError(f"Manifest is empty: {self.manifest_path}")
+        # Each manifest line expands into exactly one contiguous index range. These
+        # immutable ranges let samplers preserve episode-pack I/O locality without
+        # exposing or depending on the internal entry dictionaries.
+        self.contiguous_ranges = tuple(manifest_entry_ranges)
+        self.contiguous_range_dataset_ids = tuple(manifest_entry_dataset_ids)
+        self.episode_pack_ranges = tuple(episode_pack_ranges)
         self.paths = [entry["path"] for entry in self.entries]
         self._pack_cache: OrderedDict[Path, dict[str, Any]] = OrderedDict()
         self._pack_cache_size = 8
@@ -123,7 +162,7 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
                 path=path,
             )
         else:
-            sample = torch.load(path, map_location="cpu", weights_only=False)
+            sample = torch.load(path, map_location="cpu", weights_only=True)
         missing = self.required_keys.difference(sample)
         if missing:
             raise KeyError(f"{path} is missing keys: {sorted(missing)}")
@@ -135,7 +174,7 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         if cached is not None:
             self._pack_cache.move_to_end(path)
             return cached
-        pack = torch.load(path, map_location="cpu", weights_only=False)
+        pack = torch.load(path, map_location="cpu", weights_only=True)
         if pack.get("cache_layout") != "episode_pack":
             raise ValueError(f"{path} is not an episode_pack cache file")
         self._pack_cache[path] = pack
@@ -149,7 +188,7 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         if cached is not None:
             self._pack_cache.move_to_end(path)
             return cached
-        pack = torch.load(path, map_location="cpu", weights_only=False)
+        pack = torch.load(path, map_location="cpu", weights_only=True)
         if pack.get("cache_layout") != "sample_shard":
             raise ValueError(f"{path} is not a sample_shard cache file")
         self._pack_cache[path] = pack
@@ -174,6 +213,17 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         qwen_anchor_kv = torch.as_tensor(pack["qwen_anchor_kv"])
         if anchor_index < 0 or anchor_index >= int(qwen_anchor_kv.shape[0]):
             raise IndexError(f"anchor_index {anchor_index} out of range for {path}")
+        anchor_kinds = list(pack.get("qwen_anchor_kind", []))
+        original_anchor_kind = (
+            str(anchor_kinds[anchor_index])
+            if anchor_index < len(anchor_kinds)
+            else "unknown"
+        )
+        # Older Part 3 packs always stored a second, uniformly sampled anchor
+        # even when no gripper change existed. Treat it as the first-step anchor
+        # without rewriting the large cache files.
+        if original_anchor_kind in {"uniform", "uniform_fallback"}:
+            anchor_index = 0
 
         image_pool = list(pack.get("image_jpegs", []))
         sample_image_indices = torch.as_tensor(pack["sample_image_indices"], dtype=torch.long)
@@ -213,7 +263,12 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             "qwen_cache_scope": pack.get("qwen_cache_scope", "episode_anchors"),
             "qwen_anchor_step_idx": str(pack["qwen_anchor_step_idx"][anchor_index]),
             "qwen_anchor_kind": str(pack["qwen_anchor_kind"][anchor_index]),
-            "qwen_anchor_count": int(qwen_anchor_kv.shape[0]),
+            "qwen_anchor_original_kind": original_anchor_kind,
+            "qwen_anchor_count": sum(
+                str(kind) not in {"uniform", "uniform_fallback"}
+                for kind in pack.get("qwen_anchor_kind", [])
+            )
+            or int(qwen_anchor_kv.shape[0]),
         }
         return sample
 
@@ -252,9 +307,9 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             image_slot_jpegs = list(image_slot_jpegs[sample_index])
         elif "image_jpegs" in pack and "sample_image_indices" in pack:
             image_pool = list(pack["image_jpegs"])
-            image_indices = torch.as_tensor(pack["sample_image_indices"], dtype=torch.long)[
-                sample_index
-            ].flatten().tolist()
+            image_indices = torch.as_tensor(
+                pack["sample_image_indices"], dtype=torch.long
+            )[sample_index].flatten().tolist()
             image_slot_jpegs = []
             for image_index in image_indices:
                 if image_index < 0 or image_index >= len(image_pool):
@@ -298,6 +353,99 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         return sample
 
 
+class EpisodePackSampler(Sampler[int]):
+    """
+    Shuffle manifest entries and their samples while keeping each pack contiguous.
+
+    Sample-record manifest entries are treated as singleton ranges, so the sampler
+    remains usable with legacy and mixed-layout manifests. Call ``set_epoch`` at
+    each epoch boundary to get a deterministic new order.
+    """
+
+    def __init__(
+        self,
+        data_source: CachedFeatureDataset,
+        *,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> None:
+        self.data_source = data_source
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __iter__(self) -> Iterator[int]:
+        ranges = self.data_source.contiguous_ranges
+        if not self.shuffle:
+            for index_range in ranges:
+                yield from index_range
+            return
+
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        range_order = torch.randperm(len(ranges), generator=generator).tolist()
+        for range_index in range_order:
+            index_range = ranges[range_index]
+            offsets = torch.randperm(len(index_range), generator=generator).tolist()
+            for offset in offsets:
+                yield index_range.start + offset
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+
+class FixedStratifiedSampler(Sampler[int]):
+    """Fixed, dataset-balanced validation order with episode-pack locality."""
+
+    def __init__(self, data_source: CachedFeatureDataset, *, seed: int = 0) -> None:
+        self.data_source = data_source
+        self.seed = int(seed)
+
+    def __iter__(self) -> Iterator[int]:
+        grouped_ranges: dict[str, list[range]] = {}
+        for index_range, dataset_id in zip(
+            self.data_source.contiguous_ranges,
+            self.data_source.contiguous_range_dataset_ids,
+        ):
+            grouped_ranges.setdefault(dataset_id or "<unknown>", []).append(
+                index_range
+            )
+
+        generator = torch.Generator()
+        generator.manual_seed(self.seed)
+        streams: list[list[int]] = []
+        for dataset_id in sorted(grouped_ranges):
+            ranges = grouped_ranges[dataset_id]
+            range_order = torch.randperm(
+                len(ranges), generator=generator
+            ).tolist()
+            stream: list[int] = []
+            for range_index in range_order:
+                index_range = ranges[range_index]
+                offsets = torch.randperm(
+                    len(index_range), generator=generator
+                ).tolist()
+                stream.extend(index_range.start + offset for offset in offsets)
+            streams.append(stream)
+
+        positions = [0] * len(streams)
+        remaining = sum(len(stream) for stream in streams)
+        while remaining:
+            for stream_index, stream in enumerate(streams):
+                position = positions[stream_index]
+                if position >= len(stream):
+                    continue
+                yield stream[position]
+                positions[stream_index] += 1
+                remaining -= 1
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
 @dataclass
 class RDTBatchCollator:
     max_lang_tokens: int
@@ -308,6 +456,7 @@ class RDTBatchCollator:
     action_dim: int
     lang_token_dim: int | None = None
     img_token_dim: int | None = None
+    qwen_kv_dim: int | None = None
 
     def __post_init__(self) -> None:
         if self.lang_token_dim is None:
@@ -358,6 +507,25 @@ class RDTBatchCollator:
             mask[: supplied.shape[0]] &= supplied
         return output, mask
 
+    def _prepare_qwen_kv(self, value: Any) -> torch.Tensor:
+        qwen_kv = torch.as_tensor(value)
+        if qwen_kv.ndim == 1:
+            qwen_kv = qwen_kv.unsqueeze(0)
+        if qwen_kv.ndim != 2:
+            raise ValueError(
+                f"Expected qwen_kv [tokens, dim] or [dim], got {tuple(qwen_kv.shape)}"
+            )
+        if qwen_kv.shape[0] != 1:
+            raise ValueError(
+                f"Expected exactly one qwen_kv token, got {qwen_kv.shape[0]}"
+            )
+        if self.qwen_kv_dim is not None and qwen_kv.shape[1] != self.qwen_kv_dim:
+            raise ValueError(
+                f"Expected qwen_kv width {self.qwen_kv_dim}, "
+                f"got {qwen_kv.shape[1]}"
+            )
+        return qwen_kv
+
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         batch: dict[str, list[torch.Tensor]] = {
             "qwen_kv": [],
@@ -380,13 +548,7 @@ class RDTBatchCollator:
                 sample["img_tokens"], self.image_tokens, self.img_token_dim
             )
 
-            qwen_kv = torch.as_tensor(sample["qwen_kv"], dtype=torch.float32)
-            if qwen_kv.ndim == 1:
-                qwen_kv = qwen_kv.unsqueeze(0)
-            if qwen_kv.ndim != 2:
-                raise ValueError(
-                    f"Expected qwen_kv [tokens, dim] or [dim], got {tuple(qwen_kv.shape)}"
-                )
+            qwen_kv = self._prepare_qwen_kv(sample["qwen_kv"])
 
             if "lang_mask" in sample:
                 supplied = torch.as_tensor(sample["lang_mask"], dtype=torch.bool)
@@ -415,9 +577,12 @@ class RDTBatchCollator:
                 raise ValueError("action_dim_mask has the wrong width")
 
             batch["qwen_kv"].append(qwen_kv)
-            batch["lang_tokens"].append(lang.to(torch.float32))
+            batch["lang_tokens"].append(lang)
             batch["lang_mask"].append(default_lang_mask)
-            batch["img_tokens"].append(image.to(torch.float32))
+            # Preserve the cached feature dtype (normally BF16). Expanding every
+            # image token to FP32 here doubles host/pinned-memory use, and the
+            # model casts it back to its compute dtype immediately anyway.
+            batch["img_tokens"].append(image)
             batch["img_mask"].append(default_img_mask)
             batch["state"].append(state)
             batch["actions"].append(actions)
@@ -438,6 +603,7 @@ class RDTOnlineSiglipBatchCollator:
     state_dim: int
     action_dim: int
     lang_token_dim: int | None = None
+    qwen_kv_dim: int | None = None
 
     def __post_init__(self) -> None:
         if self.lang_token_dim is None:
@@ -451,6 +617,7 @@ class RDTOnlineSiglipBatchCollator:
             action_dim=self.action_dim,
             lang_token_dim=self.lang_token_dim,
             img_token_dim=1,
+            qwen_kv_dim=self.qwen_kv_dim,
         )
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -476,13 +643,7 @@ class RDTOnlineSiglipBatchCollator:
                 supplied = supplied[: self.max_lang_tokens]
                 default_lang_mask[: supplied.shape[0]] &= supplied
 
-            qwen_kv = torch.as_tensor(sample["qwen_kv"], dtype=torch.float32)
-            if qwen_kv.ndim == 1:
-                qwen_kv = qwen_kv.unsqueeze(0)
-            if qwen_kv.ndim != 2:
-                raise ValueError(
-                    f"Expected qwen_kv [tokens, dim] or [dim], got {tuple(qwen_kv.shape)}"
-                )
+            qwen_kv = self._base._prepare_qwen_kv(sample["qwen_kv"])
 
             state = torch.as_tensor(sample["state"], dtype=torch.float32).flatten()
             if state.numel() != self.state_dim:
@@ -509,7 +670,7 @@ class RDTOnlineSiglipBatchCollator:
                 )
 
             tensor_batch["qwen_kv"].append(qwen_kv)
-            tensor_batch["lang_tokens"].append(lang.to(torch.float32))
+            tensor_batch["lang_tokens"].append(lang)
             tensor_batch["lang_mask"].append(default_lang_mask)
             tensor_batch["state"].append(state)
             tensor_batch["actions"].append(actions)
