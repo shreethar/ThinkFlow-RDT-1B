@@ -18,13 +18,33 @@ dataset/mock_dataset/kuka_dataset/data
 
 src/thinkflow_rdt.egg-info/requires.txt
 src/thinkflow_rdt.egg-info/PKG-INFO
+src/thinkflow_rdt.egg-info/SOURCES.txt
 
 src/thinkflow_rdt/adapters/__pycache__
 scripts/__pycache__/
 tests/__pycache__
+
+# Local training artifacts and offline experiment logs.
+outputs/
+wandb/
 
 bash.exe.stackdump
 
 skills.md
 
 .env
+
+# Wheel
+*.whl
+
+# Cached Features
+cache_features/
+cache_features_b2/
+cache_latent_student/
+
+# Model
+model
+
+# Dataset
+dataset/hf_parts
+dataset/LIBERO

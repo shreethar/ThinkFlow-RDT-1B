@@ -1,4 +1,130 @@
-# ThinkFlow-VLA: SFT-conditioned RDT-1B with LoRA
+# ThinkFlow-VLA: cached-Qwen-conditioned RDT-1B
+
+## Part 3 KV-cache training
+
+The current full-RDT path consumes the episode-pack cache directly:
+
+```text
+cached Qwen K/V [B, 1, 2048]
+        -> trainable Linear(2048, 4096)
+        -> split into native RDT K and V [B, 32, 1, 64]
+        -> append inside every RDT self-attention block
+
+current state [xyz, orientation xyz, gripper_closed]
+        -> [xyz, ortho6d rotation, gripper_open] in native 128-D RDT slots
+        -> frozen pretrained RDT state adaptor
+
+normalized delta actions [B, 64, 7]
+        -> trainable 7-D action adaptor
+        -> trainable RDT-1B with a 7-D output head
+```
+
+Language embeddings are already cached. Part 3 stores observation JPEG slots,
+so the online-SigLIP entrypoint runs the frozen RDT vision encoder but never
+runs Qwen in the training loop.
+
+The production configuration is
+[`configs/part3_rdt1b.yaml`](configs/part3_rdt1b.yaml). It uses train and
+validation manifests, horizon 64, LR `1e-4`, W&B, and enforces an effective
+global batch of 256:
+
+```text
+micro_batch_size * gradient_accumulation_steps * world_size = 256
+```
+
+The masked denoising objective is averaged per training example, so gradient
+accumulation is equivalent to a real 256-example batch even when valid future
+horizons differ. Validation uses an exact 256-example global,
+dataset-stratified subset for comparable BC-Z/Kuka/Fractal metrics across
+checkpoints, independent of worker count.
+
+Run the real cached-data smoke test first. It uses the real Qwen/T5/JPEG cache,
+a two-block miniature RDT, frozen SigLIP, offline W&B, two optimizer steps, one
+validation batch, and checkpoint round-tripping. The smoke config deliberately
+uses global batch 1 for speed; the production config strictly enforces 256:
+
+```bash
+HF_HUB_OFFLINE=1 WANDB_MODE=offline \
+accelerate launch --num_processes 1 scripts/train_b0_online_siglip.py \
+  --config configs/part3_smoke.yaml \
+  --no-pretrained
+```
+
+For full RDT-1B training, make sure the RDT checkpoint is available, authenticate
+W&B, and launch:
+
+```bash
+wandb login
+accelerate launch scripts/train_b0_online_siglip.py \
+  --config configs/part3_rdt1b.yaml
+```
+
+The plain command uses your current Accelerate configuration (this machine
+currently defaults to one process). For a multi-GPU run, create a DDP or FSDP
+configuration with `accelerate config`, then pass it explicitly:
+
+```bash
+accelerate launch --config_file /path/to/accelerate.yaml \
+  scripts/train_b0_online_siglip.py --config configs/part3_rdt1b.yaml
+```
+
+The runner derives accumulation from world size and checks it again after the
+distributed engine is prepared. If using DeepSpeed, configure
+`gradient_accumulation_steps: auto`; the currently installed DeepSpeed 0.14.2
+is incompatible with this environment's PyTorch 2.10, so DDP/FSDP is the viable
+local choice until DeepSpeed is upgraded.
+
+For a 3,000-update W&B trial using the complete pretrained RDT-1B setup:
+
+```bash
+wandb login
+.venv/bin/accelerate launch scripts/train_b0_online_siglip.py \
+  --config configs/part3_rdt1b.yaml \
+  --max-steps 3000 \
+  --log-every 1 \
+  --output-dir outputs/part3_rdt1b_3000 \
+  --wandb-run-name part3-rdt1b-3000
+```
+
+Here, a step means one optimizer update at global batch 256, not one
+microbatch. This trial therefore consumes 768,000 sampled training examples.
+With `--log-every 1`, console and W&B report `train/step_time_sec` and
+`train/samples_per_sec` for every optimizer update. Step timing includes data
+loading, frozen SigLIP inference, forward/backward, and all accumulated
+microbatches, but excludes validation and checkpoint writing.
+
+For rank-32 LoRA instead of full RDT fine-tuning, use
+`configs/part3_rdt1b_lora32.yaml`:
+
+```bash
+.venv/bin/accelerate launch scripts/train_b0_online_siglip.py \
+  --config configs/part3_rdt1b_lora32.yaml \
+  --max-steps 3000 \
+  --log-every 1 \
+  --output-dir outputs/part3_rdt1b_lora32_3000 \
+  --wandb-run-name part3-rdt1b-lora32-3000
+```
+
+This freezes the base RDT transformer weights and trains rank-32 adapters in
+self-attention, cross-attention, and FFN projections. The Qwen KV projector,
+condition/action adaptors, and 7-D final layer remain trainable; the pretrained
+RDT state adaptor remains frozen.
+
+The cache currently lives at `cache_features/part_3` in this repository (the
+external path `/home/ubuntu/cache_features/part_3` is not present on this
+machine).
+
+Important cache caveat: the existing Part 3 Bridge subset contains packs where
+non-unique source episode IDs merged distinct trajectories. The supplied configs
+therefore exclude Bridge and still provide 560,415 train and 68,212 validation
+samples from BC-Z, Kuka, and Fractal. The precompute grouping and anchor-selection
+code has been fixed for future caches; regenerate Bridge before removing
+`excluded_dataset_ids: [bridge]`. Existing cache files are not modified.
+Legacy `uniform` fallback anchors in the other cached datasets are remapped to
+the first-step anchor at load time, so a second anchor is used only when it is
+actually the first gripper change.
+
+## Legacy LoRA path
 
 This project trains the B0 action baseline:
 
