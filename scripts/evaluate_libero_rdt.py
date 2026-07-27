@@ -7,12 +7,14 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp/thinkflow-cache")
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/thinkflow-matplotlib")
 
+import imageio.v2 as imageio
 import numpy as np
 import torch
 from transformers import (
@@ -33,6 +35,7 @@ from precompute_all_features import (  # noqa: E402
     standardized_collate_fn,
 )
 from rollout_libero_rdt import (  # noqa: E402
+    frame_for_video,
     install_robosuite_mujoco_compatibility,
     load_cached_language_features,
     load_feature_metadata,
@@ -61,7 +64,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device-map", default="cuda")
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--task-id",
+        type=int,
+        action="append",
+        choices=range(10),
+        help="Evaluate only this task ID; may be repeated. Defaults to all tasks.",
+    )
+    parser.add_argument(
+        "--save-videos",
+        action="store_true",
+        help="Save one separately rendered high-resolution MP4 per episode.",
+    )
+    parser.add_argument("--video-resolution", type=int, default=512)
+    parser.add_argument("--video-fps", type=int, default=20)
     return parser.parse_args()
+
+
+def _high_resolution_render(
+    env: Any,
+    *,
+    width: int,
+    height: int,
+    camera_name: str,
+) -> np.ndarray:
+    return env.env.sim.render(
+        width=width,
+        height=height,
+        camera_name=camera_name,
+    )
+
+
+def make_recordable_env(env_args: dict[str, Any]) -> Any:
+    """Build an environment with a render method callable through venv."""
+    from libero.libero.envs import OffScreenRenderEnv
+
+    env = OffScreenRenderEnv(**env_args)
+    env.render = MethodType(_high_resolution_render, env)
+    return env
+
+
+def render_vector_parallel(env: Any, **kwargs: Any) -> list[np.ndarray]:
+    """Render all subprocess environments concurrently."""
+    for worker in env.workers:
+        worker.parent_remote.send(["render", kwargs])
+    return [worker.parent_remote.recv() for worker in env.workers]
 
 
 def existing_result_keys(path: Path) -> set[tuple[int, int]]:
@@ -104,6 +151,7 @@ def main() -> None:
         raise ValueError("--episodes-per-task must be in [1, 50]")
     if args.all_episodes:
         args.episodes_per_task = 50
+    task_ids = sorted(set(args.task_id)) if args.task_id else list(range(10))
     if args.env_batch_size <= 0:
         raise ValueError("--env-batch-size must be positive")
     if not torch.cuda.is_available():
@@ -128,7 +176,7 @@ def main() -> None:
             cache_root=args.cache_root,
             cfg=cfg,
         )
-        for task_id in range(10)
+        for task_id in task_ids
     }
 
     print("Loading Qwen and SigLIP encoders...")
@@ -156,11 +204,11 @@ def main() -> None:
     results_path = args.output_dir / "episodes.jsonl"
     summary_path = args.output_dir / "summary.json"
     completed = existing_result_keys(results_path)
-    total_requested = 10 * args.episodes_per_task
+    total_requested = len(task_ids) * args.episodes_per_task
     print(f"Evaluation target: {total_requested} episodes; resuming after {len(completed)} completed")
 
     with results_path.open("a", encoding="utf-8") as output:
-        for task_id in range(10):
+        for task_id in task_ids:
             task = benchmark.get_task(task_id)
             all_init_states = torch.load(
                 args.libero_root / "libero" / "libero" / "init_files" / task.problem_folder / task.init_states_file,
@@ -178,7 +226,17 @@ def main() -> None:
                     "camera_widths": 128,
                     "horizon": args.max_steps + 10,
                 }
-                env = SubprocVectorEnv([lambda env_args=env_args: OffScreenRenderEnv(**env_args) for _ in indices])
+                if args.save_videos:
+                    env_fns = [
+                        lambda env_args=env_args: make_recordable_env(env_args)
+                        for _ in indices
+                    ]
+                else:
+                    env_fns = [
+                        lambda env_args=env_args: OffScreenRenderEnv(**env_args)
+                        for _ in indices
+                    ]
+                env = SubprocVectorEnv(env_fns)
                 env.reset()
                 observations = list(env.set_init_state(all_init_states[indices]))
                 for _ in range(5):
@@ -191,6 +249,21 @@ def main() -> None:
                 simulator_step = 0
                 plan_index = 0
                 batch_started = time.perf_counter()
+                video_paths: list[Path | None] = [None] * len(indices)
+                writers: list[Any | None] = [None] * len(indices)
+                if args.save_videos:
+                    video_dir = args.output_dir / "videos"
+                    video_dir.mkdir(parents=True, exist_ok=True)
+                    for local_index, init_index in enumerate(indices):
+                        video_path = video_dir / f"task{task_id:02d}_init{init_index:02d}.mp4"
+                        video_paths[local_index] = video_path
+                        writers[local_index] = imageio.get_writer(
+                            video_path,
+                            format="FFMPEG",
+                            fps=args.video_fps,
+                            codec="libx264",
+                            quality=8,
+                        )
                 while simulator_step < args.max_steps and not bool(done.all()):
                     active = np.flatnonzero(~done).tolist()
                     samples = [
@@ -250,6 +323,7 @@ def main() -> None:
 
                     chunk = min(args.action_chunk, args.max_steps - simulator_step)
                     for action_offset in range(chunk):
+                        done_before_step = done.copy()
                         actions = np.zeros((len(indices), 7), dtype=np.float32)
                         for active_position, env_index in enumerate(active):
                             actions[env_index] = predicted[active_position, action_offset]
@@ -260,6 +334,21 @@ def main() -> None:
                         newly_done = (~done) & np.asarray(step_done, dtype=bool)
                         success_step[newly_done] = simulator_step
                         done |= np.asarray(step_done, dtype=bool)
+                        if args.save_videos:
+                            rendered = render_vector_parallel(
+                                env,
+                                width=args.video_resolution,
+                                height=args.video_resolution,
+                                camera_name="agentview",
+                            )
+                            for local_index, writer in enumerate(writers):
+                                if writer is None or done_before_step[local_index]:
+                                    continue
+                                label = (
+                                    f"task={task_id} init={indices[local_index]} "
+                                    f"step={simulator_step} success={int(done[local_index])}"
+                                )
+                                writer.append_data(frame_for_video(rendered[local_index], label))
                         if bool(done.all()):
                             break
                     plan_index += 1
@@ -271,6 +360,9 @@ def main() -> None:
                         )
 
                 elapsed = time.perf_counter() - batch_started
+                for writer in writers:
+                    if writer is not None:
+                        writer.close()
                 env.close()
                 for local_index, init_index in enumerate(indices):
                     row = {
@@ -282,6 +374,8 @@ def main() -> None:
                         "steps": int(success_step[local_index]),
                         "checkpoint": str(args.checkpoint.resolve()),
                     }
+                    if video_paths[local_index] is not None:
+                        row["video"] = str(video_paths[local_index].resolve())
                     output.write(json.dumps(row) + "\n")
                     output.flush()
                     completed.add((task_id, init_index))

@@ -204,6 +204,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--libero-root", type=Path, default=LIBERO_ROOT_DEFAULT)
     parser.add_argument("--task-id", type=int, default=0, choices=range(10))
     parser.add_argument("--init-state-index", type=int, default=0)
+    parser.add_argument(
+        "--demo-hdf5",
+        type=Path,
+        help="Start from the first recorded simulator state of this HDF5 demo instead of a benchmark init state.",
+    )
+    parser.add_argument("--demo-name", default="demo_0")
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--action-chunk", type=int, default=8)
     parser.add_argument("--qwen-refresh-every", type=int, default=1)
@@ -276,15 +282,24 @@ def main() -> None:
         horizon=args.max_steps + 10,
     )
     observation = env.reset()
-    init_states = torch.load(
-        args.libero_root / "libero" / "libero" / "init_files" / task.problem_folder / task.init_states_file,
-        map_location="cpu",
-        weights_only=False,
-    )
-    state_index = args.init_state_index % len(init_states)
-    observation = env.set_init_state(init_states[state_index])
-    for _ in range(5):
-        observation, _, _, _ = env.step(np.zeros(7, dtype=np.float32))
+    if args.demo_hdf5 is not None:
+        import h5py
+
+        with h5py.File(args.demo_hdf5, "r") as handle:
+            demo = handle["data"][args.demo_name]
+            recorded_state = np.asarray(demo["states"][0], dtype=np.float64)
+        state_index = -1
+        observation = env.set_init_state(recorded_state)
+    else:
+        init_states = torch.load(
+            args.libero_root / "libero" / "libero" / "init_files" / task.problem_folder / task.init_states_file,
+            map_location="cpu",
+            weights_only=False,
+        )
+        state_index = args.init_state_index % len(init_states)
+        observation = env.set_init_state(init_states[state_index])
+        for _ in range(5):
+            observation, _, _, _ = env.step(np.zeros(7, dtype=np.float32))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     writer = imageio.get_writer(
@@ -391,6 +406,9 @@ def main() -> None:
         "success": success,
         "video": str(args.output.resolve()),
     }
+    if args.demo_hdf5 is not None:
+        summary["demo_hdf5"] = str(args.demo_hdf5.resolve())
+        summary["demo_name"] = args.demo_name
     summary_path = args.output.with_suffix(".json")
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2))
