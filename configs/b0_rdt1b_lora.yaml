@@ -1,5 +1,5 @@
 seed: 42
-rdt_repo: /workspace/RoboticsDiffusionTransformer
+rdt_repo: /home/ubuntu/RoboticsDiffusionTransformer
 pretrained_model: robotics-diffusion-transformer/rdt-1b
 output_dir: outputs/b0_sft_rdt1b_lora
 
