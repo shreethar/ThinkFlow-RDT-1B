@@ -101,6 +101,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
         max_samples_per_episode: int | None = DEFAULT_MAX_SAMPLES_PER_EPISODE,
         gripper_window_before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
         gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
+        gripper_change_scope: str = "all",
     ) -> None:
         if split_name not in SPLIT_NAMES:
             raise ValueError(f"split_name must be one of {SPLIT_NAMES}, got {split_name}")
@@ -121,6 +122,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
         self.max_samples_per_episode = max_samples_per_episode
         self.gripper_window_before = gripper_window_before
         self.gripper_window_after = gripper_window_after
+        self.gripper_change_scope = gripper_change_scope
         self.adapter_kwargs = dict(config.adapter_kwargs)
         self.action_stats = self._resolve_action_stats()
 
@@ -180,6 +182,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
                 filter_empty_language=self.filter_empty_language,
                 gripper_window_before=self.gripper_window_before,
                 gripper_window_after=self.gripper_window_after,
+                gripper_change_scope=self.gripper_change_scope,
             )
             for step_index in step_indices:
                 if self.stage is not None and not sample_belongs_to_stage(
@@ -386,6 +389,7 @@ def build_lazy_combined_standardized_splits(
     max_samples_per_episode: int | None = DEFAULT_MAX_SAMPLES_PER_EPISODE,
     gripper_window_before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
     gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
+    gripper_change_scope: str = "all",
 ) -> dict[str, LazyCombinedStandardizedDataset]:
     dataset_configs = (
         list(configs)
@@ -415,6 +419,7 @@ def build_lazy_combined_standardized_splits(
                         max_samples_per_episode=max_samples_per_episode,
                         gripper_window_before=gripper_window_before,
                         gripper_window_after=gripper_window_after,
+                        gripper_change_scope=gripper_change_scope,
                     ),
                 )
             )
