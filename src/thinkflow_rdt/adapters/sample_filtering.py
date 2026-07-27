@@ -39,7 +39,10 @@ def gripper_change_window_indices(
     before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
     after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
     gripper_threshold: float = 0.5,
+    change_scope: str = "all",
 ) -> list[int]:
+    if change_scope not in {"all", "first"}:
+        raise ValueError("change_scope must be 'all' or 'first'")
     action_array = np.asarray(actions, dtype=np.float32)
     if action_array.ndim != 2 or action_array.shape[0] == 0:
         return []
@@ -48,6 +51,8 @@ def gripper_change_window_indices(
 
     gripper = (action_array[:, 6] >= gripper_threshold).astype(np.int8)
     change_steps = np.flatnonzero(gripper[1:] != gripper[:-1]) + 1
+    if change_scope == "first":
+        change_steps = change_steps[:1]
     total_steps = action_array.shape[0]
 
     selected: set[int] = set()
@@ -67,6 +72,7 @@ def build_episode_sample_indices(
     gripper_window_before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
     gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
     gripper_threshold: float = 0.5,
+    gripper_change_scope: str = "all",
 ) -> list[int]:
     total_steps = len(instructions)
     if total_steps == 0:
@@ -97,6 +103,7 @@ def build_episode_sample_indices(
             before=gripper_window_before,
             after=gripper_window_after,
             gripper_threshold=gripper_threshold,
+            change_scope=gripper_change_scope,
         )
         if step_index in valid_set
     ]
@@ -119,6 +126,7 @@ def build_dataset_sample_index(
     filter_empty_language: bool = True,
     gripper_window_before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
     gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
+    gripper_change_scope: str = "all",
 ) -> list[tuple[int, int]]:
     index: list[tuple[int, int]] = []
     for episode_index, episode in enumerate(episodes):
@@ -129,6 +137,7 @@ def build_dataset_sample_index(
             filter_empty_language=filter_empty_language,
             gripper_window_before=gripper_window_before,
             gripper_window_after=gripper_window_after,
+            gripper_change_scope=gripper_change_scope,
         )
         index.extend((episode_index, step_index) for step_index in step_indices)
     return index
