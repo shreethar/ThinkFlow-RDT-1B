@@ -45,3 +45,32 @@ def test_episode_sampling_prioritizes_gripper_change_windows_under_cap():
         assert special_step in selected
     assert len(selected) == 10
     assert selected == sorted(selected)
+
+
+def test_episode_sampling_can_prioritize_only_first_wide_gripper_window():
+    actions = np.zeros((120, 7), dtype=np.float32)
+    actions[50:80, 6] = 1.0
+    actions[80:, 6] = 0.0
+    instructions = ["pick"] * 120
+
+    special = gripper_change_window_indices(
+        actions,
+        before=10,
+        after=11,
+        change_scope="first",
+    )
+
+    selected = build_episode_sample_indices(
+        instructions,
+        actions,
+        max_samples_per_episode=64,
+        gripper_window_before=10,
+        gripper_window_after=11,
+        gripper_change_scope="first",
+    )
+
+    assert special == list(range(40, 61))
+    for special_step in special:
+        assert special_step in selected
+    assert len(selected) == 64
+    assert selected == sorted(selected)
