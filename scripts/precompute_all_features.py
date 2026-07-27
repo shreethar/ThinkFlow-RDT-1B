@@ -51,6 +51,7 @@ CTRL_FREQ_BY_DATASET = {
     "droid": 15.0,
     "fractal": 3.0,
     "kuka": 3.0,
+    "libero_object": 20.0,
 }
 IMAGE_KEYS = ("primary", "wrist", "secondary")
 SPLIT_NAMES = ("train", "validation", "test")
@@ -423,7 +424,10 @@ def standardized_collate_fn(
             ]
         ),
         "ctrl_freq": torch.tensor(
-            [float(sample.get("ctrl_freq", CTRL_FREQ_BY_DATASET[dataset_id])) for sample, dataset_id in zip(kept, dataset_ids)],
+            [
+                float(sample.get("ctrl_freq", CTRL_FREQ_BY_DATASET.get(dataset_id, 10.0)))
+                for sample, dataset_id in zip(kept, dataset_ids)
+            ],
             dtype=torch.float32,
         ),
         "metadata": [
@@ -854,18 +858,50 @@ def save_batch_records(
 
 
 def iter_episode_sample_groups(dataset: Any) -> Iterable[list[dict[str, Any]]]:
-    current_key: tuple[str, str] | None = None
+    """Group a sample stream by physical episode occurrence.
+
+    Some source datasets reuse ``episode_id`` for multiple trajectories. The
+    standardized stream does not expose its raw episode index, but samples from
+    one occurrence have strictly increasing integer ``step_idx`` values. Treat
+    a non-increasing step as an occurrence boundary and add a stream-local
+    occurrence number to the public ``(dataset_id, episode_id)`` key.
+    """
+    current_occurrence_key: tuple[str, str, int] | None = None
     current_samples: list[dict[str, Any]] = []
+    occurrence_counts: dict[tuple[str, str], int] = {}
+    previous_step_index: int | None = None
+
     for sample in dataset:
-        key = (str(sample["dataset_id"]), str(sample["episode_id"]))
-        if current_key is None:
-            current_key = key
-        if key != current_key:
-            if current_samples:
-                yield current_samples
-            current_key = key
+        public_key = (str(sample["dataset_id"]), str(sample["episode_id"]))
+        step_index = sample_step_index(sample)
+        public_key_changed = (
+            current_occurrence_key is not None
+            and public_key != current_occurrence_key[:2]
+        )
+        step_restarted = (
+            current_occurrence_key is not None
+            and not public_key_changed
+            and previous_step_index is not None
+            and step_index <= previous_step_index
+        )
+
+        if current_samples and (public_key_changed or step_restarted):
+            yield current_samples
             current_samples = []
+            current_occurrence_key = None
+            previous_step_index = None
+
+        if current_occurrence_key is None:
+            occurrence_index = occurrence_counts.get(public_key, 0)
+            occurrence_counts[public_key] = occurrence_index + 1
+            current_occurrence_key = (*public_key, occurrence_index)
+
+        if public_key != current_occurrence_key[:2]:
+            raise RuntimeError("Episode occurrence grouping lost stream alignment")
+
         current_samples.append(sample)
+        previous_step_index = step_index
+
     if current_samples:
         yield current_samples
 
@@ -884,7 +920,7 @@ def sample_step_index(sample: dict[str, Any]) -> int:
 def anchor_kind(anchor_index: int, anchor: dict[str, Any]) -> str:
     if anchor_index == 0:
         return "first_step"
-    return str(anchor.get("_qwen_anchor_kind", "uniform"))
+    return str(anchor["_qwen_anchor_kind"])
 
 
 def select_episode_qwen_anchors(
@@ -893,44 +929,29 @@ def select_episode_qwen_anchors(
     normalized_actions: bool,
     max_anchors: int,
 ) -> list[dict[str, Any]]:
+    """Select the first step and, if present, the first gripper change."""
     if not samples:
         return []
     if max_anchors <= 0:
         raise ValueError("max_anchors must be positive")
 
-    selected_by_step: dict[int, dict[str, Any]] = {}
-
     first_anchor = dict(samples[0])
     first_anchor["_qwen_anchor_kind"] = "first_step"
-    selected_by_step[sample_step_index(first_anchor)] = first_anchor
+    anchors = [first_anchor]
+    if max_anchors == 1:
+        return anchors
 
     previous = sample_gripper_binary(samples[0], normalized_actions=normalized_actions)
     for sample in samples[1:]:
         current = sample_gripper_binary(sample, normalized_actions=normalized_actions)
         if current != previous:
-            if sample_step_index(sample) not in selected_by_step and len(selected_by_step) < max_anchors:
-                gripper_anchor = dict(sample)
-                gripper_anchor["_qwen_anchor_kind"] = "first_gripper_change"
-                selected_by_step[sample_step_index(gripper_anchor)] = gripper_anchor
+            gripper_anchor = dict(sample)
+            gripper_anchor["_qwen_anchor_kind"] = "first_gripper_change"
+            anchors.append(gripper_anchor)
             break
         previous = current
 
-    remaining = max_anchors - len(selected_by_step)
-    if remaining > 0 and len(samples) > 1:
-        uniform_positions = np.linspace(0, len(samples) - 1, num=max_anchors, dtype=np.int64)
-        for position in uniform_positions:
-            sample = samples[int(position)]
-            step_idx = sample_step_index(sample)
-            if step_idx in selected_by_step:
-                continue
-            uniform_anchor = dict(sample)
-            uniform_anchor["_qwen_anchor_kind"] = "uniform"
-            selected_by_step[step_idx] = uniform_anchor
-            if len(selected_by_step) >= max_anchors:
-                break
-
-    anchors = [selected_by_step[step_idx] for step_idx in sorted(selected_by_step)]
-    return anchors[:max_anchors]
+    return anchors
 
 
 def qwen_anchor_batch(
@@ -1935,7 +1956,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         action="append",
-        choices=["bc_z", "bridge", "droid", "fractal", "kuka"],
+        choices=["bc_z", "bridge", "droid", "fractal", "kuka", "libero_object"],
         help="Dataset id to include. Repeat for multiple. Defaults to all.",
     )
     parser.add_argument("--seed", type=int, default=None)
@@ -2064,10 +2085,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--qwen-anchors-per-episode",
         type=int,
-        default=8,
+        choices=[1, 2],
+        default=2,
         help=(
             "Maximum Qwen primary-image anchors per episode in episode_anchors mode. "
-            "Uses first step, first gripper change when present, then uniform samples."
+            "Uses the first step and the first gripper change when present."
         ),
     )
     parser.add_argument(
