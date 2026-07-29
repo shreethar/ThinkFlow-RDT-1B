@@ -4,7 +4,6 @@ tiktoken
 sentencepiece
 tensorflow
 tensorflow-datasets
-annotated-doc==0.0.4
 anyio==4.14.0
 causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 certifi==2026.5.20
