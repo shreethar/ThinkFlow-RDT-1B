@@ -41,6 +41,7 @@ class RunningMetric:
 class AuditStats:
     samples: int = 0
     compared_rows: int = 0
+    duplicate_step_rows: int = 0
     absolute_same_l1: RunningMetric = field(default_factory=RunningMetric)
     absolute_next_l1: RunningMetric = field(default_factory=RunningMetric)
     delta_from_current_l1: RunningMetric = field(default_factory=RunningMetric)
@@ -84,11 +85,15 @@ def numeric_step_indices(values: Any, count: int) -> list[int] | None:
     return output
 
 
-def contiguous_index_map(step_indices: list[int]) -> dict[int, int] | None:
-    mapping = {step: index for index, step in enumerate(step_indices)}
-    if len(mapping) != len(step_indices):
-        return None
-    return mapping
+def first_index_by_step(step_indices: list[int]) -> tuple[dict[int, int], int]:
+    mapping: dict[int, int] = {}
+    duplicates = 0
+    for index, step in enumerate(step_indices):
+        if step in mapping:
+            duplicates += 1
+            continue
+        mapping[step] = index
+    return mapping, duplicates
 
 
 def maybe_denormalize(
@@ -122,7 +127,10 @@ def audit_pack(
 
     sample_count = int(state.shape[0])
     step_indices = numeric_step_indices(pack.get("sample_step_idx"), sample_count)
-    index_by_step = contiguous_index_map(step_indices) if step_indices is not None else None
+    index_by_step = None
+    if step_indices is not None:
+        index_by_step, duplicates = first_index_by_step(step_indices)
+        stats.duplicate_step_rows += duplicates
     limit = sample_count if max_samples is None else min(sample_count, max_samples)
     dims = min(pose_dims, int(state.shape[1]))
 
@@ -215,6 +223,7 @@ def main() -> None:
     print(f"  unsupported manifest rows skipped: {unsupported}")
     print(f"  samples audited: {stats.samples}")
     print(f"  compared horizon rows: {stats.compared_rows}")
+    print(f"  duplicate sample_step_idx rows: {stats.duplicate_step_rows}")
     print(f"  mean |action|: {stats.action_abs_mean.mean:.6f}")
     print(f"  mean |state|: {stats.state_abs_mean.mean:.6f}")
     print(f"  L1 action vs state[t+h]: {stats.absolute_same_l1.mean:.6f}")

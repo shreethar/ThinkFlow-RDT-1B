@@ -44,6 +44,17 @@ def parse_step_indices(values: Any, count: int) -> list[int] | None:
     return output if len(output) == count else None
 
 
+def first_index_by_step(step_indices: list[int]) -> tuple[dict[int, int], int]:
+    mapping: dict[int, int] = {}
+    duplicates = 0
+    for index, step in enumerate(step_indices):
+        if step in mapping:
+            duplicates += 1
+            continue
+        mapping[step] = index
+    return mapping, duplicates
+
+
 def build_target_state_horizon(
     states: torch.Tensor,
     old_time_mask: torch.Tensor,
@@ -63,10 +74,9 @@ def build_target_state_horizon(
     target_mask = torch.zeros(sample_count, horizon, dtype=torch.bool)
 
     index_by_step: dict[int, int] | None = None
+    duplicate_steps = 0
     if step_indices is not None:
-        index_by_step = {step: index for index, step in enumerate(step_indices)}
-        if len(index_by_step) != sample_count:
-            raise ValueError("Duplicate sample_step_idx values prevent target-state reconstruction")
+        index_by_step, duplicate_steps = first_index_by_step(step_indices)
 
     missing = 0
     filled = 0
@@ -87,7 +97,11 @@ def build_target_state_horizon(
             target_mask[sample_index, offset] = True
             filled += 1
 
-    return targets, target_mask, {"filled": filled, "missing": missing}
+    return targets, target_mask, {
+        "filled": filled,
+        "missing": missing,
+        "duplicate_steps": duplicate_steps,
+    }
 
 
 def output_name_for_item(item: dict[str, Any], used_names: set[str]) -> str:
@@ -154,6 +168,7 @@ def convert_manifest(
         "copied_unsupported": 0,
         "filled_targets": 0,
         "missing_targets": 0,
+        "duplicate_step_rows": 0,
     }
 
     with output_manifest.open("w", encoding="utf-8") as out:
@@ -196,6 +211,7 @@ def convert_manifest(
                 counts["converted"] += 1
                 counts["filled_targets"] += pack_counts["filled"]
                 counts["missing_targets"] += pack_counts["missing"]
+                counts["duplicate_step_rows"] += pack_counts["duplicate_steps"]
 
             out.write(json.dumps(manifest_item) + "\n")
     return counts
