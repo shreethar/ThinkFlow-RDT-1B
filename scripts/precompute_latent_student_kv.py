@@ -38,9 +38,13 @@ from precompute_all_features import (  # noqa: E402
 )
 from thinkflow_rdt.adapters.combined_lazy import build_combined_standardized_splits  # noqa: E402
 from thinkflow_rdt.adapters.sample_filtering import (  # noqa: E402
+    DEFAULT_CLOSE_TO_OPEN_AFTER,
+    DEFAULT_CLOSE_TO_OPEN_BEFORE,
     DEFAULT_GRIPPER_WINDOW_AFTER,
     DEFAULT_GRIPPER_WINDOW_BEFORE,
     DEFAULT_MAX_SAMPLES_PER_EPISODE,
+    DEFAULT_OPEN_TO_CLOSE_AFTER,
+    DEFAULT_OPEN_TO_CLOSE_BEFORE,
 )
 from thinkflow_rdt.config import load_config  # noqa: E402
 
@@ -672,17 +676,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gripper-change-scope",
-        choices=["all", "first"],
+        choices=["all", "first", "directional"],
         default="all",
         help=(
             "Which gripper transitions receive priority sampling windows. "
-            "Use 'first' for one wider approach/closure-focused window plus uniform fill."
+            "Use 'directional' for open-to-close and close-to-open windows with "
+            "separate before/after counts."
         ),
     )
+    parser.add_argument("--open-to-close-before", type=int, default=DEFAULT_OPEN_TO_CLOSE_BEFORE)
+    parser.add_argument("--open-to-close-after", type=int, default=DEFAULT_OPEN_TO_CLOSE_AFTER)
+    parser.add_argument("--close-to-open-before", type=int, default=DEFAULT_CLOSE_TO_OPEN_BEFORE)
+    parser.add_argument("--close-to-open-after", type=int, default=DEFAULT_CLOSE_TO_OPEN_AFTER)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--no-normalize-actions", action="store_true")
+    parser.add_argument(
+        "--action-target-mode",
+        choices=["delta", "absolute_state"],
+        default="delta",
+        help=(
+            "delta uses the old standardized relative action targets. "
+            "absolute_state uses future absolute [x,y,z,roll,pitch,yaw,gripper] "
+            "state targets in physical units."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--empty-cache-every", type=int, default=25)
 
@@ -734,6 +753,14 @@ def main() -> None:
         raise ValueError("--spatial-token-count must be positive")
     if "{task}" not in args.prompt_template:
         raise ValueError("--prompt-template must contain {task}")
+    normalize_actions = not args.no_normalize_actions
+    if args.action_target_mode == "absolute_state":
+        if normalize_actions:
+            print(
+                "Using action_target_mode=absolute_state; disabling q01/q99 action "
+                "normalization so RDT targets stay in physical units."
+            )
+        normalize_actions = False
 
     print(f"Using latent-student extraction device: {device}")
     print(f"Using transformers device_map for T5: {args.device_map}")
@@ -750,11 +777,16 @@ def main() -> None:
         stage_count=args.stage_count,
         droid_stage_count=args.droid_stage_count,
         horizon=cfg.model.pred_horizon,
-        normalize_actions=not args.no_normalize_actions,
+        normalize_actions=normalize_actions,
+        action_target_mode=args.action_target_mode,
         max_samples_per_episode=args.max_samples_per_episode,
         gripper_window_before=args.gripper_window_before,
         gripper_window_after=args.gripper_window_after,
         gripper_change_scope=args.gripper_change_scope,
+        open_to_close_before=args.open_to_close_before,
+        open_to_close_after=args.open_to_close_after,
+        close_to_open_before=args.close_to_open_before,
+        close_to_open_after=args.close_to_open_after,
     )
 
     student, processor = load_student_and_processor(args, device)
@@ -778,11 +810,16 @@ def main() -> None:
         "datasets": [config.dataset_id for config in configs],
         "seed": seed,
         "stage": args.stage,
-        "normalize_actions": not args.no_normalize_actions,
+        "normalize_actions": normalize_actions,
+        "action_target_mode": args.action_target_mode,
         "max_samples_per_episode": args.max_samples_per_episode,
         "gripper_window_before": args.gripper_window_before,
         "gripper_window_after": args.gripper_window_after,
         "gripper_change_scope": args.gripper_change_scope,
+        "open_to_close_before": args.open_to_close_before,
+        "open_to_close_after": args.open_to_close_after,
+        "close_to_open_before": args.close_to_open_before,
+        "close_to_open_after": args.close_to_open_after,
         "student_model_id": args.student_model_id,
         "processor_id": args.processor_id or args.student_model_id,
         "spatial_parameters_path": (
