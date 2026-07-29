@@ -270,6 +270,9 @@ class SFTConditionedRDT(nn.Module):
         self.use_native_state_encoder = (
             cfg.model.state_encoder_layout == "rdt_eef"
         )
+        self.use_native_action_encoder = (
+            cfg.model.action_encoder_layout == "rdt_eef"
+        )
 
         projector_width = cfg.model.hidden_size
         if cfg.model.qwen_fusion == "self_attention_kv":
@@ -312,7 +315,7 @@ class SFTConditionedRDT(nn.Module):
             dtype=dtype,
         )
         self.action_adaptor: nn.Module | None = None
-        if self.use_native_state_encoder:
+        if self.use_native_state_encoder and not self.use_native_action_encoder:
             self.action_adaptor = self.runner.build_condition_adapter(
                 cfg.model.state_adaptor,
                 in_features=cfg.model.action_dim * 2,
@@ -405,6 +408,7 @@ class SFTConditionedRDT(nn.Module):
                 for parameter in module.parameters()
             ),
             "native_state_encoder": self.use_native_state_encoder,
+            "native_action_encoder": self.use_native_action_encoder,
             "action_adaptor_trainable": (
                 self.action_adaptor is not None
                 and any(
@@ -496,7 +500,9 @@ class SFTConditionedRDT(nn.Module):
         values: torch.Tensor,
         raw_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Keep normalized delta actions in their cached 7-D coordinates."""
+        """Build action-token inputs for delta actions or absolute targets."""
+        if self.use_native_action_encoder:
+            return self._state_encoder_input(values, raw_mask)
         if values.shape != raw_mask.shape:
             raise ValueError(
                 f"Action values/mask shapes differ: {values.shape} vs {raw_mask.shape}"
@@ -511,7 +517,7 @@ class SFTConditionedRDT(nn.Module):
         action_input = self._action_encoder_input(values, raw_mask)
         adaptor = (
             self.runner.state_adaptor
-            if self.action_adaptor is None
+            if self.action_adaptor is None or self.use_native_action_encoder
             else self.action_adaptor
         )
         return adaptor(action_input)

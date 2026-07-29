@@ -43,6 +43,10 @@ class ModelConfig:
     # observations to RDT's native [xyz, ortho6d, gripper_open] state slots.
     # Delta actions retain their raw 7-D cache space and use a separate adaptor.
     state_encoder_layout: str = "raw"
+    # ``raw`` keeps cached 7-D actions in the existing project convention.
+    # ``rdt_eef`` treats action targets as absolute target states and encodes
+    # them through the same native RDT EEF slots as current state observations.
+    action_encoder_layout: str = "raw"
     # Only smoke tests should freeze a randomly initialized native state adaptor.
     allow_random_frozen_state_adaptor: bool = False
     # ``compatible`` copies every shape-compatible runner tensor, including the
@@ -151,6 +155,17 @@ class ExperimentConfig:
         if self.model.state_encoder_layout not in {"raw", "rdt_eef"}:
             raise ValueError(
                 "model.state_encoder_layout must be 'raw' or 'rdt_eef'"
+            )
+        if self.model.action_encoder_layout not in {"raw", "rdt_eef"}:
+            raise ValueError(
+                "model.action_encoder_layout must be 'raw' or 'rdt_eef'"
+            )
+        if (
+            self.model.action_encoder_layout == "rdt_eef"
+            and self.model.state_encoder_layout != "rdt_eef"
+        ):
+            raise ValueError(
+                "rdt_eef action layout requires model.state_encoder_layout=rdt_eef"
             )
         if self.model.finetune_mode == "lora" and self.lora.rank <= 0:
             raise ValueError("LoRA rank must be positive")
