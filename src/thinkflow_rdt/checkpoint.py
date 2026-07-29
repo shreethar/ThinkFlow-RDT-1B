@@ -114,7 +114,7 @@ def _load_interfaces(model, interfaces: dict[str, Any], *, trainable: bool) -> N
     if checkpoint_has_action_adaptor != (action_adaptor is not None):
         raise ValueError(
             "Checkpoint/model action-adaptor layouts differ; use the same "
-            "model.state_encoder_layout that created the artifact"
+            "model.action_encoder_layout that created the artifact"
         )
     if action_adaptor is not None:
         required.add("action_adaptor")
