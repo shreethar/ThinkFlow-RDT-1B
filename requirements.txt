@@ -1,5 +1,9 @@
 --index-url https://download.pytorch.org/whl/cu128
 
+tiktoken
+sentencepiece
+tensorflow
+tensorflow-datasets
 absl-py==2.4.0
 accelerate==1.14.0
 annotated-doc==0.0.4
