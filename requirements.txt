@@ -1,3 +1,5 @@
+--index-url https://download.pytorch.org/whl/cu128
+
 absl-py==2.4.0
 accelerate==1.14.0
 annotated-doc==0.0.4
@@ -14,6 +16,8 @@ einops==0.8.2
 filelock==3.29.4
 fla-core==0.5.0
 flash-linear-attention==0.5.0
+flash-linear-attention[cuda]
+flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 fsspec==2026.6.0
 grpcio==1.81.1
 h11==0.16.0

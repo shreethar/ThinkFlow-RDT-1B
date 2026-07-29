@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "SFT-conditioned RDT-1B diffusion action model with LoRA"
 requires-python = ">=3.12"
 dependencies = [
+  "flash-linear-attention[cuda]",
+  "flash-attn==2.8.3+cu12torch2.10cxx11abiTRUE",
+  "causal-conv1d==1.6.2.post1+cu12torch2.10cxx11abiTRUE",
   "torch==2.10.0",
   "torchvision==0.25.0",
   "accelerate>=0.30",
@@ -38,3 +41,5 @@ index = [
 [tool.uv.sources]
 torch = { index = "pytorch" }
 torchvision = { index = "pytorch" }
+flash-attn = { url = "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+causal-conv1d = { url = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
