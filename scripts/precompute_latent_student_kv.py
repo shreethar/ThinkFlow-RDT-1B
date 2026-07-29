@@ -136,11 +136,26 @@ def load_student_and_processor(args: argparse.Namespace, device: torch.device) -
 def load_t5(args: argparse.Namespace, cfg: Any) -> tuple[Any, Any]:
     t5_model_id = resolve_model_id(args.t5_model_id, args.t5_fallback_model_id)
     tokenizer = T5Tokenizer.from_pretrained(t5_model_id)
-    encoder = T5EncoderModel.from_pretrained(
-        t5_model_id,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device_map,
-    )
+    if args.t5_precision == "8bit":
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise ImportError(
+                "--t5-precision 8bit requires transformers BitsAndBytesConfig "
+                "and a bitsandbytes-capable environment."
+            ) from exc
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+        encoder = T5EncoderModel.from_pretrained(
+            t5_model_id,
+            quantization_config=quantization_config,
+            device_map=args.device_map,
+        )
+    else:
+        encoder = T5EncoderModel.from_pretrained(
+            t5_model_id,
+            torch_dtype=torch.bfloat16,
+            device_map=args.device_map,
+        )
     encoder.eval()
     encoder.requires_grad_(False)
     if encoder.config.d_model != cfg.model.lang_token_dim:
@@ -148,6 +163,13 @@ def load_t5(args: argparse.Namespace, cfg: Any) -> tuple[Any, Any]:
             f"T5 d_model {encoder.config.d_model} != cfg.model.lang_token_dim {cfg.model.lang_token_dim}"
         )
     return tokenizer, encoder
+
+
+def t5_device_from_encoder(encoder: Any, fallback: torch.device) -> torch.device:
+    try:
+        return next(encoder.parameters()).device
+    except StopIteration:
+        return fallback
 
 
 def batch_to_latent_student_inputs(
@@ -572,15 +594,15 @@ def precompute_split(
             t5_seconds = 0.0
             if args.include_t5:
                 unique_instructions, sample_lang_index = unique_instruction_indices(batch["instructions"])
-                t5_batch = {"instructions": unique_instructions}
                 t5_start = time.perf_counter()
-                lang_tokens, lang_mask = precompute_t5_features(
-                    t5_batch,
-                    t5_tokenizer,
-                    t5_encoder,
+                lang_tokens, lang_mask = precompute_t5_features_chunked(
+                    unique_instructions,
+                    tokenizer=t5_tokenizer,
+                    encoder=t5_encoder,
                     max_lang_tokens=cfg.model.max_lang_tokens,
                     expected_dim=cfg.model.lang_token_dim,
                     device=device,
+                    batch_size=args.t5_batch_size,
                 )
                 if device.type == "cuda":
                     torch.cuda.synchronize()
@@ -630,6 +652,41 @@ def precompute_t5_features(*args: Any, **kwargs: Any) -> tuple[torch.Tensor, tor
     from precompute_all_features import extract_t5_features
 
     return extract_t5_features(*args, **kwargs)
+
+
+def precompute_t5_features_chunked(
+    instructions: list[str],
+    *,
+    tokenizer: Any,
+    encoder: Any,
+    max_lang_tokens: int,
+    expected_dim: int,
+    device: torch.device,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if batch_size <= 0:
+        raise ValueError("--t5-batch-size must be positive")
+    token_chunks: list[torch.Tensor] = []
+    mask_chunks: list[torch.Tensor] = []
+    encoder_device = t5_device_from_encoder(encoder, device)
+    for start in range(0, len(instructions), batch_size):
+        chunk = instructions[start : start + batch_size]
+        tokens, mask = precompute_t5_features(
+            {"instructions": chunk},
+            tokenizer,
+            encoder,
+            max_lang_tokens=max_lang_tokens,
+            expected_dim=expected_dim,
+            device=encoder_device,
+        )
+        token_chunks.append(tokens.cpu())
+        mask_chunks.append(mask.cpu())
+    if not token_chunks:
+        return (
+            torch.zeros(0, max_lang_tokens, expected_dim, dtype=torch.bfloat16),
+            torch.zeros(0, max_lang_tokens, dtype=torch.bool),
+        )
+    return torch.cat(token_chunks, dim=0), torch.cat(mask_chunks, dim=0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -730,6 +787,21 @@ def parse_args() -> argparse.Namespace:
         default="/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v1_1-xxl",
     )
     parser.add_argument("--t5-fallback-model-id", default="google/t5-v1_1-xxl")
+    parser.add_argument(
+        "--t5-precision",
+        choices=["bf16", "8bit"],
+        default="bf16",
+        help="Load T5 XXL in bf16 or bitsandbytes 8-bit.",
+    )
+    parser.add_argument(
+        "--t5-batch-size",
+        type=int,
+        default=32,
+        help=(
+            "Number of unique raw instructions per T5 forward pass. This is "
+            "independent from --batch-size, which controls LatentStudent KV shard size."
+        ),
+    )
     parser.add_argument("--save-padded-features", action="store_true")
 
     parser.add_argument("--image-history-size", type=int, default=2)
@@ -749,6 +821,8 @@ def main() -> None:
         args.device_map = "cpu"
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
+    if args.t5_batch_size <= 0:
+        raise ValueError("--t5-batch-size must be positive")
     if args.spatial_token_count <= 0:
         raise ValueError("--spatial-token-count must be positive")
     if "{task}" not in args.prompt_template:
@@ -830,6 +904,8 @@ def main() -> None:
         "layer_index": args.layer_index,
         "qwen_kv_dim": cfg.model.qwen_kv_dim,
         "include_t5": args.include_t5,
+        "t5_precision": args.t5_precision,
+        "t5_batch_size": args.t5_batch_size,
         "cache_image_slots": args.cache_image_slots,
         "image_history_size": args.image_history_size,
         "max_images_per_sample": args.max_images_per_sample,
