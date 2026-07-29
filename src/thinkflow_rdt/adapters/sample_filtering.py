@@ -8,6 +8,10 @@ import numpy as np
 DEFAULT_MAX_SAMPLES_PER_EPISODE = 64
 DEFAULT_GRIPPER_WINDOW_BEFORE = 3
 DEFAULT_GRIPPER_WINDOW_AFTER = 3
+DEFAULT_OPEN_TO_CLOSE_BEFORE = 5
+DEFAULT_OPEN_TO_CLOSE_AFTER = 4
+DEFAULT_CLOSE_TO_OPEN_BEFORE = 3
+DEFAULT_CLOSE_TO_OPEN_AFTER = 0
 
 
 def has_language_instruction(instruction: str) -> bool:
@@ -63,6 +67,41 @@ def gripper_change_window_indices(
     return sorted(selected)
 
 
+def directional_gripper_change_window_indices(
+    actions: np.ndarray,
+    *,
+    open_to_close_before: int = DEFAULT_OPEN_TO_CLOSE_BEFORE,
+    open_to_close_after: int = DEFAULT_OPEN_TO_CLOSE_AFTER,
+    close_to_open_before: int = DEFAULT_CLOSE_TO_OPEN_BEFORE,
+    close_to_open_after: int = DEFAULT_CLOSE_TO_OPEN_AFTER,
+    gripper_threshold: float = 0.5,
+) -> list[int]:
+    action_array = np.asarray(actions, dtype=np.float32)
+    if action_array.ndim != 2 or action_array.shape[0] == 0:
+        return []
+    if action_array.shape[1] < 7:
+        raise ValueError(f"Expected action dim at least 7, got {action_array.shape}")
+
+    gripper = (action_array[:, 6] >= gripper_threshold).astype(np.int8)
+    change_steps = np.flatnonzero(gripper[1:] != gripper[:-1]) + 1
+    total_steps = action_array.shape[0]
+
+    selected: set[int] = set()
+    for change_step in change_steps:
+        previous = int(gripper[int(change_step) - 1])
+        current = int(gripper[int(change_step)])
+        if previous == 0 and current == 1:
+            start = max(0, int(change_step) - open_to_close_before)
+            stop = min(total_steps, int(change_step) + open_to_close_after)
+        elif previous == 1 and current == 0:
+            start = max(0, int(change_step) - close_to_open_before)
+            stop = min(total_steps, int(change_step) + close_to_open_after)
+        else:
+            continue
+        selected.update(range(start, stop))
+    return sorted(selected)
+
+
 def build_episode_sample_indices(
     instructions: list[str],
     actions: np.ndarray,
@@ -73,6 +112,10 @@ def build_episode_sample_indices(
     gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
     gripper_threshold: float = 0.5,
     gripper_change_scope: str = "all",
+    open_to_close_before: int = DEFAULT_OPEN_TO_CLOSE_BEFORE,
+    open_to_close_after: int = DEFAULT_OPEN_TO_CLOSE_AFTER,
+    close_to_open_before: int = DEFAULT_CLOSE_TO_OPEN_BEFORE,
+    close_to_open_after: int = DEFAULT_CLOSE_TO_OPEN_AFTER,
 ) -> list[int]:
     total_steps = len(instructions)
     if total_steps == 0:
@@ -96,17 +139,24 @@ def build_episode_sample_indices(
         return []
 
     valid_set = set(valid_steps)
-    special_steps = [
-        step_index
-        for step_index in gripper_change_window_indices(
+    if gripper_change_scope == "directional":
+        special_candidates = directional_gripper_change_window_indices(
+            actions,
+            open_to_close_before=open_to_close_before,
+            open_to_close_after=open_to_close_after,
+            close_to_open_before=close_to_open_before,
+            close_to_open_after=close_to_open_after,
+            gripper_threshold=gripper_threshold,
+        )
+    else:
+        special_candidates = gripper_change_window_indices(
             actions,
             before=gripper_window_before,
             after=gripper_window_after,
             gripper_threshold=gripper_threshold,
             change_scope=gripper_change_scope,
         )
-        if step_index in valid_set
-    ]
+    special_steps = [step_index for step_index in special_candidates if step_index in valid_set]
     if len(special_steps) >= max_samples_per_episode:
         return uniform_sample_indices(special_steps, max_samples_per_episode)
 
@@ -127,6 +177,10 @@ def build_dataset_sample_index(
     gripper_window_before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
     gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
     gripper_change_scope: str = "all",
+    open_to_close_before: int = DEFAULT_OPEN_TO_CLOSE_BEFORE,
+    open_to_close_after: int = DEFAULT_OPEN_TO_CLOSE_AFTER,
+    close_to_open_before: int = DEFAULT_CLOSE_TO_OPEN_BEFORE,
+    close_to_open_after: int = DEFAULT_CLOSE_TO_OPEN_AFTER,
 ) -> list[tuple[int, int]]:
     index: list[tuple[int, int]] = []
     for episode_index, episode in enumerate(episodes):
@@ -138,6 +192,10 @@ def build_dataset_sample_index(
             gripper_window_before=gripper_window_before,
             gripper_window_after=gripper_window_after,
             gripper_change_scope=gripper_change_scope,
+            open_to_close_before=open_to_close_before,
+            open_to_close_after=open_to_close_after,
+            close_to_open_before=close_to_open_before,
+            close_to_open_after=close_to_open_after,
         )
         index.extend((episode_index, step_index) for step_index in step_indices)
     return index

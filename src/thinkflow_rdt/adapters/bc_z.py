@@ -309,9 +309,16 @@ def bcz_sample_from_episode(
     dataset_id: str,
     horizon: int,
     action_stats: ActionNormalizationStats | None,
+    action_target_mode: str = "delta",
 ) -> dict[str, Any]:
+    if action_target_mode == "delta":
+        target_sequence = episode.actions
+    elif action_target_mode == "absolute_state":
+        target_sequence = episode.states
+    else:
+        raise ValueError(f"Unsupported action_target_mode: {action_target_mode}")
     actions, actions_mask = pad_action_horizon(
-        episode.actions,
+        target_sequence,
         step_index,
         horizon=horizon,
         action_dim=ACTION_DIM,

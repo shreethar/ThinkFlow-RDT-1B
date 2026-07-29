@@ -39,6 +39,10 @@ from .sample_filtering import (
     DEFAULT_GRIPPER_WINDOW_AFTER,
     DEFAULT_GRIPPER_WINDOW_BEFORE,
     DEFAULT_MAX_SAMPLES_PER_EPISODE,
+    DEFAULT_CLOSE_TO_OPEN_AFTER,
+    DEFAULT_CLOSE_TO_OPEN_BEFORE,
+    DEFAULT_OPEN_TO_CLOSE_AFTER,
+    DEFAULT_OPEN_TO_CLOSE_BEFORE,
     build_episode_sample_indices,
 )
 
@@ -57,6 +61,7 @@ except ImportError:  # pragma: no cover - torch is a project dependency.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SPLIT_RATIOS = (0.8, 0.1, 0.1)
 SPLIT_NAMES = ("train", "validation", "test")
+ACTION_TARGET_MODES = ("delta", "absolute_state")
 
 
 @dataclass
@@ -97,14 +102,23 @@ class LazyStandardizedDataset(TorchIterableDataset):
         droid_stage_count: int = 2,
         horizon: int = DEFAULT_HORIZON,
         normalize_actions: bool = True,
+        action_target_mode: str = "delta",
         filter_empty_language: bool = True,
         max_samples_per_episode: int | None = DEFAULT_MAX_SAMPLES_PER_EPISODE,
         gripper_window_before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
         gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
         gripper_change_scope: str = "all",
+        open_to_close_before: int = DEFAULT_OPEN_TO_CLOSE_BEFORE,
+        open_to_close_after: int = DEFAULT_OPEN_TO_CLOSE_AFTER,
+        close_to_open_before: int = DEFAULT_CLOSE_TO_OPEN_BEFORE,
+        close_to_open_after: int = DEFAULT_CLOSE_TO_OPEN_AFTER,
     ) -> None:
         if split_name not in SPLIT_NAMES:
             raise ValueError(f"split_name must be one of {SPLIT_NAMES}, got {split_name}")
+        if action_target_mode not in ACTION_TARGET_MODES:
+            raise ValueError(
+                f"action_target_mode must be one of {ACTION_TARGET_MODES}, got {action_target_mode}"
+            )
 
         self.config = config
         self.dataset_id = config.dataset_id
@@ -118,11 +132,16 @@ class LazyStandardizedDataset(TorchIterableDataset):
         self.droid_stage_count = int(droid_stage_count)
         self.horizon = horizon
         self.normalize_actions = normalize_actions
+        self.action_target_mode = action_target_mode
         self.filter_empty_language = filter_empty_language
         self.max_samples_per_episode = max_samples_per_episode
         self.gripper_window_before = gripper_window_before
         self.gripper_window_after = gripper_window_after
         self.gripper_change_scope = gripper_change_scope
+        self.open_to_close_before = open_to_close_before
+        self.open_to_close_after = open_to_close_after
+        self.close_to_open_before = close_to_open_before
+        self.close_to_open_after = close_to_open_after
         self.adapter_kwargs = dict(config.adapter_kwargs)
         self.action_stats = self._resolve_action_stats()
 
@@ -183,6 +202,10 @@ class LazyStandardizedDataset(TorchIterableDataset):
                 gripper_window_before=self.gripper_window_before,
                 gripper_window_after=self.gripper_window_after,
                 gripper_change_scope=self.gripper_change_scope,
+                open_to_close_before=self.open_to_close_before,
+                open_to_close_after=self.open_to_close_after,
+                close_to_open_before=self.close_to_open_before,
+                close_to_open_after=self.close_to_open_after,
             )
             for step_index in step_indices:
                 if self.stage is not None and not sample_belongs_to_stage(
@@ -310,6 +333,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
                 dataset_id=self.dataset_id,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
+                action_target_mode=self.action_target_mode,
             )
             return add_image_history(sample, episode, step_index)
         if self.dataset_id == "bridge":
@@ -319,6 +343,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
                 dataset_id=self.dataset_id,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
+                action_target_mode=self.action_target_mode,
             )
             return add_image_history(sample, episode, step_index)
         if self.dataset_id in {"fractal", "kuka"}:
@@ -328,6 +353,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
                 dataset_id=self.dataset_id,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
+                action_target_mode=self.action_target_mode,
             )
             return add_image_history(sample, episode, step_index)
         if self.dataset_id == "droid":
@@ -337,6 +363,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
                 dataset_id=self.dataset_id,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
+                action_target_mode=self.action_target_mode,
             )
             return add_image_history(sample, episode, step_index)
         raise KeyError(f"Unknown dataset_id: {self.dataset_id}")
@@ -385,11 +412,16 @@ def build_lazy_combined_standardized_splits(
     droid_stage_count: int = 2,
     horizon: int = DEFAULT_HORIZON,
     normalize_actions: bool = True,
+    action_target_mode: str = "delta",
     filter_empty_language: bool = True,
     max_samples_per_episode: int | None = DEFAULT_MAX_SAMPLES_PER_EPISODE,
     gripper_window_before: int = DEFAULT_GRIPPER_WINDOW_BEFORE,
     gripper_window_after: int = DEFAULT_GRIPPER_WINDOW_AFTER,
     gripper_change_scope: str = "all",
+    open_to_close_before: int = DEFAULT_OPEN_TO_CLOSE_BEFORE,
+    open_to_close_after: int = DEFAULT_OPEN_TO_CLOSE_AFTER,
+    close_to_open_before: int = DEFAULT_CLOSE_TO_OPEN_BEFORE,
+    close_to_open_after: int = DEFAULT_CLOSE_TO_OPEN_AFTER,
 ) -> dict[str, LazyCombinedStandardizedDataset]:
     dataset_configs = (
         list(configs)
@@ -415,11 +447,16 @@ def build_lazy_combined_standardized_splits(
                         droid_stage_count=droid_stage_count,
                         horizon=horizon,
                         normalize_actions=normalize_actions,
+                        action_target_mode=action_target_mode,
                         filter_empty_language=filter_empty_language,
                         max_samples_per_episode=max_samples_per_episode,
                         gripper_window_before=gripper_window_before,
                         gripper_window_after=gripper_window_after,
                         gripper_change_scope=gripper_change_scope,
+                        open_to_close_before=open_to_close_before,
+                        open_to_close_after=open_to_close_after,
+                        close_to_open_before=close_to_open_before,
+                        close_to_open_after=close_to_open_after,
                     ),
                 )
             )
@@ -748,9 +785,14 @@ def _single_camera_sample_from_episode(
     dataset_id: str,
     horizon: int,
     action_stats: ActionNormalizationStats | None,
+    action_target_mode: str = "delta",
 ) -> dict[str, Any]:
+    target_sequence = _episode_action_target_sequence(
+        episode,
+        action_target_mode=action_target_mode,
+    )
     actions, actions_mask = pad_action_horizon(
-        episode.actions,
+        target_sequence,
         step_index,
         horizon=horizon,
         action_dim=ACTION_DIM,
@@ -783,9 +825,14 @@ def _droid_sample_from_episode(
     dataset_id: str,
     horizon: int,
     action_stats: ActionNormalizationStats | None,
+    action_target_mode: str = "delta",
 ) -> dict[str, Any]:
+    target_sequence = _episode_action_target_sequence(
+        episode,
+        action_target_mode=action_target_mode,
+    )
     actions, actions_mask = pad_action_horizon(
-        episode.actions,
+        target_sequence,
         step_index,
         horizon=horizon,
         action_dim=ACTION_DIM,
@@ -817,6 +864,18 @@ def _droid_sample_from_episode(
         "actions": actions,
         "actions_mask": actions_mask,
     }
+
+
+def _episode_action_target_sequence(
+    episode: Any,
+    *,
+    action_target_mode: str,
+) -> np.ndarray:
+    if action_target_mode == "delta":
+        return episode.actions
+    if action_target_mode == "absolute_state":
+        return episode.states
+    raise ValueError(f"Unsupported action_target_mode: {action_target_mode}")
 
 
 def _is_successful_episode(raw_episode: Any) -> bool:
