@@ -42,6 +42,9 @@ from thinkflow_rdt.adapters.combined_lazy import (  # noqa: E402
     build_combined_standardized_splits,
     default_lazy_standardized_dataset_configs,
 )
+from thinkflow_rdt.adapters.sample_filtering import (  # noqa: E402
+    DEFAULT_MAX_SAMPLES_PER_EPISODE,
+)
 from thinkflow_rdt.config import load_config  # noqa: E402
 
 
@@ -1189,6 +1192,183 @@ def build_episode_image_pool(
     return image_pool, torch.as_tensor(sample_image_indices, dtype=torch.long)
 
 
+def build_shard_image_pool(
+    batch: dict[str, Any],
+    *,
+    image_history_size: int,
+    image_jpeg_quality: int,
+) -> tuple[list[bytes], torch.Tensor]:
+    key_to_index: dict[tuple[str, ...], int] = {}
+    image_pool: list[bytes] = []
+    sample_image_indices: list[list[int]] = []
+    blank_payload = image_to_jpeg_bytes(blank_rgb_image(), quality=image_jpeg_quality)
+
+    for sample_index, (metadata, sample_slots) in enumerate(
+        zip(batch["metadata"], batch["siglip_image_slots"])
+    ):
+        slot_mask = batch["siglip_slot_mask"][sample_index]
+        dataset_id = str(metadata["dataset_id"])
+        episode_id = str(metadata["episode_id"])
+        try:
+            step_idx = int(metadata["step_idx"])
+        except (TypeError, ValueError):
+            step_idx = sample_index
+
+        slot_indices: list[int] = []
+        for slot_index, image in enumerate(sample_slots):
+            valid = bool(slot_mask[slot_index])
+            if valid:
+                logical_step_idx, image_key = logical_image_slot_key(
+                    step_idx=step_idx,
+                    slot_index=slot_index,
+                    image_history_size=image_history_size,
+                )
+                pool_key = (dataset_id, episode_id, str(logical_step_idx), image_key)
+            else:
+                pool_key = ("blank",)
+
+            image_index = key_to_index.get(pool_key)
+            if image_index is None:
+                image_index = len(image_pool)
+                key_to_index[pool_key] = image_index
+                image_pool.append(
+                    image_to_jpeg_bytes(image, quality=image_jpeg_quality)
+                    if valid
+                    else blank_payload
+                )
+            slot_indices.append(image_index)
+        sample_image_indices.append(slot_indices)
+
+    return image_pool, torch.as_tensor(sample_image_indices, dtype=torch.long)
+
+
+def compact_lang_pool(
+    lang_tokens: torch.Tensor,
+    lang_mask: torch.Tensor,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    tokens_list: list[torch.Tensor] = []
+    mask_list: list[torch.Tensor] = []
+    for index in range(lang_tokens.shape[0]):
+        compact = compact_tokens(lang_tokens[index], lang_mask[index])
+        tokens_list.append(compact.cpu())
+        mask_list.append(torch.ones(compact.shape[0], dtype=torch.bool))
+    return tokens_list, mask_list
+
+
+def unique_instruction_indices(instructions: list[str]) -> tuple[list[str], torch.Tensor]:
+    index_by_instruction: dict[str, int] = {}
+    unique: list[str] = []
+    sample_indices: list[int] = []
+    for instruction in instructions:
+        key = str(instruction)
+        if key not in index_by_instruction:
+            index_by_instruction[key] = len(unique)
+            unique.append(key)
+        sample_indices.append(index_by_instruction[key])
+    return unique, torch.as_tensor(sample_indices, dtype=torch.long)
+
+
+def batch_dataset_label(batch: dict[str, Any]) -> str:
+    ids = [str(item.get("dataset_id", "unknown")) for item in batch.get("metadata", [])]
+    unique_ids = list(dict.fromkeys(ids))
+    if not unique_ids:
+        return "unknown"
+    if len(unique_ids) <= 3:
+        return "+".join(unique_ids)
+    return "+".join(unique_ids[:3]) + f"+{len(unique_ids) - 3}more"
+
+
+def save_sample_shard(
+    *,
+    split_dir: Path,
+    manifest_handle: Any,
+    shard_index: int,
+    sample_start_index: int,
+    batch: dict[str, Any],
+    qwen_kv: torch.Tensor,
+    lang_tokens: torch.Tensor,
+    lang_mask: torch.Tensor,
+    sample_lang_index: torch.Tensor,
+    image_history_size: int,
+    image_jpeg_quality: int,
+    save_padded_features: bool,
+) -> tuple[int, str]:
+    batch_size = int(qwen_kv.shape[0])
+    filename = f"shard_{shard_index:09d}.pt"
+    path = split_dir / filename
+
+    record: dict[str, Any] = {
+        "cache_layout": "sample_shard",
+        "feature_type": "qwen_think_end_kv",
+        "num_samples": batch_size,
+        "sample_start_index": sample_start_index,
+        "sample_stop_index": sample_start_index + batch_size,
+        "qwen_kv": qwen_kv.cpu(),
+        "state": batch["state"].cpu(),
+        "actions": batch["actions"].cpu(),
+        "action_time_mask": batch["action_time_mask"].cpu(),
+        "action_dim_mask": batch["action_dim_mask"].cpu(),
+        "ctrl_freq": batch["ctrl_freq"].cpu(),
+        "metadata": list(batch["metadata"]),
+        "instructions": [str(instruction) for instruction in batch["instructions"]],
+        "sample_lang_index": sample_lang_index.cpu(),
+    }
+
+    if save_padded_features:
+        record["lang_tokens"] = lang_tokens.cpu()
+        record["lang_mask"] = lang_mask.cpu()
+    else:
+        token_list, mask_list = compact_lang_pool(lang_tokens, lang_mask)
+        record["lang_tokens"] = token_list
+        record["lang_mask"] = mask_list
+
+    image_pool, sample_image_indices = build_shard_image_pool(
+        batch,
+        image_history_size=image_history_size,
+        image_jpeg_quality=image_jpeg_quality,
+    )
+    record["image_jpegs"] = image_pool
+    record["sample_image_indices"] = sample_image_indices.cpu()
+    record["sample_image_mask"] = batch["siglip_slot_mask"].cpu()
+    record["image_slot_count"] = int(batch["siglip_slot_mask"].shape[1])
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(record, tmp_path)
+    os.replace(tmp_path, path)
+
+    first_metadata = batch["metadata"][0]
+    last_metadata = batch["metadata"][-1]
+    manifest_line = (
+        json.dumps(
+            {
+                "path": filename,
+                "cache_layout": "sample_shard",
+                "feature_type": "qwen_think_end_kv",
+                "num_samples": batch_size,
+                "sample_start_index": sample_start_index,
+                "sample_stop_index": sample_start_index + batch_size,
+                "first_dataset_id": first_metadata["dataset_id"],
+                "first_episode_id": first_metadata["episode_id"],
+                "first_step_idx": first_metadata["step_idx"],
+                "last_dataset_id": last_metadata["dataset_id"],
+                "last_episode_id": last_metadata["episode_id"],
+                "last_step_idx": last_metadata["step_idx"],
+                "lang_token_count": (
+                    int(lang_tokens.shape[1]) if save_padded_features else None
+                ),
+                "unique_instruction_count": int(len(record["lang_tokens"])),
+                "image_pool_count": len(image_pool),
+                "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
+                "has_img_tokens": False,
+                "has_image_slots": True,
+            }
+        )
+        + "\n"
+    )
+    manifest_handle.write(manifest_line)
+    return sample_start_index + batch_size, manifest_line
+
+
 def save_episode_anchor_pack_job(
     *,
     split_dir: Path,
@@ -1790,6 +1970,7 @@ def precompute_split(
     )
 
     sample_count = 0
+    shard_count = 0
     skipped_no_image = 0
     with tmp_manifest_path.open("w", encoding="utf-8") as manifest:
         progress = tqdm(dataloader, desc=f"precompute {split_name}", unit="batch")
@@ -1814,8 +1995,29 @@ def precompute_split(
                 prompt_template=args.qwen_trajectory_prompt_template,
                 enable_thinking=args.qwen_enable_thinking,
             )
+            if args.max_samples_per_split is not None:
+                keep = min(args.max_samples_per_split - sample_count, qwen_kv.shape[0])
+                qwen_kv = qwen_kv[:keep]
+                for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
+                    batch[key] = batch[key][:keep]
+                batch["metadata"] = batch["metadata"][:keep]
+                batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
+                batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]
+                batch["instructions"] = batch["instructions"][:keep]
+                batch["qwen_images"] = batch["qwen_images"][:keep]
+                batch["siglip_image_slots"] = batch["siglip_image_slots"][:keep]
+                batch["kept_samples"] = batch["kept_samples"][:keep]
+
+            sample_lang_index = None
+            if args.cache_layout == "sample_shards":
+                unique_instructions, sample_lang_index = unique_instruction_indices(
+                    batch["instructions"]
+                )
+                t5_batch = {"instructions": unique_instructions}
+            else:
+                t5_batch = batch
             lang_tokens, lang_mask = extract_t5_features(
-                batch,
+                t5_batch,
                 models["t5_tokenizer"],
                 models["t5_encoder"],
                 max_lang_tokens=cfg.model.max_lang_tokens,
@@ -1835,35 +2037,49 @@ def precompute_split(
                 img_tokens = None
                 img_mask = None
 
-            if args.max_samples_per_split is not None:
-                keep = min(args.max_samples_per_split - sample_count, qwen_kv.shape[0])
-                qwen_kv = qwen_kv[:keep]
-                lang_tokens = lang_tokens[:keep]
-                lang_mask = lang_mask[:keep]
-                if img_tokens is not None:
-                    img_tokens = img_tokens[:keep]
-                if img_mask is not None:
-                    img_mask = img_mask[:keep]
-                for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
-                    batch[key] = batch[key][:keep]
-                batch["metadata"] = batch["metadata"][:keep]
-                batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
-                batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]
-
-            sample_count = save_batch_records(
-                split_dir=split_dir,
-                manifest_handle=manifest,
-                start_index=sample_count,
-                batch=batch,
-                qwen_kv=qwen_kv,
-                lang_tokens=lang_tokens,
-                lang_mask=lang_mask,
-                img_tokens=img_tokens,
-                img_mask=img_mask,
-                save_padded_features=args.save_padded_features,
-                cache_image_slots=args.feature_set == "qwen_t5",
-            )
-            progress.set_postfix(samples=sample_count, skipped_no_image=skipped_no_image)
+            dataset_label = batch_dataset_label(batch)
+            if args.cache_layout == "sample_shards":
+                assert sample_lang_index is not None
+                sample_count, _ = save_sample_shard(
+                    split_dir=split_dir,
+                    manifest_handle=manifest,
+                    shard_index=shard_count,
+                    sample_start_index=sample_count,
+                    batch=batch,
+                    qwen_kv=qwen_kv,
+                    lang_tokens=lang_tokens,
+                    lang_mask=lang_mask,
+                    sample_lang_index=sample_lang_index,
+                    image_history_size=args.image_history_size,
+                    image_jpeg_quality=args.image_jpeg_quality,
+                    save_padded_features=args.save_padded_features,
+                )
+                shard_count += 1
+                progress.set_postfix(
+                    dataset=dataset_label,
+                    samples=sample_count,
+                    shards=shard_count,
+                    skipped_no_image=skipped_no_image,
+                )
+            else:
+                sample_count = save_batch_records(
+                    split_dir=split_dir,
+                    manifest_handle=manifest,
+                    start_index=sample_count,
+                    batch=batch,
+                    qwen_kv=qwen_kv,
+                    lang_tokens=lang_tokens,
+                    lang_mask=lang_mask,
+                    img_tokens=img_tokens,
+                    img_mask=img_mask,
+                    save_padded_features=args.save_padded_features,
+                    cache_image_slots=args.feature_set == "qwen_t5",
+                )
+                progress.set_postfix(
+                    dataset=dataset_label,
+                    samples=sample_count,
+                    skipped_no_image=skipped_no_image,
+                )
 
             if args.empty_cache_every > 0 and (batch_index + 1) % args.empty_cache_every == 0:
                 torch.cuda.empty_cache()
@@ -1891,11 +2107,25 @@ def load_models(args: argparse.Namespace, cfg: Any, device: torch.device) -> dic
     print("Loading T5 encoder...")
     t5_model_id = resolve_model_id(args.t5_model_id, args.t5_fallback_model_id)
     t5_tokenizer = T5Tokenizer.from_pretrained(t5_model_id)
-    t5_encoder = T5EncoderModel.from_pretrained(
-        t5_model_id,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device_map,
-    )
+    if args.t5_precision == "8bit":
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise ImportError(
+                "--t5-precision 8bit requires transformers BitsAndBytesConfig "
+                "and a bitsandbytes-capable environment."
+            ) from exc
+        t5_encoder = T5EncoderModel.from_pretrained(
+            t5_model_id,
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+            device_map=args.device_map,
+        )
+    else:
+        t5_encoder = T5EncoderModel.from_pretrained(
+            t5_model_id,
+            torch_dtype=torch.bfloat16,
+            device_map=args.device_map,
+        )
     t5_encoder.eval()
     t5_encoder.requires_grad_(False)
     if getattr(t5_encoder.config, "d_model", cfg.model.lang_token_dim) != cfg.model.lang_token_dim:
@@ -1981,6 +2211,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--max-samples-per-split", type=int, default=None)
     parser.add_argument("--max-batches-per-split", type=int, default=None)
+    parser.add_argument(
+        "--max-samples-per-episode",
+        type=int,
+        default=DEFAULT_MAX_SAMPLES_PER_EPISODE,
+    )
+    parser.add_argument(
+        "--gripper-change-scope",
+        choices=["all", "first", "directional"],
+        default="directional",
+        help=(
+            "Which gripper transitions receive priority sampling windows. "
+            "directional uses separate open-to-close and close-to-open windows."
+        ),
+    )
+    parser.add_argument("--open-to-close-before", type=int, default=10)
+    parser.add_argument("--open-to-close-after", type=int, default=8)
+    parser.add_argument("--close-to-open-before", type=int, default=6)
+    parser.add_argument("--close-to-open-after", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--episode-batch-size",
@@ -2004,6 +2252,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--no-normalize-actions", action="store_true")
     parser.add_argument(
+        "--action-target-mode",
+        choices=["delta", "absolute_state"],
+        default="delta",
+        help=(
+            "delta uses standardized relative action targets. absolute_state uses "
+            "future absolute [x,y,z,roll,pitch,yaw,gripper] state targets in "
+            "physical units and disables q01/q99 normalization."
+        ),
+    )
+    parser.add_argument(
         "--feature-set",
         choices=["all", "qwen_t5"],
         default="all",
@@ -2014,11 +2272,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cache-layout",
-        choices=["auto", "sample_records", "episode_packs"],
+        choices=["auto", "sample_records", "episode_packs", "sample_shards"],
         default="auto",
         help=(
             "Feature cache layout. auto uses episode_packs for episode-anchor "
-            "qwen_t5 caches and sample_records otherwise."
+            "qwen_t5 caches and sample_records otherwise. sample_shards writes "
+            "one batched .pt shard per DataLoader batch for online SigLIP training."
         ),
     )
     parser.add_argument("--image-history-size", type=int, default=2)
@@ -2119,6 +2378,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--t5-fallback-model-id", default="google/t5-v1_1-xxl")
     parser.add_argument(
+        "--t5-precision",
+        choices=["bf16", "8bit"],
+        default="bf16",
+        help="Load T5 XXL in bf16 or bitsandbytes 8-bit.",
+    )
+    parser.add_argument(
         "--siglip-model-id",
         default="/home/ubuntu/RoboticsDiffusionTransformer/google/siglip-so400m-patch14-384",
     )
@@ -2138,9 +2403,12 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     if args.qwen_cache_scope == "auto":
-        args.qwen_cache_scope = (
-            "episode_anchors" if args.feature_set == "qwen_t5" else "per_sample"
-        )
+        if args.cache_layout == "sample_shards":
+            args.qwen_cache_scope = "per_sample"
+        else:
+            args.qwen_cache_scope = (
+                "episode_anchors" if args.feature_set == "qwen_t5" else "per_sample"
+            )
     if args.cache_layout == "auto":
         args.cache_layout = (
             "episode_packs"
@@ -2151,6 +2419,13 @@ def main() -> None:
         raise ValueError("--qwen-cache-scope episode_anchors requires --feature-set qwen_t5")
     if args.cache_layout == "episode_packs" and args.qwen_cache_scope != "episode_anchors":
         raise ValueError("--cache-layout episode_packs requires --qwen-cache-scope episode_anchors")
+    if args.cache_layout == "sample_shards":
+        if args.feature_set != "qwen_t5":
+            raise ValueError("--cache-layout sample_shards requires --feature-set qwen_t5")
+        if args.qwen_cache_scope != "per_sample":
+            raise ValueError("--cache-layout sample_shards requires --qwen-cache-scope per_sample")
+        if args.qwen_enable_thinking:
+            raise ValueError("--cache-layout sample_shards expects --no-qwen-enable-thinking")
     if args.episode_batch_size <= 0:
         raise ValueError("--episode-batch-size must be positive")
     if args.episode_prefetch_size < 0:
@@ -2163,8 +2438,26 @@ def main() -> None:
         raise ValueError("--profile-every-episodes must be positive")
     if args.qwen_anchors_per_episode <= 0:
         raise ValueError("--qwen-anchors-per-episode must be positive")
+    if args.max_samples_per_episode is not None and args.max_samples_per_episode <= 0:
+        raise ValueError("--max-samples-per-episode must be positive")
+    for name in (
+        "open_to_close_before",
+        "open_to_close_after",
+        "close_to_open_before",
+        "close_to_open_after",
+    ):
+        if int(getattr(args, name)) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} cannot be negative")
     if "{task}" not in args.qwen_trajectory_prompt_template:
         raise ValueError("--qwen-trajectory-prompt-template must contain {task}")
+    normalize_actions = not args.no_normalize_actions
+    if args.action_target_mode == "absolute_state":
+        if normalize_actions:
+            print(
+                "Using action_target_mode=absolute_state; disabling q01/q99 action "
+                "normalization so RDT targets stay in physical units."
+            )
+        normalize_actions = False
     seed = cfg.seed if args.seed is None else args.seed
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.device_map == "cuda" and device.type != "cuda":
@@ -2184,7 +2477,14 @@ def main() -> None:
         stage_count=args.stage_count,
         droid_stage_count=args.droid_stage_count,
         horizon=cfg.model.pred_horizon,
-        normalize_actions=not args.no_normalize_actions,
+        normalize_actions=normalize_actions,
+        action_target_mode=args.action_target_mode,
+        max_samples_per_episode=args.max_samples_per_episode,
+        gripper_change_scope=args.gripper_change_scope,
+        open_to_close_before=args.open_to_close_before,
+        open_to_close_after=args.open_to_close_after,
+        close_to_open_before=args.close_to_open_before,
+        close_to_open_after=args.close_to_open_after,
     )
     split_names = args.split or list(SPLIT_NAMES)
 
@@ -2209,10 +2509,22 @@ def main() -> None:
         "episode_prefetch_size": args.episode_prefetch_size,
         "async_write_workers": args.async_write_workers,
         "max_pending_writes": args.max_pending_writes,
-        "normalize_actions": not args.no_normalize_actions,
+        "max_samples_per_episode": args.max_samples_per_episode,
+        "gripper_change_scope": args.gripper_change_scope,
+        "open_to_close_before": args.open_to_close_before,
+        "open_to_close_after": args.open_to_close_after,
+        "close_to_open_before": args.close_to_open_before,
+        "close_to_open_after": args.close_to_open_after,
+        "normalize_actions": normalize_actions,
+        "action_target_mode": args.action_target_mode,
         "feature_set": args.feature_set,
         "cache_layout": args.cache_layout,
         "qwen_cache_scope": args.qwen_cache_scope,
+        "qwen_kv_granularity": (
+            "one_kv_per_sample_step"
+            if args.cache_layout == "sample_shards"
+            else args.qwen_cache_scope
+        ),
         "qwen_anchors_per_episode": args.qwen_anchors_per_episode,
         "qwen_stop_at_think": args.qwen_stop_at_think,
         "qwen_enable_thinking": args.qwen_enable_thinking,
@@ -2226,6 +2538,7 @@ def main() -> None:
         "qwen_processor_id": args.qwen_processor_id or args.qwen_model_id,
         "qwen_layer_index": args.qwen_layer_index,
         "t5_model_id": resolve_model_id(args.t5_model_id, args.t5_fallback_model_id),
+        "t5_precision": args.t5_precision,
         "siglip_model_id": resolve_model_id(
             args.siglip_model_id,
             args.siglip_fallback_model_id,
