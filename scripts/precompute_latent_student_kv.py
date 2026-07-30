@@ -356,6 +356,16 @@ def unique_instruction_indices(instructions: list[str]) -> tuple[list[str], torc
     return unique, torch.as_tensor(sample_indices, dtype=torch.long)
 
 
+def batch_dataset_label(batch: dict[str, Any]) -> str:
+    ids = [str(item.get("dataset_id", "unknown")) for item in batch.get("metadata", [])]
+    unique_ids = list(dict.fromkeys(ids))
+    if not unique_ids:
+        return "unknown"
+    if len(unique_ids) <= 3:
+        return "+".join(unique_ids)
+    return "+".join(unique_ids[:3]) + f"+{len(unique_ids) - 3}more"
+
+
 def build_shard_image_pool(
     batch: dict[str, Any],
     *,
@@ -572,6 +582,7 @@ def precompute_split(
                     batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]
                     batch["kept_samples"] = batch["kept_samples"][:keep]
 
+            dataset_label = batch_dataset_label(batch)
             skipped_no_image += int(batch.get("skipped_no_image", 0))
             kv_start = time.perf_counter()
             latent_kv, waypoints = extract_latent_student_spatial_kv(
@@ -629,6 +640,7 @@ def precompute_split(
             sample_count += saved
             shard_count += 1
             progress.set_postfix(
+                dataset=dataset_label,
                 samples=sample_count,
                 kv=f"{kv_seconds:.2f}s",
                 t5=f"{t5_seconds:.2f}s",
