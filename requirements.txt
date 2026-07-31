@@ -8,6 +8,7 @@ imageio
 imageio-ffmpeg
 h5py
 opencv-python-headless
+robosuite>=1.4,<1.5
 causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 cuda-bindings==12.9.4
 cuda-toolkit==12.8.1

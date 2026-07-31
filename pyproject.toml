@@ -30,6 +30,7 @@ dependencies = [
   "imageio-ffmpeg>=0.5",
   "opencv-python-headless>=4.9",
   "h5py>=3.10",
+  "robosuite>=1.4,<1.5",
   "wandb>=0.17",
   "protobuf>=5.26.0",
 ]
