@@ -30,16 +30,20 @@ for path in (REPO_ROOT / "src", REPO_ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 from precompute_all_features import (  # noqa: E402
+    extract_t5_features,
     extract_qwen_kv,
     extract_siglip_features,
     standardized_collate_fn,
 )
 from rollout_libero_rdt import (  # noqa: E402
+    LIBERO_BENCHMARK_CHOICES,
+    LIBERO_DEFAULT_BENCHMARK,
     frame_for_video,
     install_robosuite_mujoco_compatibility,
-    load_cached_language_features,
     load_feature_metadata,
+    load_t5_encoder,
     rollout_sample,
+    t5_device_from_encoder,
 )
 from thinkflow_rdt.adapters.action_stats import load_action_stats  # noqa: E402
 from thinkflow_rdt.adapters.libero import rdt_action_to_libero  # noqa: E402
@@ -49,21 +53,52 @@ from thinkflow_rdt.model import SFTConditionedRDT  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Measure RDT success rate across LIBERO Object episodes.")
+    parser = argparse.ArgumentParser(description="Measure RDT success rate across LIBERO episodes.")
     parser.add_argument("--config", default="configs/b0_rdt1b_lora.yaml")
-    parser.add_argument("--checkpoint", type=Path, default=Path("outputs/libero_object_full/checkpoint-1000"))
-    parser.add_argument("--cache-root", type=Path, default=Path("cache_features/libero_object/full"))
-    parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Object/datasets/libero_object/audit.json"))
+    parser.add_argument("--benchmark", choices=LIBERO_BENCHMARK_CHOICES, default=LIBERO_DEFAULT_BENCHMARK)
+    parser.add_argument("--checkpoint", type=Path, default=Path("outputs/libero_spatial_full/checkpoint-1600"))
+    parser.add_argument("--cache-root", type=Path, default=Path("cache_features/libero_spatial/full"))
+    parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Spatial/datasets/libero_spatial/audit.json"))
     parser.add_argument("--libero-root", type=Path, default=Path("/home/ubuntu/LIBERO"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/libero_object_evaluation/checkpoint-1000"))
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/libero_spatial_evaluation/checkpoint-1600"))
     parser.add_argument("--episodes-per-task", type=int, default=20, help="LIBERO official default is 20; each task has 50 available.")
     parser.add_argument("--all-episodes", action="store_true", help="Evaluate all 50 states for each of 10 tasks (500 rollouts).")
     parser.add_argument("--env-batch-size", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=600)
-    parser.add_argument("--action-chunk", type=int, default=8)
+    parser.add_argument(
+        "--action-chunk",
+        type=int,
+        default=8,
+        help=(
+            "Number of sampled actions to execute before observing again and "
+            "re-planning. The model still predicts cfg.model.pred_horizon actions."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device-map", default="cuda")
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--t5-model-id",
+        default=None,
+        help="Override T5 XXL model path/id. Defaults to cache metadata, then local RDT model root, then google/t5-v1_1-xxl.",
+    )
+    parser.add_argument("--t5-fallback-model-id", default="google/t5-v1_1-xxl")
+    parser.add_argument("--t5-precision", choices=["bf16", "8bit"], default="bf16")
+    parser.add_argument(
+        "--qwen-model-id",
+        default=None,
+        help="Override Qwen model path/id. Defaults to cache metadata, then shreethar/stage1_unsloth.",
+    )
+    parser.add_argument(
+        "--qwen-processor-id",
+        default=None,
+        help="Override Qwen processor path/id. Defaults to --qwen-model-id.",
+    )
+    parser.add_argument(
+        "--siglip-model-id",
+        default=None,
+        help="Override SigLIP model path/id. Defaults to cache metadata, then google/siglip-so400m-patch14-384.",
+    )
     parser.add_argument(
         "--task-id",
         type=int,
@@ -163,23 +198,33 @@ def main() -> None:
 
     device = torch.device("cuda")
     cfg = load_config(args.config)
+    if args.action_chunk <= 0:
+        raise ValueError("--action-chunk must be positive")
+    if args.action_chunk > cfg.model.pred_horizon:
+        raise ValueError(
+            f"--action-chunk ({args.action_chunk}) cannot exceed "
+            f"cfg.model.pred_horizon ({cfg.model.pred_horizon})"
+        )
     stats = load_action_stats(args.action_stats)
     metadata = load_feature_metadata(args.cache_root)
-    qwen_id = metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
-    qwen_processor_id = metadata.get("qwen_processor_id", qwen_id)
-    siglip_id = metadata.get("siglip_model_id", "google/siglip-so400m-patch14-384")
-    benchmark = get_benchmark("libero_object")(0)
+    qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
+    qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
+    siglip_id = args.siglip_model_id or metadata.get("siglip_model_id", "google/siglip-so400m-patch14-384")
+    t5_id = (
+        args.t5_model_id
+        or metadata.get("t5_model_id")
+        or "/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v1_1-xxl"
+    )
+    benchmark = get_benchmark(args.benchmark)(0)
 
-    language_by_task = {
-        task_id: load_cached_language_features(
-            benchmark.get_task(task_id).name,
-            cache_root=args.cache_root,
-            cfg=cfg,
-        )
-        for task_id in task_ids
-    }
-
-    print("Loading Qwen and SigLIP encoders...")
+    print("Loading T5, Qwen, and SigLIP encoders...")
+    t5_tokenizer, t5 = load_t5_encoder(
+        model_id=t5_id,
+        fallback_model_id=args.t5_fallback_model_id,
+        precision=args.t5_precision,
+        device_map=args.device_map,
+        cfg=cfg,
+    )
     qwen_processor = AutoProcessor.from_pretrained(qwen_processor_id)
     qwen_processor.tokenizer.padding_side = "left"
     qwen = AutoModelForImageTextToText.from_pretrained(
@@ -194,6 +239,17 @@ def main() -> None:
         torch_dtype=torch.bfloat16,
         device_map=args.device_map,
     ).eval()
+    language_by_task = {
+        task_id: extract_t5_features(
+            {"instructions": [benchmark.get_task(task_id).language]},
+            t5_tokenizer,
+            t5,
+            max_lang_tokens=cfg.model.max_lang_tokens,
+            expected_dim=cfg.model.lang_token_dim,
+            device=t5_device_from_encoder(t5, device),
+        )
+        for task_id in task_ids
+    }
 
     print(f"Loading RDT artifact {args.checkpoint}...")
     model = SFTConditionedRDT(cfg, load_pretrained=True)
@@ -270,6 +326,7 @@ def main() -> None:
                         rollout_sample(
                             observations[index],
                             previous[index],
+                            dataset_id=args.benchmark,
                             instruction=task.language,
                             horizon=cfg.model.pred_horizon,
                         )
@@ -366,6 +423,7 @@ def main() -> None:
                 env.close()
                 for local_index, init_index in enumerate(indices):
                     row = {
+                        "benchmark": args.benchmark,
                         "task_id": task_id,
                         "task_name": task.name,
                         "instruction": task.language,

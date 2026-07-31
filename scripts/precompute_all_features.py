@@ -55,6 +55,7 @@ CTRL_FREQ_BY_DATASET = {
     "fractal": 3.0,
     "kuka": 3.0,
     "libero_object": 20.0,
+    "libero_spatial": 20.0,
 }
 IMAGE_KEYS = ("primary", "wrist", "secondary")
 SPLIT_NAMES = ("train", "validation", "test")
@@ -2186,7 +2187,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         action="append",
-        choices=["bc_z", "bridge", "droid", "fractal", "kuka", "libero_object"],
+        choices=[
+            "bc_z",
+            "bridge",
+            "droid",
+            "fractal",
+            "kuka",
+            "libero_object",
+            "libero_spatial",
+        ],
         help="Dataset id to include. Repeat for multiple. Defaults to all.",
     )
     parser.add_argument("--seed", type=int, default=None)

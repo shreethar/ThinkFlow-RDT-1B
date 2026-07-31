@@ -233,7 +233,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
         )
 
     def _iter_raw_episodes(self):
-        if self.dataset_id == "libero_object":
+        if self.dataset_id in {"libero_object", "libero_spatial"}:
             for episode in iter_libero_episodes(self.data_dir):
                 self._current_libero_episode = episode
                 yield {"libero_episode": episode, "steps": range(len(episode.actions))}
@@ -260,7 +260,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
             raise KeyError(f"Unknown dataset_id: {self.dataset_id}")
 
     def _episode_id(self, raw_episode: Any, raw_episode_index: int) -> str:
-        if self.dataset_id == "libero_object":
+        if self.dataset_id in {"libero_object", "libero_spatial"}:
             return raw_episode["libero_episode"].episode_id
         if self.dataset_id == "bc_z":
             return bcz_episode_id(raw_episode, raw_episode_index, split=self.source_split)
@@ -269,7 +269,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
         return f"{self.source_split}_{raw_episode_index:06d}"
 
     def _convert_episode(self, raw_episode_index: int, episode_id: str, steps: list[Any]) -> Any:
-        if self.dataset_id == "libero_object":
+        if self.dataset_id in {"libero_object", "libero_spatial"}:
             # The HDF5 reader has already converted this demonstration.
             return self._current_libero_episode
         if self.dataset_id == "bc_z":
@@ -318,13 +318,14 @@ class LazyStandardizedDataset(TorchIterableDataset):
         raise KeyError(f"Unknown dataset_id: {self.dataset_id}")
 
     def _sample_from_episode(self, episode: Any, step_index: int) -> dict[str, Any]:
-        if self.dataset_id == "libero_object":
+        if self.dataset_id in {"libero_object", "libero_spatial"}:
             sample = libero_sample_from_episode(
                 episode,
                 step_index,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
             )
+            sample["dataset_id"] = self.dataset_id
             return add_image_history(sample, episode, step_index)
         if self.dataset_id == "bc_z":
             sample = bcz_sample_from_episode(
@@ -893,6 +894,10 @@ def _mock_layout_configs(mock_root: Path) -> dict[str, LazyStandardizedDatasetCo
             dataset_id="libero_object",
             data_dir=mock_root / "libero_object" / "data",
         ),
+        "libero_spatial": LazyStandardizedDatasetConfig(
+            dataset_id="libero_spatial",
+            data_dir=mock_root / "libero_spatial" / "data",
+        ),
         "bc_z": LazyStandardizedDatasetConfig(
             dataset_id="bc_z",
             data_dir=mock_root / "bc_z_dataset" / "data",
@@ -940,6 +945,10 @@ def _hf_layout_configs(root: Path) -> dict[str, LazyStandardizedDatasetConfig]:
         "libero_object": LazyStandardizedDatasetConfig(
             dataset_id="libero_object",
             data_dir=root / "libero_object" / "data",
+        ),
+        "libero_spatial": LazyStandardizedDatasetConfig(
+            dataset_id="libero_spatial",
+            data_dir=root / "libero_spatial" / "data",
         ),
         "bc_z": LazyStandardizedDatasetConfig(
             dataset_id="bc_z",

@@ -16,9 +16,10 @@ from thinkflow_rdt.adapters.libero import iter_libero_episodes
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate LIBERO Object HDF5 and compute RDT action statistics.")
+    parser = argparse.ArgumentParser(description="Validate LIBERO HDF5 and compute RDT action statistics.")
+    parser.add_argument("--dataset-id", default="libero_spatial")
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True, help="Usually <root>/libero_object/audit.json")
+    parser.add_argument("--output", type=Path, required=True, help="Usually <root>/<dataset-id>/audit.json")
     parser.add_argument("--max-episodes", type=int)
     args = parser.parse_args()
 
@@ -34,7 +35,7 @@ def main() -> None:
         raise RuntimeError("No LIBERO demonstrations were found")
     stats = compute_action_quantile_stats(np.concatenate(parts, axis=0))
     payload = {
-        "dataset_id": "libero_object",
+        "dataset_id": args.dataset_id,
         "episodes": episodes,
         "steps": steps,
         "conventions": {
@@ -43,7 +44,7 @@ def main() -> None:
             "gripper_open": 0,
             "gripper_closed": 1,
         },
-        "action_normalization": stats.to_audit_block(source={"dataset_id": "libero_object", "steps": steps}),
+        "action_normalization": stats.to_audit_block(source={"dataset_id": args.dataset_id, "steps": steps}),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

@@ -26,18 +26,30 @@ from transformers import (
     AutoProcessor,
     SiglipImageProcessor,
     SiglipVisionModel,
+    T5EncoderModel,
+    T5Tokenizer,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 LIBERO_ROOT_DEFAULT = Path("/home/ubuntu/LIBERO")
+LIBERO_BENCHMARK_CHOICES = (
+    "libero_spatial",
+    "libero_object",
+    "libero_goal",
+    "libero_10",
+    "libero_90",
+)
+LIBERO_DEFAULT_BENCHMARK = "libero_spatial"
 for path in (SRC_ROOT, REPO_ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
 from precompute_all_features import (  # noqa: E402
+    extract_t5_features,
     extract_qwen_kv,
     extract_siglip_features,
+    resolve_model_id,
     standardized_collate_fn,
 )
 from thinkflow_rdt.adapters.action_stats import load_action_stats  # noqa: E402
@@ -96,50 +108,59 @@ def free_model(model: Any) -> None:
         torch.cuda.empty_cache()
 
 
-def load_cached_language_features(
-    task_name: str,
+def load_t5_encoder(
     *,
-    cache_root: Path,
+    model_id: str,
+    fallback_model_id: str | None,
+    precision: str,
+    device_map: str,
     cfg: Any,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    for split in ("train", "validation", "test"):
-        manifest = cache_root / split / "manifest.jsonl"
-        if not manifest.exists():
-            continue
-        with manifest.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                item = json.loads(line)
-                if isinstance(item, dict) and task_name not in str(item.get("episode_id", "")):
-                    continue
-                record_path = Path(item["path"] if isinstance(item, dict) else item)
-                if not record_path.is_absolute():
-                    record_path = manifest.parent / record_path
-                record = torch.load(record_path, map_location="cpu", weights_only=True)
-                if not isinstance(item, dict) and task_name not in str(record.get("episode_id", "")):
-                    continue
-                tokens = torch.as_tensor(record["lang_tokens"], dtype=torch.bfloat16)
-                source_mask = torch.as_tensor(record.get("lang_mask", torch.ones(len(tokens))), dtype=torch.bool)
-                output = torch.zeros(
-                    1,
-                    cfg.model.max_lang_tokens,
-                    cfg.model.lang_token_dim,
-                    dtype=torch.bfloat16,
-                )
-                mask = torch.zeros(1, cfg.model.max_lang_tokens, dtype=torch.bool)
-                valid = min(len(tokens), cfg.model.max_lang_tokens)
-                output[0, :valid] = tokens[:valid]
-                mask[0, :valid] = source_mask[:valid]
-                print(f"Loaded cached T5 features from {record_path}")
-                return output, mask
-    raise FileNotFoundError(
-        f"No cached language features for task {task_name!r} below {cache_root}"
-    )
+) -> tuple[T5Tokenizer, T5EncoderModel]:
+    resolved_model_id = resolve_model_id(model_id, fallback_model_id)
+    tokenizer = T5Tokenizer.from_pretrained(resolved_model_id)
+    if precision == "8bit":
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise ImportError(
+                "--t5-precision 8bit requires transformers BitsAndBytesConfig "
+                "and a bitsandbytes-capable environment."
+            ) from exc
+        encoder = T5EncoderModel.from_pretrained(
+            resolved_model_id,
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+            device_map=device_map,
+        )
+    elif precision == "bf16":
+        encoder = T5EncoderModel.from_pretrained(
+            resolved_model_id,
+            torch_dtype=torch.bfloat16,
+            device_map=device_map,
+        )
+    else:
+        raise ValueError("--t5-precision must be 'bf16' or '8bit'")
+    encoder.eval()
+    encoder.requires_grad_(False)
+    if getattr(encoder.config, "d_model", cfg.model.lang_token_dim) != cfg.model.lang_token_dim:
+        raise ValueError(
+            f"T5 d_model {encoder.config.d_model} != "
+            f"cfg.model.lang_token_dim {cfg.model.lang_token_dim}"
+        )
+    return tokenizer, encoder
+
+
+def t5_device_from_encoder(encoder: Any, fallback: torch.device) -> torch.device:
+    try:
+        return next(encoder.parameters()).device
+    except StopIteration:
+        return fallback
 
 
 def rollout_sample(
     observation: dict[str, Any],
     previous_observation: dict[str, Any] | None,
     *,
+    dataset_id: str,
     instruction: str,
     horizon: int,
 ) -> dict[str, Any]:
@@ -170,7 +191,7 @@ def rollout_sample(
         "secondary": 0,
     }
     return {
-        "dataset_id": "libero_object",
+        "dataset_id": dataset_id,
         "episode_id": "rollout",
         "step_idx": "0",
         "instruction": instruction,
@@ -196,11 +217,12 @@ def frame_for_video(frame: np.ndarray, text: str) -> np.ndarray:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Roll out a trained RDT artifact in LIBERO Object and record MP4.")
+    parser = argparse.ArgumentParser(description="Roll out a trained RDT artifact in LIBERO and record MP4.")
     parser.add_argument("--config", default="configs/b0_rdt1b_lora.yaml")
-    parser.add_argument("--checkpoint", type=Path, default=Path("outputs/libero_object_full/checkpoint-1000"))
-    parser.add_argument("--cache-root", type=Path, default=Path("cache_features/libero_object/full"))
-    parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Object/datasets/libero_object/audit.json"))
+    parser.add_argument("--benchmark", choices=LIBERO_BENCHMARK_CHOICES, default=LIBERO_DEFAULT_BENCHMARK)
+    parser.add_argument("--checkpoint", type=Path, default=Path("outputs/libero_spatial_full/checkpoint-1600"))
+    parser.add_argument("--cache-root", type=Path, default=Path("cache_features/libero_spatial/full"))
+    parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Spatial/datasets/libero_spatial/audit.json"))
     parser.add_argument("--libero-root", type=Path, default=LIBERO_ROOT_DEFAULT)
     parser.add_argument("--task-id", type=int, default=0, choices=range(10))
     parser.add_argument("--init-state-index", type=int, default=0)
@@ -211,7 +233,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--demo-name", default="demo_0")
     parser.add_argument("--max-steps", type=int, default=600)
-    parser.add_argument("--action-chunk", type=int, default=8)
+    parser.add_argument(
+        "--action-chunk",
+        type=int,
+        default=8,
+        help=(
+            "Number of sampled actions to execute before observing again and "
+            "re-planning. The model still predicts cfg.model.pred_horizon actions."
+        ),
+    )
     parser.add_argument("--qwen-refresh-every", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fps", type=int, default=20)
@@ -221,9 +251,31 @@ def parse_args() -> argparse.Namespace:
         default=512,
         help="True simulator render resolution for the MP4; policy observations remain 128x128.",
     )
-    parser.add_argument("--output", type=Path, default=Path("outputs/libero_object_rollout/task0_checkpoint1000.mp4"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/libero_spatial_rollout/task0_checkpoint1600.mp4"))
     parser.add_argument("--device-map", default="cuda")
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--t5-model-id",
+        default=None,
+        help="Override T5 XXL model path/id. Defaults to cache metadata, then local RDT model root, then google/t5-v1_1-xxl.",
+    )
+    parser.add_argument("--t5-fallback-model-id", default="google/t5-v1_1-xxl")
+    parser.add_argument("--t5-precision", choices=["bf16", "8bit"], default="bf16")
+    parser.add_argument(
+        "--qwen-model-id",
+        default=None,
+        help="Override Qwen model path/id. Defaults to cache metadata, then shreethar/stage1_unsloth.",
+    )
+    parser.add_argument(
+        "--qwen-processor-id",
+        default=None,
+        help="Override Qwen processor path/id. Defaults to --qwen-model-id.",
+    )
+    parser.add_argument(
+        "--siglip-model-id",
+        default=None,
+        help="Override SigLIP model path/id. Defaults to cache metadata, then google/siglip-so400m-patch14-384.",
+    )
     return parser.parse_args()
 
 
@@ -239,22 +291,35 @@ def main() -> None:
         raise RuntimeError("CUDA is required for RDT rollout")
     device = torch.device("cuda")
     cfg = load_config(args.config)
+    if args.action_chunk <= 0:
+        raise ValueError("--action-chunk must be positive")
+    if args.action_chunk > cfg.model.pred_horizon:
+        raise ValueError(
+            f"--action-chunk ({args.action_chunk}) cannot exceed "
+            f"cfg.model.pred_horizon ({cfg.model.pred_horizon})"
+        )
     stats = load_action_stats(args.action_stats)
     metadata = load_feature_metadata(args.cache_root)
-    qwen_id = metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
-    qwen_processor_id = metadata.get("qwen_processor_id", qwen_id)
-    siglip_id = metadata.get("siglip_model_id", "google/siglip-so400m-patch14-384")
-
-    benchmark = get_benchmark("libero_object")(0)
-    task = benchmark.get_task(args.task_id)
-    instruction = task.language
-    lang_tokens, lang_mask = load_cached_language_features(
-        task.name,
-        cache_root=args.cache_root,
-        cfg=cfg,
+    qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
+    qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
+    siglip_id = args.siglip_model_id or metadata.get("siglip_model_id", "google/siglip-so400m-patch14-384")
+    t5_id = (
+        args.t5_model_id
+        or metadata.get("t5_model_id")
+        or "/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v1_1-xxl"
     )
 
-    print("Loading Qwen and SigLIP encoders...")
+    benchmark = get_benchmark(args.benchmark)(0)
+    task = benchmark.get_task(args.task_id)
+    instruction = task.language
+    print("Loading T5, Qwen, and SigLIP encoders...")
+    t5_tokenizer, t5 = load_t5_encoder(
+        model_id=t5_id,
+        fallback_model_id=args.t5_fallback_model_id,
+        precision=args.t5_precision,
+        device_map=args.device_map,
+        cfg=cfg,
+    )
     qwen_processor = AutoProcessor.from_pretrained(qwen_processor_id)
     qwen_processor.tokenizer.padding_side = "left"
     qwen = AutoModelForImageTextToText.from_pretrained(
@@ -269,6 +334,14 @@ def main() -> None:
         torch_dtype=torch.bfloat16,
         device_map=args.device_map,
     ).eval()
+    lang_tokens, lang_mask = extract_t5_features(
+        {"instructions": [instruction]},
+        t5_tokenizer,
+        t5,
+        max_lang_tokens=cfg.model.max_lang_tokens,
+        expected_dim=cfg.model.lang_token_dim,
+        device=t5_device_from_encoder(t5, device),
+    )
 
     print(f"Loading RDT artifact {args.checkpoint}...")
     model = SFTConditionedRDT(cfg, load_pretrained=True)
@@ -320,6 +393,7 @@ def main() -> None:
             sample = rollout_sample(
                 observation,
                 previous_observation,
+                dataset_id=args.benchmark,
                 instruction=instruction,
                 horizon=cfg.model.pred_horizon,
             )
@@ -397,6 +471,7 @@ def main() -> None:
         env.close()
 
     summary = {
+        "benchmark": args.benchmark,
         "task_id": args.task_id,
         "instruction": instruction,
         "checkpoint": str(args.checkpoint.resolve()),
