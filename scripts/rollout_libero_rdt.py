@@ -64,7 +64,12 @@ from thinkflow_rdt.model import SFTConditionedRDT  # noqa: E402
 
 def install_robosuite_mujoco_compatibility() -> None:
     """Adapt robosuite 1.4's sole old-style MuJoCo mass-matrix call."""
-    from robosuite.controllers.base_controller import Controller
+    try:
+        from robosuite.controllers.base_controller import Controller
+    except ModuleNotFoundError:
+        # Newer robosuite releases moved/removed this old controller module.
+        # In that case the legacy mj_fullM patch is not applicable.
+        return
 
     def update(controller, force: bool = False) -> None:
         if not (controller.new_update or force):
