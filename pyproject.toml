@@ -26,6 +26,10 @@ dependencies = [
   "tqdm>=4.66",
   "transformers>=4.44",
   "matplotlib>=3.7.0",
+  "imageio>=2.34",
+  "imageio-ffmpeg>=0.5",
+  "opencv-python-headless>=4.9",
+  "h5py>=3.10",
   "wandb>=0.17",
   "protobuf>=5.26.0",
 ]
