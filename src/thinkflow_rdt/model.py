@@ -509,9 +509,9 @@ class SFTConditionedRDT(nn.Module):
         unified_values = values.new_zeros(*values.shape[:-1], self.rdt_state_dim)
         unified_masks = raw_mask.new_zeros(*raw_mask.shape[:-1], self.rdt_state_dim)
 
-        # Cache state convention: absolute xyz, three orientation coordinates,
-        # and binary gripper_closed. Native RDT state convention uses absolute
-        # xyz, ortho6d rotation, and gripper_open.
+        # Collators flip cached gripper_closed values into RDT's native
+        # gripper_open convention before tensors reach the model. Keep dim 6 as
+        # gripper_open here; do not flip it again.
         unified_values[..., 30:33] = values[..., :3] * raw_mask[..., :3]
         unified_masks[..., 30:33] = raw_mask[..., :3]
 
@@ -523,7 +523,7 @@ class SFTConditionedRDT(nn.Module):
         unified_masks[..., 33:39] = rotation_valid.expand_as(rotation)
 
         gripper_valid = raw_mask[..., 6]
-        unified_values[..., 10] = (1.0 - values[..., 6]) * gripper_valid
+        unified_values[..., 10] = values[..., 6] * gripper_valid
         unified_masks[..., 10] = gripper_valid
         return torch.cat([unified_values, unified_masks], dim=-1)
 

@@ -526,6 +526,22 @@ class RDTBatchCollator:
             )
         return qwen_kv
 
+    def _convert_cached_gripper_to_rdt_open(
+        self,
+        state: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # IMPORTANT: cached shards keep the project/data convention in dim 6:
+        # gripper_closed, where 1=closed and 0=open. The pretrained RDT action
+        # model uses the opposite binary convention in dim 6: gripper_open,
+        # where 0=closed and 1=open. Flip at load/collate time so old caches
+        # remain usable while all model inputs and targets match RDT.
+        state = state.clone()
+        actions = actions.clone()
+        state[..., 6] = 1.0 - state[..., 6]
+        actions[..., 6] = 1.0 - actions[..., 6]
+        return state, actions
+
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         batch: dict[str, list[torch.Tensor]] = {
             "qwen_kv": [],
@@ -568,6 +584,9 @@ class RDTBatchCollator:
 
             actions, action_time_mask = self._pad_actions(
                 sample["actions"], sample.get("action_time_mask")
+            )
+            state, actions = self._convert_cached_gripper_to_rdt_open(
+                state, actions
             )
             action_dim_mask = torch.as_tensor(
                 sample.get("action_dim_mask", torch.ones(self.action_dim)),
@@ -654,6 +673,9 @@ class RDTOnlineSiglipBatchCollator:
 
             actions, action_time_mask = self._base._pad_actions(
                 sample["actions"], sample.get("action_time_mask")
+            )
+            state, actions = self._base._convert_cached_gripper_to_rdt_open(
+                state, actions
             )
             action_dim_mask = torch.as_tensor(
                 sample.get("action_dim_mask", torch.ones(self.action_dim)),

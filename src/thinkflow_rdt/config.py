@@ -39,9 +39,10 @@ class ModelConfig:
     rdt_state_dim: int | None = None
     freeze_state_adaptor: bool = False
     freeze_condition_adaptors: bool = False
-    # ``rdt_eef`` converts cached [xyz, Euler/axis-angle xyz, gripper_closed]
+    # Cached shards store [xyz, Euler/axis-angle xyz, gripper_closed], but the
+    # collators flip dim 6 to RDT's native gripper_open convention at load time.
+    # ``rdt_eef`` then maps loaded [xyz, Euler/axis-angle xyz, gripper_open]
     # observations to RDT's native [xyz, ortho6d, gripper_open] state slots.
-    # Delta actions retain their raw 7-D cache space and use a separate adaptor.
     state_encoder_layout: str = "raw"
     # ``raw`` keeps cached 7-D actions in the existing project convention.
     # ``rdt_eef`` treats action targets as absolute target states and encodes
