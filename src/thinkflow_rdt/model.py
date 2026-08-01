@@ -305,10 +305,10 @@ class SFTConditionedRDT(nn.Module):
         projector_width = cfg.model.hidden_size
         if cfg.model.qwen_fusion == "self_attention_kv":
             projector_width *= 2
-        self.qwen_adaptor = nn.Linear(
-            cfg.model.qwen_kv_dim,
-            projector_width,
-            dtype=dtype,
+        self.qwen_adaptor = nn.Sequential(
+            nn.Linear(cfg.model.qwen_kv_dim, projector_width, dtype=dtype),
+            nn.GELU(),
+            nn.Linear(projector_width, projector_width, dtype=dtype),
         )
         self.unified_cross_extra_pos_embed = nn.Parameter(
             torch.zeros(1, 2, cfg.model.hidden_size, dtype=dtype)
