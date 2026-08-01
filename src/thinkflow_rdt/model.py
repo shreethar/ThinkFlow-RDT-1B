@@ -694,6 +694,24 @@ class SFTConditionedRDT(nn.Module):
             ((prediction - target).abs() * valid).sum(dim=(1, 2))
             / sample_denominator
         )
+        squared_error = (prediction - target).pow(2) * valid
+
+        def component_loss_sum(start: int, stop: int) -> tuple[torch.Tensor, torch.Tensor]:
+            component_valid = valid[..., start:stop]
+            component_count = component_valid.sum(dim=(1, 2))
+            component_is_valid = (component_count > 0).to(prediction.dtype)
+            component_loss = (
+                squared_error[..., start:stop].sum(dim=(1, 2))
+                / component_count.clamp_min(1.0)
+            )
+            return (
+                (component_loss * component_is_valid).sum(),
+                component_is_valid.sum(),
+            )
+
+        xyz_loss_sum, xyz_valid_count = component_loss_sum(0, 3)
+        rot_loss_sum, rot_valid_count = component_loss_sum(3, 6)
+        gripper_loss_sum, gripper_valid_count = component_loss_sum(6, 7)
         # The objective is the mean per-example denoising loss. This makes
         # microbatch accumulation exactly equivalent to a batch of the same
         # number of examples even when valid horizon lengths differ.
@@ -708,6 +726,12 @@ class SFTConditionedRDT(nn.Module):
             "loss_sum": loss_sum.detach(),
             "mae_sum": mae_sum.detach(),
             "valid_count": valid_count.detach(),
+            "xyz_loss_sum": xyz_loss_sum.detach(),
+            "xyz_valid_count": xyz_valid_count.detach(),
+            "rot_loss_sum": rot_loss_sum.detach(),
+            "rot_valid_count": rot_valid_count.detach(),
+            "gripper_loss_sum": gripper_loss_sum.detach(),
+            "gripper_valid_count": gripper_valid_count.detach(),
         }
 
     @torch.no_grad()

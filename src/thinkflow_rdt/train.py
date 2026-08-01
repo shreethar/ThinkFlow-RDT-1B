@@ -475,6 +475,12 @@ def validate(
     loss_sum = torch.zeros((), device=accelerator.device, dtype=torch.float64)
     mae_sum = torch.zeros_like(loss_sum)
     valid_count = torch.zeros_like(loss_sum)
+    xyz_loss_sum = torch.zeros_like(loss_sum)
+    xyz_valid_count = torch.zeros_like(loss_sum)
+    rot_loss_sum = torch.zeros_like(loss_sum)
+    rot_valid_count = torch.zeros_like(loss_sum)
+    gripper_loss_sum = torch.zeros_like(loss_sum)
+    gripper_valid_count = torch.zeros_like(loss_sum)
     sample_error_sum = torch.zeros_like(loss_sum)
     sample_valid_count = torch.zeros_like(loss_sum)
     devices = (
@@ -516,6 +522,24 @@ def validate(
             valid_count += accelerator.reduce(
                 metrics["valid_count"].double(), reduction="sum"
             )
+            xyz_loss_sum += accelerator.reduce(
+                metrics["xyz_loss_sum"].double(), reduction="sum"
+            )
+            xyz_valid_count += accelerator.reduce(
+                metrics["xyz_valid_count"].double(), reduction="sum"
+            )
+            rot_loss_sum += accelerator.reduce(
+                metrics["rot_loss_sum"].double(), reduction="sum"
+            )
+            rot_valid_count += accelerator.reduce(
+                metrics["rot_valid_count"].double(), reduction="sum"
+            )
+            gripper_loss_sum += accelerator.reduce(
+                metrics["gripper_loss_sum"].double(), reduction="sum"
+            )
+            gripper_valid_count += accelerator.reduce(
+                metrics["gripper_valid_count"].double(), reduction="sum"
+            )
             if index < cfg.training.sample_validation_batches:
                 # Route sampling through DDP/FSDP so parameter-gathering hooks
                 # run just as they do for the training forward.
@@ -553,6 +577,21 @@ def validate(
         "val/loss": (
             float((loss_sum / loss_denominator).cpu())
             if valid_count.item() > 0
+            else math.nan
+        ),
+        "val/loss_xyz": (
+            float((xyz_loss_sum / xyz_valid_count.clamp_min(1.0)).cpu())
+            if xyz_valid_count.item() > 0
+            else math.nan
+        ),
+        "val/loss_rot": (
+            float((rot_loss_sum / rot_valid_count.clamp_min(1.0)).cpu())
+            if rot_valid_count.item() > 0
+            else math.nan
+        ),
+        "val/loss_gripper": (
+            float((gripper_loss_sum / gripper_valid_count.clamp_min(1.0)).cpu())
+            if gripper_valid_count.item() > 0
             else math.nan
         ),
         "val/target_mae": (
@@ -707,10 +746,19 @@ def train(
     global_step = 0
     running_loss = 0.0
     running_mae = 0.0
+    running_xyz_loss = 0.0
+    running_rot_loss = 0.0
+    running_gripper_loss = 0.0
     running_step_time = 0.0
     running_steps = 0
     pending_loss = 0.0
     pending_mae = 0.0
+    pending_xyz_loss_sum = 0.0
+    pending_xyz_valid_count = 0.0
+    pending_rot_loss_sum = 0.0
+    pending_rot_valid_count = 0.0
+    pending_gripper_loss_sum = 0.0
+    pending_gripper_valid_count = 0.0
     pending_microbatches = 0
     update_started_at = time.perf_counter()
     epoch = 0
@@ -748,12 +796,28 @@ def train(
 
             pending_loss += float(loss.detach())
             pending_mae += float(metrics["train_target_mae"].detach())
+            pending_xyz_loss_sum += float(metrics["xyz_loss_sum"].detach())
+            pending_xyz_valid_count += float(metrics["xyz_valid_count"].detach())
+            pending_rot_loss_sum += float(metrics["rot_loss_sum"].detach())
+            pending_rot_valid_count += float(metrics["rot_valid_count"].detach())
+            pending_gripper_loss_sum += float(
+                metrics["gripper_loss_sum"].detach()
+            )
+            pending_gripper_valid_count += float(
+                metrics["gripper_valid_count"].detach()
+            )
             pending_microbatches += 1
             if not accelerator.sync_gradients:
                 continue
             if not optimizer_update_succeeded:
                 pending_loss = 0.0
                 pending_mae = 0.0
+                pending_xyz_loss_sum = 0.0
+                pending_xyz_valid_count = 0.0
+                pending_rot_loss_sum = 0.0
+                pending_rot_valid_count = 0.0
+                pending_gripper_loss_sum = 0.0
+                pending_gripper_valid_count = 0.0
                 pending_microbatches = 0
                 update_started_at = time.perf_counter()
                 continue
@@ -772,6 +836,10 @@ def train(
                 [
                     pending_loss / max(pending_microbatches, 1),
                     pending_mae / max(pending_microbatches, 1),
+                    pending_xyz_loss_sum / max(pending_xyz_valid_count, 1.0),
+                    pending_rot_loss_sum / max(pending_rot_valid_count, 1.0),
+                    pending_gripper_loss_sum
+                    / max(pending_gripper_valid_count, 1.0),
                 ],
                 device=accelerator.device,
                 dtype=torch.float64,
@@ -779,16 +847,29 @@ def train(
             step_metrics = accelerator.reduce(step_metrics, reduction="mean")
             running_loss += float(step_metrics[0].cpu())
             running_mae += float(step_metrics[1].cpu())
+            running_xyz_loss += float(step_metrics[2].cpu())
+            running_rot_loss += float(step_metrics[3].cpu())
+            running_gripper_loss += float(step_metrics[4].cpu())
             running_step_time += step_time
             running_steps += 1
             pending_loss = 0.0
             pending_mae = 0.0
+            pending_xyz_loss_sum = 0.0
+            pending_xyz_valid_count = 0.0
+            pending_rot_loss_sum = 0.0
+            pending_rot_valid_count = 0.0
+            pending_gripper_loss_sum = 0.0
+            pending_gripper_valid_count = 0.0
             pending_microbatches = 0
 
             if cfg.training.log_every > 0 and global_step % cfg.training.log_every == 0:
                 average_step_time = running_step_time / max(running_steps, 1)
                 log_data = {
                     "train/loss": running_loss / max(running_steps, 1),
+                    "train/loss_xyz": running_xyz_loss / max(running_steps, 1),
+                    "train/loss_rot": running_rot_loss / max(running_steps, 1),
+                    "train/loss_gripper": running_gripper_loss
+                    / max(running_steps, 1),
                     "train/target_mae": running_mae / max(running_steps, 1),
                     "train/step": global_step,
                     "train/effective_global_batch": effective_global_batch,
@@ -810,6 +891,9 @@ def train(
                     print(log_data)
                 running_loss = 0.0
                 running_mae = 0.0
+                running_xyz_loss = 0.0
+                running_rot_loss = 0.0
+                running_gripper_loss = 0.0
                 running_step_time = 0.0
                 running_steps = 0
 

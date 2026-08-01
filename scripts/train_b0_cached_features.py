@@ -200,6 +200,15 @@ def build_config(args: argparse.Namespace):
             optional_override(args.mixed_precision, cfg.training.mixed_precision)
         ),
         report_to=str(optional_override(args.report_to, cfg.training.report_to)),
+        global_batch_size=optional_override(
+            args.global_batch_size, cfg.training.global_batch_size
+        ),
+        wandb_project=str(
+            optional_override(args.wandb_project, cfg.training.wandb_project)
+        ),
+        wandb_run_name=optional_override(
+            args.wandb_run_name, cfg.training.wandb_run_name
+        ),
     )
     model_cfg = cfg.model
     if args.no_gradient_checkpointing:
@@ -302,6 +311,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
+    parser.add_argument(
+        "--global-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Effective global batch size. If set, accumulation is resolved as "
+            "global_batch_size / (micro_batch_size * world_size)."
+        ),
+    )
     parser.add_argument("--learning-rate-lora", type=float, default=None)
     parser.add_argument("--learning-rate-interfaces", type=float, default=None)
     parser.add_argument("--warmup-steps", type=int, default=None)
@@ -312,6 +330,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-validation-batches", type=int, default=None)
     parser.add_argument("--mixed-precision", default=None)
     parser.add_argument("--report-to", default=None)
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
