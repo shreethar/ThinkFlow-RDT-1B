@@ -26,7 +26,7 @@ model:
   state_encoder_layout: rdt_eef
   action_encoder_layout: rdt_eef
   freeze_state_adaptor: true
-  freeze_condition_adaptors: false
+  freeze_condition_adaptors: true
   copy_pretrained_final_fc1: true
   gradient_checkpointing: true
 
