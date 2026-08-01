@@ -52,7 +52,11 @@ from precompute_all_features import (  # noqa: E402
     resolve_model_id,
     standardized_collate_fn,
 )
-from thinkflow_rdt.adapters.action_stats import load_action_stats  # noqa: E402
+from thinkflow_rdt.adapters.action_stats import (  # noqa: E402
+    ACTION_DIM_NAMES,
+    denormalize_action_array,
+    load_action_stats,
+)
 from thinkflow_rdt.adapters.libero import (  # noqa: E402
     libero_observation_to_rdt,
     rdt_action_to_libero,
@@ -159,6 +163,19 @@ def t5_device_from_encoder(encoder: Any, fallback: torch.device) -> torch.device
         return next(encoder.parameters()).device
     except StopIteration:
         return fallback
+
+
+def array_to_nested_float_list(values: np.ndarray) -> list:
+    return np.asarray(values, dtype=np.float32).astype(float).tolist()
+
+
+def action_debug_stats(values: np.ndarray) -> dict[str, list[float]]:
+    action = np.asarray(values, dtype=np.float32)
+    return {
+        "min": action.min(axis=0).astype(float).tolist(),
+        "max": action.max(axis=0).astype(float).tolist(),
+        "mean": action.mean(axis=0).astype(float).tolist(),
+    }
 
 
 def rollout_sample(
@@ -281,6 +298,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override SigLIP model path/id. Defaults to cache metadata, then google/siglip-so400m-patch14-384.",
     )
+    parser.add_argument(
+        "--action-debug-jsonl",
+        type=Path,
+        help=(
+            "Write per-replan normalized, denormalized, and final LIBERO "
+            "actions to this JSONL file."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -304,6 +329,13 @@ def main() -> None:
             f"cfg.model.pred_horizon ({cfg.model.pred_horizon})"
         )
     stats = load_action_stats(args.action_stats)
+    print("Action denormalization stats:")
+    print(json.dumps({
+        "dim_names": ACTION_DIM_NAMES[: len(stats.q01)],
+        "q01": stats.q01.astype(float).tolist(),
+        "q99": stats.q99.astype(float).tolist(),
+        "eps": stats.eps,
+    }, indent=2))
     metadata = load_feature_metadata(args.cache_root)
     qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
     qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
@@ -393,6 +425,10 @@ def main() -> None:
     simulator_step = 0
     plan_index = 0
     start = time.perf_counter()
+    action_debug_handle = None
+    if args.action_debug_jsonl is not None:
+        args.action_debug_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        action_debug_handle = args.action_debug_jsonl.open("w", encoding="utf-8")
     try:
         while simulator_step < args.max_steps and not success:
             sample = rollout_sample(
@@ -444,11 +480,38 @@ def main() -> None:
             }
             torch.manual_seed(args.seed + plan_index)
             normalized = model.sample_actions(batch)[0].float().cpu().numpy()
+            denormalized = denormalize_action_array(normalized, stats)
             actions = rdt_action_to_libero(normalized, stats)
             if not np.isfinite(actions).all():
                 raise FloatingPointError("RDT produced NaN/Inf actions")
 
             chunk = min(args.action_chunk, args.max_steps - simulator_step)
+            if action_debug_handle is not None:
+                action_debug_handle.write(
+                    json.dumps(
+                        {
+                            "plan_index": plan_index,
+                            "simulator_step_start": simulator_step,
+                            "pred_horizon": int(cfg.model.pred_horizon),
+                            "executed_steps": int(chunk),
+                            "dim_names": ACTION_DIM_NAMES[: normalized.shape[-1]],
+                            "normalization": {
+                                "q01": stats.q01.astype(float).tolist(),
+                                "q99": stats.q99.astype(float).tolist(),
+                                "formula": "denormalized = (clip(normalized,-1,1)+1)*0.5*(q99-q01)+q01",
+                            },
+                            "normalized_stats": action_debug_stats(normalized),
+                            "denormalized_delta_stats": action_debug_stats(denormalized),
+                            "libero_action_stats": action_debug_stats(actions),
+                            "normalized_actions": array_to_nested_float_list(normalized),
+                            "denormalized_delta_actions": array_to_nested_float_list(denormalized),
+                            "libero_actions": array_to_nested_float_list(actions),
+                            "executed_libero_actions": array_to_nested_float_list(actions[:chunk]),
+                        }
+                    )
+                    + "\n"
+                )
+                action_debug_handle.flush()
             for action_index in range(chunk):
                 # Keep adjacent t-1/t frames for the next SigLIP history, matching
                 # the feature-precomputation contract even when actions are chunked.
@@ -472,6 +535,8 @@ def main() -> None:
                 flush=True,
             )
     finally:
+        if action_debug_handle is not None:
+            action_debug_handle.close()
         writer.close()
         env.close()
 
@@ -486,6 +551,8 @@ def main() -> None:
         "success": success,
         "video": str(args.output.resolve()),
     }
+    if args.action_debug_jsonl is not None:
+        summary["action_debug_jsonl"] = str(args.action_debug_jsonl.resolve())
     if args.demo_hdf5 is not None:
         summary["demo_hdf5"] = str(args.demo_hdf5.resolve())
         summary["demo_name"] = args.demo_name
