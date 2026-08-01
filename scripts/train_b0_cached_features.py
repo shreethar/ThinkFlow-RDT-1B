@@ -89,6 +89,22 @@ def manifests_from_cache_roots(
     return manifests
 
 
+def manifests_from_cache_parts_root(
+    parts_root: Path,
+    *,
+    parts: list[int],
+    split_name: str,
+) -> list[Path]:
+    root = parts_root.expanduser().resolve()
+    manifests: list[Path] = []
+    for part in parts:
+        manifest = root / f"part_{int(part)}" / split_name / "manifest.jsonl"
+        if not manifest.exists():
+            raise FileNotFoundError(manifest)
+        manifests.append(manifest)
+    return manifests
+
+
 def optional_override(value: object | None, current: object) -> object:
     return current if value is None else value
 
@@ -107,6 +123,22 @@ def build_config(args: argparse.Namespace):
         )
         val_manifests.extend(
             manifests_from_cache_roots(cache_roots, split_name=args.val_split)
+        )
+    if args.cache_parts_root:
+        parts = args.cache_parts or [1, 2, 3]
+        train_manifests.extend(
+            manifests_from_cache_parts_root(
+                args.cache_parts_root,
+                parts=parts,
+                split_name=args.train_split,
+            )
+        )
+        val_manifests.extend(
+            manifests_from_cache_parts_root(
+                args.cache_parts_root,
+                parts=parts,
+                split_name=args.val_split,
+            )
         )
     if not train_manifests:
         raise ValueError("Provide --cache-root or --train-manifest")
@@ -201,7 +233,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Train B0 RDT from precomputed sample-by-sample cached features. "
-            "Pass one or more cache roots such as cache_features/part_1."
+            "Pass one or more cache roots such as cache_features/part_1, or "
+            "use --cache-parts-root to train across part_1/part_2/part_3."
         )
     )
     parser.add_argument("--config", required=True)
@@ -211,6 +244,22 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         action="append",
         help="Cache root containing train/ and validation/ manifest.jsonl. Repeat for parts.",
+    )
+    parser.add_argument(
+        "--cache-parts-root",
+        type=Path,
+        help=(
+            "Directory containing part_1/, part_2/, part_3/ cache roots. "
+            "Defaults to all three parts unless --cache-parts is provided."
+        ),
+    )
+    parser.add_argument(
+        "--cache-parts",
+        type=int,
+        nargs="+",
+        choices=[1, 2, 3],
+        default=None,
+        help="Part numbers to use under --cache-parts-root. Default: 1 2 3.",
     )
     parser.add_argument(
         "--train-manifest",
