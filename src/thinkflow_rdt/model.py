@@ -131,6 +131,9 @@ def install_kv_aware_forward(
         lang_mask=None,
         img_mask=None,
         external_kv=None,
+        extra_cross_cond=None,
+        extra_cross_mask=None,
+        unified_cross_attention=False,
     ):
         t_embed = self.t_embedder(t).unsqueeze(1)
         freq_embed = self.freq_embedder(freq).unsqueeze(1)
@@ -140,8 +143,33 @@ def install_kv_aware_forward(
         x = x + self.x_pos_embed
         lang_c = lang_c + self.lang_cond_pos_embed[:, : lang_c.shape[1]]
         img_c = img_c + self.img_cond_pos_embed[:, : img_c.shape[1]]
-        conditions = (lang_c, img_c)
-        masks = (lang_mask, img_mask)
+        if unified_cross_attention:
+            condition_parts = [lang_c, img_c]
+            if lang_mask is None:
+                lang_mask = torch.ones(
+                    lang_c.shape[:2], dtype=torch.bool, device=lang_c.device
+                )
+            if img_mask is None:
+                img_mask = torch.ones(
+                    img_c.shape[:2], dtype=torch.bool, device=img_c.device
+                )
+            mask_parts = [lang_mask, img_mask]
+            if extra_cross_cond is not None:
+                condition_parts.append(extra_cross_cond)
+                if extra_cross_mask is None:
+                    extra_cross_mask = torch.ones(
+                        extra_cross_cond.shape[:2],
+                        dtype=torch.bool,
+                        device=extra_cross_cond.device,
+                    )
+                mask_parts.append(extra_cross_mask)
+            unified_condition = torch.cat(condition_parts, dim=1)
+            unified_mask = torch.cat(mask_parts, dim=1)
+            conditions = (unified_condition, unified_condition)
+            masks = (unified_mask, unified_mask)
+        else:
+            conditions = (lang_c, img_c)
+            masks = (lang_mask, img_mask)
         for index, block in enumerate(self.blocks):
             condition = conditions[index % 2]
             mask = masks[index % 2]
@@ -282,6 +310,9 @@ class SFTConditionedRDT(nn.Module):
             projector_width,
             dtype=dtype,
         )
+        self.unified_cross_extra_pos_embed = nn.Parameter(
+            torch.zeros(1, 2, cfg.model.hidden_size, dtype=dtype)
+        )
 
         runner_config = {
             "lang_adaptor": cfg.model.lang_adaptor,
@@ -373,6 +404,7 @@ class SFTConditionedRDT(nn.Module):
         if self.action_adaptor is not None:
             self.action_adaptor.requires_grad_(True)
         self.qwen_adaptor.requires_grad_(True)
+        self.unified_cross_extra_pos_embed.requires_grad_(True)
 
     @property
     def model_dtype(self) -> torch.dtype:
@@ -525,10 +557,13 @@ class SFTConditionedRDT(nn.Module):
     def _adapt_static_conditions(
         self,
         batch: dict[str, torch.Tensor],
+        state_cond: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
         torch.Tensor | None,
     ]:
         lang_cond = self.runner.lang_adaptor(batch["lang_tokens"])
@@ -536,6 +571,8 @@ class SFTConditionedRDT(nn.Module):
         lang_mask = batch["lang_mask"].bool()
         projected_qwen = self.qwen_adaptor(batch["qwen_kv"])
         external_kv: torch.Tensor | None = None
+        extra_cross_cond: torch.Tensor | None = None
+        extra_cross_mask: torch.Tensor | None = None
         if self.cfg.model.qwen_fusion == "language":
             lang_cond = torch.cat([projected_qwen, lang_cond], dim=1)
             qwen_mask = torch.ones(
@@ -544,9 +581,41 @@ class SFTConditionedRDT(nn.Module):
                 device=projected_qwen.device,
             )
             lang_mask = torch.cat([qwen_mask, lang_mask], dim=1)
-        else:
+        elif self.cfg.model.qwen_fusion == "self_attention_kv":
             external_kv = projected_qwen
-        return lang_cond, img_cond, lang_mask, external_kv
+        elif self.cfg.model.qwen_fusion == "unified_cross_attention":
+            extra_parts = []
+            extra_masks = []
+            extra_pos = self.unified_cross_extra_pos_embed
+            if state_cond is not None:
+                extra_parts.append(state_cond + extra_pos[:, 0:1])
+                extra_masks.append(
+                    torch.ones(
+                        state_cond.shape[:2],
+                        dtype=torch.bool,
+                        device=state_cond.device,
+                    )
+                )
+            extra_parts.append(projected_qwen + extra_pos[:, 1:2])
+            extra_masks.append(
+                torch.ones(
+                    projected_qwen.shape[:2],
+                    dtype=torch.bool,
+                    device=projected_qwen.device,
+                )
+            )
+            extra_cross_cond = torch.cat(extra_parts, dim=1)
+            extra_cross_mask = torch.cat(extra_masks, dim=1)
+        else:
+            raise ValueError(f"Unsupported qwen_fusion: {self.cfg.model.qwen_fusion}")
+        return (
+            lang_cond,
+            img_cond,
+            lang_mask,
+            external_kv,
+            extra_cross_cond,
+            extra_cross_mask,
+        )
 
     def compute_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         batch = self.cast_batch(batch)
@@ -579,8 +648,15 @@ class SFTConditionedRDT(nn.Module):
         action_cond = self._adapt_actions(noisy_actions, action_token_mask)
         state_action_cond = torch.cat([state_cond, action_cond], dim=1)
 
-        lang_cond, img_cond, lang_mask, external_kv = (
-            self._adapt_static_conditions(batch)
+        (
+            lang_cond,
+            img_cond,
+            lang_mask,
+            external_kv,
+            extra_cross_cond,
+            extra_cross_mask,
+        ) = (
+            self._adapt_static_conditions(batch, state_cond=state_cond)
         )
         prediction = self.runner.model(
             state_action_cond,
@@ -591,6 +667,11 @@ class SFTConditionedRDT(nn.Module):
             lang_mask=lang_mask,
             img_mask=batch["img_mask"].bool(),
             external_kv=external_kv,
+            extra_cross_cond=extra_cross_cond,
+            extra_cross_mask=extra_cross_mask,
+            unified_cross_attention=(
+                self.cfg.model.qwen_fusion == "unified_cross_attention"
+            ),
         )
         if self.runner.prediction_type == "sample":
             target = actions
@@ -636,8 +717,15 @@ class SFTConditionedRDT(nn.Module):
         dim_mask = batch["action_dim_mask"].to(states.dtype).unsqueeze(1)
         state_input = self._state_encoder_input(states, dim_mask)
         state_cond = self.runner.state_adaptor(state_input)
-        lang_cond, img_cond, lang_mask, external_kv = (
-            self._adapt_static_conditions(batch)
+        (
+            lang_cond,
+            img_cond,
+            lang_mask,
+            external_kv,
+            extra_cross_cond,
+            extra_cross_mask,
+        ) = (
+            self._adapt_static_conditions(batch, state_cond=state_cond)
         )
 
         noisy = torch.randn(
@@ -671,6 +759,11 @@ class SFTConditionedRDT(nn.Module):
                 lang_mask=lang_mask,
                 img_mask=batch["img_mask"].bool(),
                 external_kv=external_kv,
+                extra_cross_cond=extra_cross_cond,
+                extra_cross_mask=extra_cross_mask,
+                unified_cross_attention=(
+                    self.cfg.model.qwen_fusion == "unified_cross_attention"
+                ),
             )
             noisy = scheduler.step(output, timestep, noisy).prev_sample
             noisy = noisy.to(states.dtype) * expanded_dim_mask

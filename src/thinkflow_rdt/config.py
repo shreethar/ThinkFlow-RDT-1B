@@ -144,9 +144,14 @@ class ExperimentConfig:
             raise ValueError("pred_horizon must be positive")
         if self.model.finetune_mode not in {"lora", "full"}:
             raise ValueError("model.finetune_mode must be 'lora' or 'full'")
-        if self.model.qwen_fusion not in {"language", "self_attention_kv"}:
+        if self.model.qwen_fusion not in {
+            "language",
+            "self_attention_kv",
+            "unified_cross_attention",
+        }:
             raise ValueError(
-                "model.qwen_fusion must be 'language' or 'self_attention_kv'"
+                "model.qwen_fusion must be 'language', 'self_attention_kv', "
+                "or 'unified_cross_attention'"
             )
         if self.model.pretrained_copy_mode not in {"selected", "compatible"}:
             raise ValueError(

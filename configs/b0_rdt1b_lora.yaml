@@ -20,6 +20,13 @@ model:
   lang_adaptor: linear
   img_adaptor: linear
   state_adaptor: mlp3x_gelu
+  qwen_fusion: unified_cross_attention
+  pretrained_copy_mode: compatible
+  rdt_state_dim: 128
+  state_encoder_layout: rdt_eef
+  action_encoder_layout: rdt_eef
+  freeze_state_adaptor: true
+  freeze_condition_adaptors: false
   copy_pretrained_final_fc1: true
   gradient_checkpointing: true
 

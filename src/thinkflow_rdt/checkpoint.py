@@ -89,6 +89,10 @@ def _interface_state(
             state["action_adaptor"] = _component_state(
                 model_state_dict, "action_adaptor."
             )
+        if "unified_cross_extra_pos_embed" in model_state_dict:
+            state["unified_cross_extra_pos_embed"] = model_state_dict[
+                "unified_cross_extra_pos_embed"
+            ]
         return state
     state = {
         _FORMAT_KEY: artifact_format,
@@ -99,6 +103,10 @@ def _interface_state(
     }
     if getattr(model, "action_adaptor", None) is not None:
         state["action_adaptor"] = model.action_adaptor.state_dict()
+    if getattr(model, "unified_cross_extra_pos_embed", None) is not None:
+        state["unified_cross_extra_pos_embed"] = (
+            model.unified_cross_extra_pos_embed.detach().cpu()
+        )
     return state
 
 
@@ -136,6 +144,17 @@ def _load_interfaces(model, interfaces: dict[str, Any], *, trainable: bool) -> N
         module.load_state_dict(interfaces[name])
         if not trainable:
             module.requires_grad_(False)
+    if (
+        getattr(model, "unified_cross_extra_pos_embed", None) is not None
+        and "unified_cross_extra_pos_embed" in interfaces
+    ):
+        model.unified_cross_extra_pos_embed.data.copy_(
+            interfaces["unified_cross_extra_pos_embed"].to(
+                device=model.unified_cross_extra_pos_embed.device,
+                dtype=model.unified_cross_extra_pos_embed.dtype,
+            )
+        )
+        model.unified_cross_extra_pos_embed.requires_grad = trainable
 
 
 def save_trainable_artifact(
