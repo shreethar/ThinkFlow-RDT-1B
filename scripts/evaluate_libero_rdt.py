@@ -38,10 +38,12 @@ from precompute_all_features import (  # noqa: E402
 from rollout_libero_rdt import (  # noqa: E402
     LIBERO_BENCHMARK_CHOICES,
     LIBERO_DEFAULT_BENCHMARK,
+    absolute_target_state_to_libero_action,
     frame_for_video,
     install_robosuite_mujoco_compatibility,
     load_feature_metadata,
     load_t5_encoder,
+    rdt_state_open_from_libero,
     rollout_sample,
     t5_device_from_encoder,
 )
@@ -59,6 +61,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=Path("outputs/libero_spatial_full/checkpoint-1600"))
     parser.add_argument("--cache-root", type=Path, default=Path("cache_features/libero_spatial/full"))
     parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Spatial/datasets/libero_spatial/audit.json"))
+    parser.add_argument(
+        "--action-output-mode",
+        choices=["absolute_target_state", "normalized_delta"],
+        default="absolute_target_state",
+        help=(
+            "Use absolute_target_state for the current B0 target-state model. "
+            "Use normalized_delta only for older LIBERO delta-action checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--target-state-start-index",
+        type=int,
+        default=1,
+        help="First predicted target-state token to execute; 1 skips target[0] == current state.",
+    )
+    parser.add_argument(
+        "--max-delta-pos",
+        type=float,
+        default=0.05,
+        help="Clip absolute-target xyz deltas before sending them to LIBERO; set negative to disable.",
+    )
+    parser.add_argument(
+        "--max-delta-rot",
+        type=float,
+        default=0.25,
+        help="Clip absolute-target rpy deltas before sending them to LIBERO; set negative to disable.",
+    )
     parser.add_argument("--libero-root", type=Path, default=Path("/home/ubuntu/LIBERO"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/libero_spatial_evaluation/checkpoint-1600"))
     parser.add_argument("--episodes-per-task", type=int, default=20, help="LIBERO official default is 20; each task has 50 available.")
@@ -205,7 +234,11 @@ def main() -> None:
             f"--action-chunk ({args.action_chunk}) cannot exceed "
             f"cfg.model.pred_horizon ({cfg.model.pred_horizon})"
         )
-    stats = load_action_stats(args.action_stats)
+    if args.target_state_start_index < 0:
+        raise ValueError("--target-state-start-index must be non-negative")
+    max_delta_pos = None if args.max_delta_pos < 0 else args.max_delta_pos
+    max_delta_rot = None if args.max_delta_rot < 0 else args.max_delta_rot
+    stats = load_action_stats(args.action_stats) if args.action_output_mode == "normalized_delta" else None
     metadata = load_feature_metadata(args.cache_root)
     qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
     qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
@@ -373,9 +406,15 @@ def main() -> None:
                         "qwen_kv": qwen_kv,
                     }
                     torch.manual_seed(args.seed + task_id * 100_000 + batch_start * 1_000 + plan_index)
-                    normalized = model.sample_actions(policy_batch).float().cpu().numpy()
-                    predicted = rdt_action_to_libero(normalized, stats)
-                    if not np.isfinite(predicted).all():
+                    model_output = model.sample_actions(policy_batch).float().cpu().numpy()
+                    predicted = None
+                    if args.action_output_mode == "normalized_delta":
+                        assert stats is not None
+                        predicted = rdt_action_to_libero(model_output, stats)
+                        finite_actions = predicted
+                    else:
+                        finite_actions = model_output
+                    if not np.isfinite(finite_actions).all():
                         raise FloatingPointError("RDT produced NaN/Inf actions")
 
                     chunk = min(args.action_chunk, args.max_steps - simulator_step)
@@ -383,7 +422,21 @@ def main() -> None:
                         done_before_step = done.copy()
                         actions = np.zeros((len(indices), 7), dtype=np.float32)
                         for active_position, env_index in enumerate(active):
-                            actions[env_index] = predicted[active_position, action_offset]
+                            if args.action_output_mode == "absolute_target_state":
+                                target_index = min(
+                                    action_offset + args.target_state_start_index,
+                                    model_output.shape[1] - 1,
+                                )
+                                current_state = rdt_state_open_from_libero(observations[env_index])
+                                actions[env_index] = absolute_target_state_to_libero_action(
+                                    model_output[active_position, target_index],
+                                    current_state,
+                                    max_delta_pos=max_delta_pos,
+                                    max_delta_rot=max_delta_rot,
+                                )
+                            else:
+                                assert predicted is not None
+                                actions[env_index] = predicted[active_position, action_offset]
                             previous[env_index] = observations[env_index]
                         next_obs, _, step_done, _ = env.step(actions)
                         observations = list(next_obs)

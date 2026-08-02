@@ -178,6 +178,43 @@ def action_debug_stats(values: np.ndarray) -> dict[str, list[float]]:
     }
 
 
+def wrap_rpy_delta(delta: np.ndarray) -> np.ndarray:
+    return np.arctan2(np.sin(delta), np.cos(delta)).astype(np.float32)
+
+
+def rdt_state_open_from_libero(observation: dict[str, Any]) -> np.ndarray:
+    converted = libero_observation_to_rdt(observation)
+    state = converted["state"].copy()
+    # Live rollout bypasses the training collator. The cached data is
+    # gripper_closed, but the current RDT checkpoint expects dim 6 to be
+    # gripper_open because that is the pretrained RDT convention.
+    state[..., 6] = 1.0 - state[..., 6]
+    return state
+
+
+def absolute_target_state_to_libero_action(
+    target_state: np.ndarray,
+    current_state: np.ndarray,
+    *,
+    max_delta_pos: float | None,
+    max_delta_rot: float | None,
+) -> np.ndarray:
+    """Convert predicted absolute target state to LIBERO delta-controller action."""
+    target = np.asarray(target_state, dtype=np.float32)
+    current = np.asarray(current_state, dtype=np.float32)
+    action = np.zeros((7,), dtype=np.float32)
+    action[:3] = target[:3] - current[:3]
+    action[3:6] = wrap_rpy_delta(target[3:6] - current[3:6])
+    if max_delta_pos is not None:
+        action[:3] = np.clip(action[:3], -float(max_delta_pos), float(max_delta_pos))
+    if max_delta_rot is not None:
+        action[3:6] = np.clip(action[3:6], -float(max_delta_rot), float(max_delta_rot))
+    # LIBERO/robosuite gripper command is +1=open and -1=close. The model
+    # predicts RDT gripper_open in [0, 1], so threshold at 0.5.
+    action[6] = 1.0 if float(target[6]) >= 0.5 else -1.0
+    return action
+
+
 def rollout_sample(
     observation: dict[str, Any],
     previous_observation: dict[str, Any] | None,
@@ -187,6 +224,10 @@ def rollout_sample(
     horizon: int,
 ) -> dict[str, Any]:
     converted = libero_observation_to_rdt(observation)
+    state = converted["state"].copy()
+    # Match the current model input convention. Cached training examples are
+    # flipped in the collator; live rollout has to perform the same conversion.
+    state[..., 6] = 1.0 - state[..., 6]
     current = {
         "primary": Image.fromarray(converted["primary"]).convert("RGB"),
         "wrist": None if converted["wrist"] is None else Image.fromarray(converted["wrist"]).convert("RGB"),
@@ -221,7 +262,7 @@ def rollout_sample(
         "image_mask": current_mask,
         "image_history": [previous, current],
         "image_history_mask": [previous_mask, current_mask],
-        "state": converted["state"],
+        "state": state,
         "state_mask": np.ones(7, dtype=np.float32),
         "actions": np.zeros((horizon, 7), dtype=np.float32),
         "actions_mask": np.ones(horizon, dtype=np.float32),
@@ -245,6 +286,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=Path("outputs/libero_spatial_full/checkpoint-1600"))
     parser.add_argument("--cache-root", type=Path, default=Path("cache_features/libero_spatial/full"))
     parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Spatial/datasets/libero_spatial/audit.json"))
+    parser.add_argument(
+        "--action-output-mode",
+        choices=["absolute_target_state", "normalized_delta"],
+        default="absolute_target_state",
+        help=(
+            "Use absolute_target_state for the current B0 target-state model. "
+            "Use normalized_delta only for older LIBERO delta-action checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--target-state-start-index",
+        type=int,
+        default=1,
+        help=(
+            "First predicted target-state token to execute. Training target[0] "
+            "is the current state, so 1 avoids a deliberate no-op."
+        ),
+    )
+    parser.add_argument(
+        "--max-delta-pos",
+        type=float,
+        default=0.05,
+        help="Clip absolute-target xyz deltas before sending them to LIBERO; set negative to disable.",
+    )
+    parser.add_argument(
+        "--max-delta-rot",
+        type=float,
+        default=0.25,
+        help="Clip absolute-target rpy deltas before sending them to LIBERO; set negative to disable.",
+    )
     parser.add_argument("--libero-root", type=Path, default=LIBERO_ROOT_DEFAULT)
     parser.add_argument("--task-id", type=int, default=0, choices=range(10))
     parser.add_argument("--init-state-index", type=int, default=0)
@@ -302,8 +373,7 @@ def parse_args() -> argparse.Namespace:
         "--action-debug-jsonl",
         type=Path,
         help=(
-            "Write per-replan normalized, denormalized, and final LIBERO "
-            "actions to this JSONL file."
+            "Write per-replan model outputs and final LIBERO actions to this JSONL file."
         ),
     )
     return parser.parse_args()
@@ -328,14 +398,20 @@ def main() -> None:
             f"--action-chunk ({args.action_chunk}) cannot exceed "
             f"cfg.model.pred_horizon ({cfg.model.pred_horizon})"
         )
-    stats = load_action_stats(args.action_stats)
-    print("Action denormalization stats:")
-    print(json.dumps({
-        "dim_names": ACTION_DIM_NAMES[: len(stats.q01)],
-        "q01": stats.q01.astype(float).tolist(),
-        "q99": stats.q99.astype(float).tolist(),
-        "eps": stats.eps,
-    }, indent=2))
+    if args.target_state_start_index < 0:
+        raise ValueError("--target-state-start-index must be non-negative")
+    max_delta_pos = None if args.max_delta_pos < 0 else args.max_delta_pos
+    max_delta_rot = None if args.max_delta_rot < 0 else args.max_delta_rot
+    stats = None
+    if args.action_output_mode == "normalized_delta":
+        stats = load_action_stats(args.action_stats)
+        print("Action denormalization stats:")
+        print(json.dumps({
+            "dim_names": ACTION_DIM_NAMES[: len(stats.q01)],
+            "q01": stats.q01.astype(float).tolist(),
+            "q99": stats.q99.astype(float).tolist(),
+            "eps": stats.eps,
+        }, indent=2))
     metadata = load_feature_metadata(args.cache_root)
     qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
     qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
@@ -479,44 +555,78 @@ def main() -> None:
                 "qwen_kv": cached_qwen,
             }
             torch.manual_seed(args.seed + plan_index)
-            normalized = model.sample_actions(batch)[0].float().cpu().numpy()
-            denormalized = denormalize_action_array(normalized, stats)
-            actions = rdt_action_to_libero(normalized, stats)
+            model_output = model.sample_actions(batch)[0].float().cpu().numpy()
+            if args.action_output_mode == "normalized_delta":
+                assert stats is not None
+                denormalized = denormalize_action_array(model_output, stats)
+                actions = rdt_action_to_libero(model_output, stats)
+            else:
+                denormalized = None
+                plan_start_state = rdt_state_open_from_libero(observation)
+                actions = np.stack(
+                    [
+                        absolute_target_state_to_libero_action(
+                            model_output[min(index + args.target_state_start_index, len(model_output) - 1)],
+                            plan_start_state,
+                            max_delta_pos=max_delta_pos,
+                            max_delta_rot=max_delta_rot,
+                        )
+                        for index in range(len(model_output))
+                    ],
+                    axis=0,
+                )
             if not np.isfinite(actions).all():
                 raise FloatingPointError("RDT produced NaN/Inf actions")
 
             chunk = min(args.action_chunk, args.max_steps - simulator_step)
+            debug_row: dict[str, Any] | None = None
             if action_debug_handle is not None:
-                action_debug_handle.write(
-                    json.dumps(
-                        {
-                            "plan_index": plan_index,
-                            "simulator_step_start": simulator_step,
-                            "pred_horizon": int(cfg.model.pred_horizon),
-                            "executed_steps": int(chunk),
-                            "dim_names": ACTION_DIM_NAMES[: normalized.shape[-1]],
-                            "normalization": {
-                                "q01": stats.q01.astype(float).tolist(),
-                                "q99": stats.q99.astype(float).tolist(),
-                                "formula": "denormalized = (clip(normalized,-1,1)+1)*0.5*(q99-q01)+q01",
-                            },
-                            "normalized_stats": action_debug_stats(normalized),
-                            "denormalized_delta_stats": action_debug_stats(denormalized),
-                            "libero_action_stats": action_debug_stats(actions),
-                            "normalized_actions": array_to_nested_float_list(normalized),
-                            "denormalized_delta_actions": array_to_nested_float_list(denormalized),
-                            "libero_actions": array_to_nested_float_list(actions),
-                            "executed_libero_actions": array_to_nested_float_list(actions[:chunk]),
-                        }
-                    )
-                    + "\n"
-                )
-                action_debug_handle.flush()
+                debug_row = {
+                    "plan_index": plan_index,
+                    "simulator_step_start": simulator_step,
+                    "pred_horizon": int(cfg.model.pred_horizon),
+                    "executed_steps": int(chunk),
+                    "dim_names": ACTION_DIM_NAMES[: model_output.shape[-1]],
+                    "action_output_mode": args.action_output_mode,
+                    "model_output_stats": action_debug_stats(model_output),
+                    "model_outputs": array_to_nested_float_list(model_output),
+                    "planned_libero_action_stats": action_debug_stats(actions),
+                    "planned_libero_actions_at_replan_start": array_to_nested_float_list(actions),
+                }
+                if args.action_output_mode == "normalized_delta":
+                    assert stats is not None and denormalized is not None
+                    debug_row["normalization"] = {
+                        "q01": stats.q01.astype(float).tolist(),
+                        "q99": stats.q99.astype(float).tolist(),
+                        "formula": "denormalized = (clip(model_output,-1,1)+1)*0.5*(q99-q01)+q01",
+                    }
+                    debug_row["denormalized_delta_stats"] = action_debug_stats(denormalized)
+                    debug_row["denormalized_delta_actions"] = array_to_nested_float_list(denormalized)
+                else:
+                    debug_row["absolute_target_state_conversion"] = {
+                        "target_state_start_index": int(args.target_state_start_index),
+                        "max_delta_pos": max_delta_pos,
+                        "max_delta_rot": max_delta_rot,
+                        "gripper": "model dim 6 is gripper_open; LIBERO command is +1 open, -1 close",
+                    }
+            executed_actions: list[np.ndarray] = []
             for action_index in range(chunk):
+                if args.action_output_mode == "absolute_target_state":
+                    target_index = min(action_index + args.target_state_start_index, len(model_output) - 1)
+                    current_state = rdt_state_open_from_libero(observation)
+                    action = absolute_target_state_to_libero_action(
+                        model_output[target_index],
+                        current_state,
+                        max_delta_pos=max_delta_pos,
+                        max_delta_rot=max_delta_rot,
+                    )
+                else:
+                    action = actions[action_index]
+                executed_actions.append(action.copy())
                 # Keep adjacent t-1/t frames for the next SigLIP history, matching
                 # the feature-precomputation contract even when actions are chunked.
                 previous_observation = observation
-                observation, reward, done, _ = env.step(actions[action_index])
+                observation, reward, done, _ = env.step(action)
                 simulator_step += 1
                 success = bool(done) or bool(env.check_success())
                 label = f"task={args.task_id} step={simulator_step} plan={plan_index} success={int(success)}"
@@ -528,6 +638,10 @@ def main() -> None:
                 writer.append_data(frame_for_video(video_frame, label))
                 if success:
                     break
+            if action_debug_handle is not None and debug_row is not None:
+                debug_row["executed_libero_actions"] = array_to_nested_float_list(np.stack(executed_actions, axis=0))
+                action_debug_handle.write(json.dumps(debug_row) + "\n")
+                action_debug_handle.flush()
             plan_index += 1
             print(
                 f"plan={plan_index} simulator_step={simulator_step} "
