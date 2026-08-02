@@ -559,8 +559,20 @@ def validate(
                 per_sample_valid = (per_sample_count > 0).to(
                     prediction.dtype
                 )
+                diff = prediction - target
+                diff = torch.cat(
+                    [
+                        diff[..., :3],
+                        torch.atan2(
+                            torch.sin(diff[..., 3:6]),
+                            torch.cos(diff[..., 3:6]),
+                        ),
+                        diff[..., 6:],
+                    ],
+                    dim=-1,
+                )
                 error = (
-                    ((prediction - target).pow(2) * valid).sum(dim=(1, 2))
+                    (diff.pow(2) * valid).sum(dim=(1, 2))
                     / per_sample_count.clamp_min(1.0)
                 )
                 error = (error * per_sample_valid).sum()

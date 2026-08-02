@@ -685,15 +685,26 @@ class SFTConditionedRDT(nn.Module):
         sample_valid_count = valid.sum(dim=(1, 2))
         sample_is_valid = (sample_valid_count > 0).to(prediction.dtype)
         sample_denominator = sample_valid_count.clamp_min(1.0)
+        diff = prediction - target
+        # Rotation dims are Euler angles. Use shortest-angle error so equivalent
+        # poses near the -pi/pi boundary are not punished as large mistakes.
+        diff = torch.cat(
+            [
+                diff[..., :3],
+                torch.atan2(torch.sin(diff[..., 3:6]), torch.cos(diff[..., 3:6])),
+                diff[..., 6:],
+            ],
+            dim=-1,
+        )
         sample_imitation_loss = (
-            ((prediction - target).pow(2) * valid).sum(dim=(1, 2))
+            (diff.pow(2) * valid).sum(dim=(1, 2))
             / sample_denominator
         )
         sample_mae = (
-            ((prediction - target).abs() * valid).sum(dim=(1, 2))
+            (diff.abs() * valid).sum(dim=(1, 2))
             / sample_denominator
         )
-        squared_error = (prediction - target).pow(2) * valid
+        squared_error = diff.pow(2) * valid
 
         def component_loss_sum(start: int, stop: int) -> tuple[torch.Tensor, torch.Tensor]:
             component_valid = valid[..., start:stop]
@@ -713,8 +724,9 @@ class SFTConditionedRDT(nn.Module):
         gripper_loss_sum, gripper_valid_count = component_loss_sum(6, 7)
         # The optimization objective is imitation loss: masked MSE between the
         # predicted clean action/target-state chunk and the ground-truth chunk.
-        # Component losses below are diagnostics only and are not separately
-        # weighted into the gradient objective.
+        # XYZ/gripper use ordinary residuals; Euler rotation dims use wrapped
+        # shortest-angle residuals. Component losses are diagnostics only and
+        # are not separately weighted into the gradient objective.
         loss_sum = (sample_imitation_loss * sample_is_valid).sum()
         mae_sum = (sample_mae * sample_is_valid).sum()
         valid_count = sample_is_valid.sum()

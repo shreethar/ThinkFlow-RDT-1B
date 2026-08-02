@@ -113,13 +113,39 @@ def masked_component_mse(
     dim_mask: torch.Tensor,
     start: int,
     stop: int,
+    *,
+    wrap_angles: bool = False,
 ) -> float:
     valid = time_mask.unsqueeze(-1).to(prediction.dtype) * dim_mask.unsqueeze(1).to(
         prediction.dtype
     )
-    error = (prediction - target).pow(2) * valid
+    diff = prediction - target
+    if wrap_angles:
+        diff = torch.atan2(torch.sin(diff), torch.cos(diff))
+    error = diff.pow(2) * valid
     denom = valid[..., start:stop].sum().clamp_min(1.0)
     return float((error[..., start:stop].sum() / denom).detach().cpu())
+
+
+def masked_action_mse(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    time_mask: torch.Tensor,
+    dim_mask: torch.Tensor,
+) -> float:
+    valid = time_mask.unsqueeze(-1).to(prediction.dtype) * dim_mask.unsqueeze(1).to(
+        prediction.dtype
+    )
+    diff = prediction - target
+    diff = torch.cat(
+        [
+            diff[..., :3],
+            torch.atan2(torch.sin(diff[..., 3:6]), torch.cos(diff[..., 3:6])),
+            diff[..., 6:],
+        ],
+        dim=-1,
+    )
+    return float((diff.pow(2).mul(valid).sum() / valid.sum().clamp_min(1.0)).detach().cpu())
 
 
 def tensor_stats(name: str, tensor: torch.Tensor) -> dict[str, float | str]:
@@ -261,13 +287,11 @@ def main() -> None:
                 prediction = model.sample_actions(batch).float()
                 target = batch["actions"].to(prediction.dtype)
                 sample_metrics = {
-                    "sample_mse": masked_component_mse(
+                    "sample_mse": masked_action_mse(
                         prediction,
                         target,
                         batch["action_time_mask"],
                         batch["action_dim_mask"],
-                        0,
-                        cfg.model.action_dim,
                     ),
                     "sample_mse_xyz": masked_component_mse(
                         prediction,
@@ -278,6 +302,15 @@ def main() -> None:
                         3,
                     ),
                     "sample_mse_rot": masked_component_mse(
+                        prediction,
+                        target,
+                        batch["action_time_mask"],
+                        batch["action_dim_mask"],
+                        3,
+                        6,
+                        wrap_angles=True,
+                    ),
+                    "sample_mse_rot_raw": masked_component_mse(
                         prediction,
                         target,
                         batch["action_time_mask"],
