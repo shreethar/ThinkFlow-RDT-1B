@@ -673,20 +673,19 @@ class SFTConditionedRDT(nn.Module):
                 self.cfg.model.qwen_fusion == "unified_cross_attention"
             ),
         )
-        if self.runner.prediction_type == "sample":
-            target = actions
-        elif self.runner.prediction_type == "epsilon":
-            target = noise
-        else:
+        if self.runner.prediction_type != "sample":
             raise ValueError(
-                f"Unsupported prediction type: {self.runner.prediction_type}"
+                "This trainer optimizes imitation loss against clean action "
+                "targets, so noise_scheduler.prediction_type must be 'sample'. "
+                f"Got {self.runner.prediction_type!r}."
             )
+        target = actions
 
         valid = time_mask.unsqueeze(-1).to(prediction.dtype) * dim_mask
         sample_valid_count = valid.sum(dim=(1, 2))
         sample_is_valid = (sample_valid_count > 0).to(prediction.dtype)
         sample_denominator = sample_valid_count.clamp_min(1.0)
-        sample_loss = (
+        sample_imitation_loss = (
             ((prediction - target).pow(2) * valid).sum(dim=(1, 2))
             / sample_denominator
         )
@@ -712,14 +711,17 @@ class SFTConditionedRDT(nn.Module):
         xyz_loss_sum, xyz_valid_count = component_loss_sum(0, 3)
         rot_loss_sum, rot_valid_count = component_loss_sum(3, 6)
         gripper_loss_sum, gripper_valid_count = component_loss_sum(6, 7)
-        # The objective is the mean per-example denoising loss. This makes
-        # microbatch accumulation exactly equivalent to a batch of the same
-        # number of examples even when valid horizon lengths differ.
-        loss_sum = (sample_loss * sample_is_valid).sum()
+        # The optimization objective is imitation loss: masked MSE between the
+        # predicted clean action/target-state chunk and the ground-truth chunk.
+        # Component losses below are diagnostics only and are not separately
+        # weighted into the gradient objective.
+        loss_sum = (sample_imitation_loss * sample_is_valid).sum()
         mae_sum = (sample_mae * sample_is_valid).sum()
         valid_count = sample_is_valid.sum()
+        imitation_loss = loss_sum / valid_count.clamp_min(1.0)
         return {
-            "loss": loss_sum / valid_count.clamp_min(1.0),
+            "loss": imitation_loss,
+            "imitation_loss": imitation_loss.detach(),
             "train_target_mae": (
                 mae_sum / valid_count.clamp_min(1.0)
             ).detach(),

@@ -579,6 +579,11 @@ def validate(
             if valid_count.item() > 0
             else math.nan
         ),
+        "val/imitation_loss": (
+            float((loss_sum / loss_denominator).cpu())
+            if valid_count.item() > 0
+            else math.nan
+        ),
         "val/loss_xyz": (
             float((xyz_loss_sum / xyz_valid_count.clamp_min(1.0)).cpu())
             if xyz_valid_count.item() > 0
@@ -866,6 +871,7 @@ def train(
                 average_step_time = running_step_time / max(running_steps, 1)
                 log_data = {
                     "train/loss": running_loss / max(running_steps, 1),
+                    "train/imitation_loss": running_loss / max(running_steps, 1),
                     "train/loss_xyz": running_xyz_loss / max(running_steps, 1),
                     "train/loss_rot": running_rot_loss / max(running_steps, 1),
                     "train/loss_gripper": running_gripper_loss
