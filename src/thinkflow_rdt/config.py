@@ -30,6 +30,8 @@ class ModelConfig:
     # ``lora`` preserves the original lightweight fine-tuning path. ``full``
     # trains the complete RDT transformer while keeping selected encoders frozen.
     finetune_mode: str = "lora"
+    # ``none`` runs the base RDT language/image/state conditioning without any
+    # Qwen injection. This is useful for pretrained-only rollout baselines.
     # ``self_attention_kv`` projects the flattened Qwen K/V pair to one native
     # RDT K/V pair and appends it inside every RDT self-attention block.
     # ``language`` is retained for backward compatibility with older artifacts.
@@ -146,13 +148,14 @@ class ExperimentConfig:
         if self.model.finetune_mode not in {"lora", "full"}:
             raise ValueError("model.finetune_mode must be 'lora' or 'full'")
         if self.model.qwen_fusion not in {
+            "none",
             "language",
             "self_attention_kv",
             "unified_cross_attention",
         }:
             raise ValueError(
-                "model.qwen_fusion must be 'language', 'self_attention_kv', "
-                "or 'unified_cross_attention'"
+                "model.qwen_fusion must be 'none', 'language', "
+                "'self_attention_kv', or 'unified_cross_attention'"
             )
         if self.model.pretrained_copy_mode not in {"selected", "compatible"}:
             raise ValueError(

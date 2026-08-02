@@ -569,11 +569,13 @@ class SFTConditionedRDT(nn.Module):
         lang_cond = self.runner.lang_adaptor(batch["lang_tokens"])
         img_cond = self.runner.img_adaptor(batch["img_tokens"])
         lang_mask = batch["lang_mask"].bool()
-        projected_qwen = self.qwen_adaptor(batch["qwen_kv"])
         external_kv: torch.Tensor | None = None
         extra_cross_cond: torch.Tensor | None = None
         extra_cross_mask: torch.Tensor | None = None
-        if self.cfg.model.qwen_fusion == "language":
+        if self.cfg.model.qwen_fusion == "none":
+            pass
+        elif self.cfg.model.qwen_fusion == "language":
+            projected_qwen = self.qwen_adaptor(batch["qwen_kv"])
             lang_cond = torch.cat([projected_qwen, lang_cond], dim=1)
             qwen_mask = torch.ones(
                 projected_qwen.shape[:2],
@@ -582,8 +584,10 @@ class SFTConditionedRDT(nn.Module):
             )
             lang_mask = torch.cat([qwen_mask, lang_mask], dim=1)
         elif self.cfg.model.qwen_fusion == "self_attention_kv":
+            projected_qwen = self.qwen_adaptor(batch["qwen_kv"])
             external_kv = projected_qwen
         elif self.cfg.model.qwen_fusion == "unified_cross_attention":
+            projected_qwen = self.qwen_adaptor(batch["qwen_kv"])
             extra_parts = []
             extra_masks = []
             extra_pos = self.unified_cross_extra_pos_embed

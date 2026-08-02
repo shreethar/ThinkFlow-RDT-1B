@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -59,6 +60,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/b0_rdt1b_lora.yaml")
     parser.add_argument("--benchmark", choices=LIBERO_BENCHMARK_CHOICES, default=LIBERO_DEFAULT_BENCHMARK)
     parser.add_argument("--checkpoint", type=Path, default=Path("outputs/libero_spatial_full/checkpoint-1600"))
+    parser.add_argument(
+        "--pretrained-only",
+        action="store_true",
+        help=(
+            "Load only cfg.pretrained_model and skip the trainable checkpoint "
+            "artifact. Qwen fusion is disabled so no random Qwen adaptor is used."
+        ),
+    )
+    parser.add_argument(
+        "--disable-qwen-fusion",
+        action="store_true",
+        help="Disable Qwen fusion/extraction for rollout while still loading the checkpoint artifact.",
+    )
     parser.add_argument("--cache-root", type=Path, default=Path("cache_features/libero_spatial/full"))
     parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Spatial/datasets/libero_spatial/audit.json"))
     parser.add_argument(
@@ -227,6 +241,8 @@ def main() -> None:
 
     device = torch.device("cuda")
     cfg = load_config(args.config)
+    if args.pretrained_only or args.disable_qwen_fusion:
+        cfg = replace(cfg, model=replace(cfg.model, qwen_fusion="none"))
     if args.action_chunk <= 0:
         raise ValueError("--action-chunk must be positive")
     if args.action_chunk > cfg.model.pred_horizon:
@@ -250,7 +266,8 @@ def main() -> None:
     )
     benchmark = get_benchmark(args.benchmark)(0)
 
-    print("Loading T5, Qwen, and SigLIP encoders...")
+    use_qwen = cfg.model.qwen_fusion != "none"
+    print("Loading T5, SigLIP, and optional Qwen encoders...")
     t5_tokenizer, t5 = load_t5_encoder(
         model_id=t5_id,
         fallback_model_id=args.t5_fallback_model_id,
@@ -258,14 +275,17 @@ def main() -> None:
         device_map=args.device_map,
         cfg=cfg,
     )
-    qwen_processor = AutoProcessor.from_pretrained(qwen_processor_id)
-    qwen_processor.tokenizer.padding_side = "left"
-    qwen = AutoModelForImageTextToText.from_pretrained(
-        qwen_id,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device_map,
-        attn_implementation="sdpa",
-    ).eval()
+    qwen_processor = None
+    qwen = None
+    if use_qwen:
+        qwen_processor = AutoProcessor.from_pretrained(qwen_processor_id)
+        qwen_processor.tokenizer.padding_side = "left"
+        qwen = AutoModelForImageTextToText.from_pretrained(
+            qwen_id,
+            torch_dtype=torch.bfloat16,
+            device_map=args.device_map,
+            attn_implementation="sdpa",
+        ).eval()
     siglip_processor = SiglipImageProcessor.from_pretrained(siglip_id)
     siglip = SiglipVisionModel.from_pretrained(
         siglip_id,
@@ -284,9 +304,13 @@ def main() -> None:
         for task_id in task_ids
     }
 
-    print(f"Loading RDT artifact {args.checkpoint}...")
+    if args.pretrained_only:
+        print(f"Loading pretrained RDT baseline {cfg.pretrained_model}...")
+    else:
+        print(f"Loading RDT artifact {args.checkpoint}...")
     model = SFTConditionedRDT(cfg, load_pretrained=True)
-    load_trainable_artifact(model, args.checkpoint, trainable=False)
+    if not args.pretrained_only:
+        load_trainable_artifact(model, args.checkpoint, trainable=False)
     model.to(device).eval()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -374,18 +398,21 @@ def main() -> None:
                         encode_image_slots=False,
                     )
                     assert encoded is not None
-                    qwen_kv = extract_qwen_kv(
-                        encoded,
-                        qwen_processor,
-                        qwen,
-                        device=device,
-                        layer_index=int(metadata.get("qwen_layer_index", 7)),
-                        max_new_tokens=args.qwen_max_new_tokens,
-                        expected_dim=cfg.model.qwen_kv_dim,
-                        stop_at_think_end=bool(metadata.get("qwen_stop_at_think", True)),
-                        prompt_template=metadata.get("qwen_trajectory_prompt_template"),
-                        enable_thinking=bool(metadata.get("qwen_enable_thinking", False)),
-                    )
+                    qwen_kv = None
+                    if use_qwen:
+                        assert qwen_processor is not None and qwen is not None
+                        qwen_kv = extract_qwen_kv(
+                            encoded,
+                            qwen_processor,
+                            qwen,
+                            device=device,
+                            layer_index=int(metadata.get("qwen_layer_index", 7)),
+                            max_new_tokens=args.qwen_max_new_tokens,
+                            expected_dim=cfg.model.qwen_kv_dim,
+                            stop_at_think_end=bool(metadata.get("qwen_stop_at_think", True)),
+                            prompt_template=metadata.get("qwen_trajectory_prompt_template"),
+                            enable_thinking=bool(metadata.get("qwen_enable_thinking", False)),
+                        )
                     img_tokens, img_mask = extract_siglip_features(
                         encoded,
                         siglip_processor,
@@ -403,8 +430,10 @@ def main() -> None:
                         "lang_mask": lang_mask.expand(len(active), -1).to(device),
                         "img_tokens": img_tokens,
                         "img_mask": img_mask,
-                        "qwen_kv": qwen_kv,
                     }
+                    if use_qwen:
+                        assert qwen_kv is not None
+                        policy_batch["qwen_kv"] = qwen_kv
                     torch.manual_seed(args.seed + task_id * 100_000 + batch_start * 1_000 + plan_index)
                     model_output = model.sample_actions(policy_batch).float().cpu().numpy()
                     predicted = None
@@ -483,7 +512,8 @@ def main() -> None:
                         "init_state_index": init_index,
                         "success": bool(done[local_index]),
                         "steps": int(success_step[local_index]),
-                        "checkpoint": str(args.checkpoint.resolve()),
+                        "checkpoint": "pretrained-only" if args.pretrained_only else str(args.checkpoint.resolve()),
+                        "pretrained_only": bool(args.pretrained_only),
                     }
                     if video_paths[local_index] is not None:
                         row["video"] = str(video_paths[local_index].resolve())
