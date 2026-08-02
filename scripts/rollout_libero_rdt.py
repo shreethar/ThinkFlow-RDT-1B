@@ -197,6 +197,8 @@ def absolute_target_state_to_libero_action(
     target_state: np.ndarray,
     current_state: np.ndarray,
     *,
+    pos_scale: float,
+    rot_scale: float,
     max_delta_pos: float | None,
     max_delta_rot: float | None,
 ) -> np.ndarray:
@@ -204,8 +206,8 @@ def absolute_target_state_to_libero_action(
     target = np.asarray(target_state, dtype=np.float32)
     current = np.asarray(current_state, dtype=np.float32)
     action = np.zeros((7,), dtype=np.float32)
-    action[:3] = target[:3] - current[:3]
-    action[3:6] = wrap_rpy_delta(target[3:6] - current[3:6])
+    action[:3] = (target[:3] - current[:3]) * float(pos_scale)
+    action[3:6] = wrap_rpy_delta(target[3:6] - current[3:6]) * float(rot_scale)
     if max_delta_pos is not None:
         action[:3] = np.clip(action[:3], -float(max_delta_pos), float(max_delta_pos))
     if max_delta_rot is not None:
@@ -321,14 +323,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-delta-pos",
         type=float,
-        default=0.05,
+        default=1.0,
         help="Clip absolute-target xyz deltas before sending them to LIBERO; set negative to disable.",
     )
     parser.add_argument(
         "--max-delta-rot",
         type=float,
-        default=0.25,
+        default=1.0,
         help="Clip absolute-target rpy deltas before sending them to LIBERO; set negative to disable.",
+    )
+    parser.add_argument(
+        "--pos-scale",
+        type=float,
+        default=10.0,
+        help="Scale absolute-target xyz error into LIBERO controller command space.",
+    )
+    parser.add_argument(
+        "--rot-scale",
+        type=float,
+        default=10.0,
+        help="Scale absolute-target rpy error into LIBERO controller command space.",
     )
     parser.add_argument("--libero-root", type=Path, default=LIBERO_ROOT_DEFAULT)
     parser.add_argument("--task-id", type=int, default=0, choices=range(10))
@@ -595,6 +609,8 @@ def main() -> None:
                         absolute_target_state_to_libero_action(
                             model_output[min(index + args.target_state_start_index, len(model_output) - 1)],
                             plan_start_state,
+                            pos_scale=args.pos_scale,
+                            rot_scale=args.rot_scale,
                             max_delta_pos=max_delta_pos,
                             max_delta_rot=max_delta_rot,
                         )
@@ -632,6 +648,8 @@ def main() -> None:
                 else:
                     debug_row["absolute_target_state_conversion"] = {
                         "target_state_start_index": int(args.target_state_start_index),
+                        "pos_scale": float(args.pos_scale),
+                        "rot_scale": float(args.rot_scale),
                         "max_delta_pos": max_delta_pos,
                         "max_delta_rot": max_delta_rot,
                         "gripper": "model dim 6 is gripper_open; LIBERO command is +1 open, -1 close",
@@ -644,6 +662,8 @@ def main() -> None:
                     action = absolute_target_state_to_libero_action(
                         model_output[target_index],
                         current_state,
+                        pos_scale=args.pos_scale,
+                        rot_scale=args.rot_scale,
                         max_delta_pos=max_delta_pos,
                         max_delta_rot=max_delta_rot,
                     )

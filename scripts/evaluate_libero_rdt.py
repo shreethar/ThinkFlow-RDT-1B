@@ -93,14 +93,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-delta-pos",
         type=float,
-        default=0.05,
+        default=1.0,
         help="Clip absolute-target xyz deltas before sending them to LIBERO; set negative to disable.",
     )
     parser.add_argument(
         "--max-delta-rot",
         type=float,
-        default=0.25,
+        default=1.0,
         help="Clip absolute-target rpy deltas before sending them to LIBERO; set negative to disable.",
+    )
+    parser.add_argument(
+        "--pos-scale",
+        type=float,
+        default=10.0,
+        help="Scale absolute-target xyz error into LIBERO controller command space.",
+    )
+    parser.add_argument(
+        "--rot-scale",
+        type=float,
+        default=10.0,
+        help="Scale absolute-target rpy error into LIBERO controller command space.",
     )
     parser.add_argument("--libero-root", type=Path, default=Path("/home/ubuntu/LIBERO"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/libero_spatial_evaluation/checkpoint-1600"))
@@ -460,6 +472,8 @@ def main() -> None:
                                 actions[env_index] = absolute_target_state_to_libero_action(
                                     model_output[active_position, target_index],
                                     current_state,
+                                    pos_scale=args.pos_scale,
+                                    rot_scale=args.rot_scale,
                                     max_delta_pos=max_delta_pos,
                                     max_delta_rot=max_delta_rot,
                                 )
