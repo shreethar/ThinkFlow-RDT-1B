@@ -515,10 +515,6 @@ class RDTBatchCollator:
             raise ValueError(
                 f"Expected qwen_kv [tokens, dim] or [dim], got {tuple(qwen_kv.shape)}"
             )
-        if qwen_kv.shape[0] != 1:
-            raise ValueError(
-                f"Expected exactly one qwen_kv token, got {qwen_kv.shape[0]}"
-            )
         if self.qwen_kv_dim is not None and qwen_kv.shape[1] != self.qwen_kv_dim:
             raise ValueError(
                 f"Expected qwen_kv width {self.qwen_kv_dim}, "
