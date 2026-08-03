@@ -31,6 +31,7 @@ DEFAULT_LOSS_VARIANTS = (
     "baseline",
     "zero_qwen",
     "shuffle_qwen",
+    "cross_dataset_qwen",
     "zero_lang",
     "shuffle_lang",
     "zero_image",
@@ -42,6 +43,7 @@ DEFAULT_SAMPLE_VARIANTS = (
     "baseline",
     "zero_qwen",
     "shuffle_qwen",
+    "cross_dataset_qwen",
 )
 
 
@@ -154,7 +156,97 @@ def roll_or_zero(tensor: torch.Tensor) -> torch.Tensor:
     return torch.roll(tensor, shifts=1, dims=0)
 
 
-def apply_variant(batch: dict[str, Any], variant: str) -> dict[str, Any]:
+def sample_dataset_id(sample: dict[str, Any]) -> str:
+    dataset_id = sample.get("dataset_id")
+    if dataset_id is None:
+        return "<unknown>"
+    return str(dataset_id)
+
+
+def build_cross_dataset_qwen_replacements(
+    dataset: CachedFeatureDataset,
+    indices: list[int],
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    """Preselect mismatched Qwen tensors from a different dataset for each index."""
+    qwen_by_dataset: dict[str, list[tuple[int, torch.Tensor]]] = {}
+    source_dataset_by_index: dict[int, str] = {}
+    for index in indices:
+        sample = dataset[index]
+        dataset_id = sample_dataset_id(sample)
+        qwen_kv = torch.as_tensor(sample["qwen_kv"]).detach().cpu()
+        if qwen_kv.ndim == 1:
+            qwen_kv = qwen_kv.unsqueeze(0)
+        if qwen_kv.ndim != 2:
+            raise ValueError(
+                f"Expected qwen_kv [tokens, dim] for index {index}, got {tuple(qwen_kv.shape)}"
+            )
+        qwen_by_dataset.setdefault(dataset_id, []).append((index, qwen_kv.clone()))
+        source_dataset_by_index[index] = dataset_id
+
+    rng = random.Random(seed)
+    replacements: dict[int, torch.Tensor] = {}
+    replacement_dataset_by_index: dict[int, str] = {}
+    pair_counts: dict[str, int] = {}
+    dataset_ids = sorted(qwen_by_dataset)
+    for index in indices:
+        source_dataset_id = source_dataset_by_index[index]
+        candidate_datasets = [
+            dataset_id for dataset_id in dataset_ids if dataset_id != source_dataset_id
+        ]
+        if not candidate_datasets:
+            continue
+        replacement_dataset_id = rng.choice(candidate_datasets)
+        _, replacement_qwen = rng.choice(qwen_by_dataset[replacement_dataset_id])
+        replacements[index] = replacement_qwen.clone()
+        replacement_dataset_by_index[index] = replacement_dataset_id
+        pair_key = f"{source_dataset_id}->{replacement_dataset_id}"
+        pair_counts[pair_key] = pair_counts.get(pair_key, 0) + 1
+
+    return {
+        "replacements": replacements,
+        "source_dataset_by_index": source_dataset_by_index,
+        "replacement_dataset_by_index": replacement_dataset_by_index,
+        "summary": {
+            "selected_indices": len(indices),
+            "replaced_indices": len(replacements),
+            "fallback_indices": len(indices) - len(replacements),
+            "source_dataset_counts": {
+                dataset_id: len(values)
+                for dataset_id, values in sorted(qwen_by_dataset.items())
+            },
+            "replacement_pair_counts": dict(sorted(pair_counts.items())),
+        },
+    }
+
+
+def cross_dataset_qwen_for_batch(
+    cross_dataset_qwen: dict[str, Any],
+    batch_indices: list[int],
+    reference: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    tensors = []
+    missing = 0
+    replacements: dict[int, torch.Tensor] = cross_dataset_qwen["replacements"]
+    for row, index in enumerate(batch_indices):
+        replacement = replacements.get(index)
+        if replacement is None:
+            tensors.append(torch.zeros_like(reference[row]))
+            missing += 1
+        else:
+            tensors.append(
+                replacement.to(device=reference.device, dtype=reference.dtype)
+            )
+    return torch.stack(tensors, dim=0), missing
+
+
+def apply_variant(
+    batch: dict[str, Any],
+    variant: str,
+    *,
+    cross_dataset_qwen_batch: torch.Tensor | None = None,
+) -> dict[str, Any]:
     out = clone_batch(batch)
     if variant == "baseline":
         return out
@@ -163,6 +255,18 @@ def apply_variant(batch: dict[str, Any], variant: str) -> dict[str, Any]:
         return out
     if variant == "shuffle_qwen":
         out["qwen_kv"] = roll_or_zero(out["qwen_kv"])
+        return out
+    if variant == "cross_dataset_qwen":
+        if cross_dataset_qwen_batch is None:
+            out["qwen_kv"] = torch.zeros_like(out["qwen_kv"])
+            return out
+        if cross_dataset_qwen_batch.shape != out["qwen_kv"].shape:
+            raise ValueError(
+                "cross_dataset_qwen replacement shape "
+                f"{tuple(cross_dataset_qwen_batch.shape)} does not match "
+                f"batch qwen_kv shape {tuple(out['qwen_kv'].shape)}"
+            )
+        out["qwen_kv"] = cross_dataset_qwen_batch
         return out
     if variant == "zero_lang":
         out["lang_tokens"] = torch.zeros_like(out["lang_tokens"])
@@ -513,6 +617,7 @@ def evaluate_model(
     online_siglip: tuple[Any, Any] | None,
     loss_variants: list[str],
     sample_variants: list[str],
+    cross_dataset_qwen: dict[str, Any] | None,
     sample_action_batches: int,
     timestep_bucket_count: int,
     batch_size: int,
@@ -559,9 +664,30 @@ def evaluate_model(
                     variant_notes[variant].append(
                         "Batch size is 1 for at least one batch; shuffle variant falls back to zeros."
                     )
+        cross_dataset_qwen_batch = None
+        if "cross_dataset_qwen" in set(loss_variants + sample_variants):
+            if cross_dataset_qwen is None:
+                variant_notes["cross_dataset_qwen"].append(
+                    "No cross-dataset Qwen replacement pool was provided; falling back to zeros."
+                )
+            else:
+                cross_dataset_qwen_batch, missing = cross_dataset_qwen_for_batch(
+                    cross_dataset_qwen,
+                    batch_indices,
+                    batch["qwen_kv"],
+                )
+                if missing:
+                    variant_notes["cross_dataset_qwen"].append(
+                        f"{missing} sample(s) in one batch had no different-dataset Qwen replacement; "
+                        "those rows fall back to zeros."
+                    )
 
         for variant in loss_variants:
-            variant_batch = apply_variant(batch, variant)
+            variant_batch = apply_variant(
+                batch,
+                variant,
+                cross_dataset_qwen_batch=cross_dataset_qwen_batch,
+            )
             for bucket_index, (low, high) in enumerate(ranges):
                 timesteps = sample_timesteps(
                     batch_size=len(batch_indices),
@@ -583,7 +709,11 @@ def evaluate_model(
 
         if batches_seen < sample_action_batches:
             for variant in sample_variants:
-                variant_batch = apply_variant(batch, variant)
+                variant_batch = apply_variant(
+                    batch,
+                    variant,
+                    cross_dataset_qwen_batch=cross_dataset_qwen_batch,
+                )
                 torch.manual_seed(seed + batches_seen)
                 if device.type == "cuda":
                     torch.cuda.manual_seed_all(seed + batches_seen)
@@ -681,7 +811,7 @@ def parse_args() -> argparse.Namespace:
         "--loss-variants",
         default=None,
         help=(
-            "Comma-separated variants. Default: baseline,zero_qwen,shuffle_qwen,"
+            "Comma-separated variants. Default: baseline,zero_qwen,shuffle_qwen,cross_dataset_qwen,"
             "zero_lang,shuffle_lang,zero_image,shuffle_image,zero_state,zero_ctrl_freq. "
             "Use 'all' to include shuffle_all_context."
         ),
@@ -689,7 +819,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sample-variants",
         default=None,
-        help="Comma-separated variants for diffusion sample_actions diagnostics. Default: baseline,zero_qwen,shuffle_qwen.",
+        help=(
+            "Comma-separated variants for diffusion sample_actions diagnostics. "
+            "Default: baseline,zero_qwen,shuffle_qwen,cross_dataset_qwen."
+        ),
     )
     parser.add_argument(
         "--sample-action-batches",
@@ -766,6 +899,16 @@ def main() -> None:
 
     loss_variants = parse_list(args.loss_variants, DEFAULT_LOSS_VARIANTS)
     sample_variants = parse_list(args.sample_variants, DEFAULT_SAMPLE_VARIANTS)
+    needs_cross_dataset_qwen = "cross_dataset_qwen" in set(loss_variants + sample_variants)
+    cross_dataset_qwen = (
+        build_cross_dataset_qwen_replacements(
+            dataset,
+            indices,
+            seed=args.seed + 314159,
+        )
+        if needs_cross_dataset_qwen
+        else None
+    )
     report: dict[str, Any] = {
         "config": str(Path(args.config).resolve()),
         "checkpoint": str(args.checkpoint.resolve()),
@@ -781,9 +924,15 @@ def main() -> None:
         "sample_variants": sample_variants,
         "sample_action_batches": args.sample_action_batches,
         "timestep_buckets": args.timestep_buckets,
+        "cross_dataset_qwen": (
+            cross_dataset_qwen["summary"]
+            if cross_dataset_qwen is not None
+            else None
+        ),
         "models": {},
         "notes": [
             "zero_* variants remove a condition; shuffle_* variants swap conditions within the batch.",
+            "cross_dataset_qwen replaces only qwen_kv with a qwen_kv tensor sampled from a different dataset id among the selected eval samples.",
             "shuffle variants need batch_size > 1; singleton batches fall back to zeros.",
             "sample_action_metrics use full diffusion sampling and are usually more expensive than loss buckets.",
             "pretrained-only comparison is approximate because this project wrapper changes the official RDT output interface.",
@@ -830,6 +979,7 @@ def main() -> None:
             online_siglip=online_siglip,
             loss_variants=model_loss_variants,
             sample_variants=model_sample_variants,
+            cross_dataset_qwen=cross_dataset_qwen,
             sample_action_batches=args.sample_action_batches,
             timestep_bucket_count=args.timestep_buckets,
             batch_size=args.batch_size,
