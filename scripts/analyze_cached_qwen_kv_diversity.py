@@ -320,16 +320,33 @@ def analyze_vectors(
 ) -> dict[str, Any]:
     norms = pooled.norm(dim=-1)
     normalized = torch.nn.functional.normalize(pooled, dim=-1)
+    mean_vector = pooled.mean(dim=0, keepdim=True)
+    centered = pooled - mean_vector
+    centered_norms = centered.norm(dim=-1)
+    centered_normalized = torch.nn.functional.normalize(centered, dim=-1)
     pair_values = pairwise_cosine_sample(
         normalized,
         pair_count=args.pair_count,
         seed=args.seed,
     )
+    centered_pair_values = pairwise_cosine_sample(
+        centered_normalized,
+        pair_count=args.pair_count,
+        seed=args.seed + 17,
+    )
+    mean_norm = float(mean_vector.squeeze(0).norm())
     report: dict[str, Any] = {
         "shape": list(pooled.shape),
         "norms": scalar_stats(norms),
+        "mean_vector_norm": mean_norm,
+        "centered_norms": scalar_stats(centered_norms),
+        "centered_norm_to_raw_norm_ratio": scalar_stats(
+            centered_norms / norms.clamp_min(1e-30)
+        ),
         "pair_cosine_sample": scalar_stats(pair_values),
+        "centered_pair_cosine_sample": scalar_stats(centered_pair_values),
         "full_pair_cosine": full_offdiag_cosine_stats(normalized),
+        "centered_full_pair_cosine": full_offdiag_cosine_stats(centered_normalized),
         "effective_rank": effective_rank(pooled),
         "quantized_duplicates": [
             quantized_duplicate_rate(pooled, decimals=decimals)
@@ -365,6 +382,8 @@ def analyze_vectors(
         for token_index in range(token_count):
             token_vectors = token_tensor[:, token_index, :]
             token_norm = torch.nn.functional.normalize(token_vectors, dim=-1)
+            token_centered = token_vectors - token_vectors.mean(dim=0, keepdim=True)
+            token_centered_norm = torch.nn.functional.normalize(token_centered, dim=-1)
             per_token[str(token_index)] = {
                 "shape": list(token_vectors.shape),
                 "norms": scalar_stats(token_vectors.norm(dim=-1)),
@@ -373,6 +392,13 @@ def analyze_vectors(
                         token_norm,
                         pair_count=args.pair_count,
                         seed=args.seed + 1000 + token_index,
+                    )
+                ),
+                "centered_pair_cosine_sample": scalar_stats(
+                    pairwise_cosine_sample(
+                        token_centered_norm,
+                        pair_count=args.pair_count,
+                        seed=args.seed + 2000 + token_index,
                     )
                 ),
                 "effective_rank": effective_rank(token_vectors),
@@ -484,6 +510,8 @@ def main() -> None:
         ),
         "interpretation_hints": [
             "Pair cosine near 1.0 and low effective rank indicate low KV diversity.",
+            "Raw cosine can be high for transformer hidden states because of a large shared mean/common component.",
+            "Centered pair cosine subtracts that common component and is better for judging sample-specific residual information.",
             "High diversity but RDT ablation shuffle_qwen ~= baseline suggests projector/fusion/training is not using sample-specific KV.",
             "B2 spatial tokens should ideally show lower pair cosine and higher effective rank than B0 </think> KV.",
             "If nearest neighbors mostly come from the same episode/instruction, KV may encode episode/task context rather than action-relevant sample details.",
@@ -492,6 +520,7 @@ def main() -> None:
     args.output.write_text(json.dumps(report, indent=2, default=json_default) + "\n", encoding="utf-8")
     print(f"Wrote {args.output.resolve()}")
     pair_stats = report["analysis"]["pair_cosine_sample"]
+    centered_pair_stats = report["analysis"]["centered_pair_cosine_sample"]
     rank = report["analysis"]["effective_rank"]
     print(
         "pair cosine sample: "
@@ -499,6 +528,13 @@ def main() -> None:
         f"median={pair_stats.get('median', 0):.6f} "
         f"p95={pair_stats.get('p95', 0):.6f} "
         f"p99={pair_stats.get('p99', 0):.6f}"
+    )
+    print(
+        "centered pair cosine sample: "
+        f"mean={centered_pair_stats.get('mean', 0):.6f} "
+        f"median={centered_pair_stats.get('median', 0):.6f} "
+        f"p95={centered_pair_stats.get('p95', 0):.6f} "
+        f"p99={centered_pair_stats.get('p99', 0):.6f}"
     )
     print(
         "effective rank: "
