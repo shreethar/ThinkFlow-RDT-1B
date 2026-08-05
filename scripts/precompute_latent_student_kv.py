@@ -36,7 +36,10 @@ from precompute_all_features import (  # noqa: E402
     resolve_model_id,
     standardized_collate_fn,
 )
-from thinkflow_rdt.adapters.combined_lazy import build_combined_standardized_splits  # noqa: E402
+from thinkflow_rdt.adapters.combined_lazy import (  # noqa: E402
+    LIBERO_DATASET_IDS,
+    build_combined_standardized_splits,
+)
 from thinkflow_rdt.adapters.sample_filtering import (  # noqa: E402
     DEFAULT_CLOSE_TO_OPEN_AFTER,
     DEFAULT_CLOSE_TO_OPEN_BEFORE,
@@ -714,7 +717,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         action="append",
-        choices=["bc_z", "bridge", "droid", "fractal", "kuka"],
+        choices=["bc_z", "bridge", "droid", "fractal", "kuka", *LIBERO_DATASET_IDS],
     )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--stage", type=int, choices=[1, 2, 3], default=None)

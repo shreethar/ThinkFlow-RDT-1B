@@ -38,6 +38,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from thinkflow_rdt.adapters.combined_lazy import (  # noqa: E402
+    LIBERO_DATASET_IDS,
     LazyStandardizedDatasetConfig,
     build_combined_standardized_splits,
     default_lazy_standardized_dataset_configs,
@@ -56,6 +57,9 @@ CTRL_FREQ_BY_DATASET = {
     "kuka": 3.0,
     "libero_object": 20.0,
     "libero_spatial": 20.0,
+    "libero_goal": 20.0,
+    "libero_10": 20.0,
+    "libero_90": 20.0,
 }
 IMAGE_KEYS = ("primary", "wrist", "secondary")
 SPLIT_NAMES = ("train", "validation", "test")
@@ -2193,8 +2197,7 @@ def parse_args() -> argparse.Namespace:
             "droid",
             "fractal",
             "kuka",
-            "libero_object",
-            "libero_spatial",
+            *LIBERO_DATASET_IDS,
         ],
         help="Dataset id to include. Repeat for multiple. Defaults to all.",
     )
