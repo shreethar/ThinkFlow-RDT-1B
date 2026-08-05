@@ -24,6 +24,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from thinkflow_rdt.adapters.combined_lazy import (  # noqa: E402
+    LIBERO_DATASET_IDS,
     SPLIT_NAMES,
     build_combined_standardized_splits,
     default_lazy_standardized_dataset_configs,
@@ -45,6 +46,7 @@ CTRL_FREQ_BY_DATASET = {
     "droid": 15.0,
     "fractal": 3.0,
     "kuka": 3.0,
+    **{dataset_id: 20.0 for dataset_id in LIBERO_DATASET_IDS},
 }
 
 
