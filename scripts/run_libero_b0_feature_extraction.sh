@@ -35,6 +35,10 @@ T5_PRECISION=${T5_PRECISION:-bf16}
 BATCH_SIZE=${BATCH_SIZE:-32}
 NUM_WORKERS=${NUM_WORKERS:-4}
 MAX_SAMPLES_PER_EPISODE=${MAX_SAMPLES_PER_EPISODE:-64}
+OPEN_TO_CLOSE_BEFORE=${OPEN_TO_CLOSE_BEFORE:-5}
+OPEN_TO_CLOSE_AFTER=${OPEN_TO_CLOSE_AFTER:-6}
+CLOSE_TO_OPEN_BEFORE=${CLOSE_TO_OPEN_BEFORE:-4}
+CLOSE_TO_OPEN_AFTER=${CLOSE_TO_OPEN_AFTER:-3}
 IMAGE_HISTORY_SIZE=${IMAGE_HISTORY_SIZE:-2}
 MAX_IMAGES_PER_SAMPLE=${MAX_IMAGES_PER_SAMPLE:-6}
 IMAGE_JPEG_QUALITY=${IMAGE_JPEG_QUALITY:-85}
@@ -52,10 +56,10 @@ ARGS=(
   --action-target-mode absolute_state
   --max-samples-per-episode "$MAX_SAMPLES_PER_EPISODE"
   --gripper-change-scope directional
-  --open-to-close-before 10
-  --open-to-close-after 8
-  --close-to-open-before 6
-  --close-to-open-after 6
+  --open-to-close-before "$OPEN_TO_CLOSE_BEFORE"
+  --open-to-close-after "$OPEN_TO_CLOSE_AFTER"
+  --close-to-open-before "$CLOSE_TO_OPEN_BEFORE"
+  --close-to-open-after "$CLOSE_TO_OPEN_AFTER"
   --qwen-model-id "$QWEN_MODEL_ID"
   --qwen-layer-index 7
   --no-qwen-enable-thinking
