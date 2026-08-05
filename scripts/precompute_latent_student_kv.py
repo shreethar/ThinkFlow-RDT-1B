@@ -472,6 +472,12 @@ def save_sample_shard(
         "metadata": list(batch["metadata"]),
         "instructions": [str(instruction) for instruction in batch["instructions"]],
     }
+    if "joint_state" in batch:
+        record["joint_state"] = batch["joint_state"].cpu()
+    if "joint_states" in batch:
+        record["joint_states"] = batch["joint_states"].cpu()
+    if "joint_states_mask" in batch:
+        record["joint_states_mask"] = batch["joint_states_mask"].cpu()
 
     if lang_tokens is not None and lang_mask is not None and sample_lang_index is not None:
         if save_padded_features:
@@ -519,6 +525,7 @@ def save_sample_shard(
                 "qwen_kv_dim": int(latent_kv.shape[2]),
                 "has_lang_tokens": lang_tokens is not None,
                 "has_image_slots": cache_image_slots,
+                "has_joint_states": "joint_states" in record,
             }
         )
         + "\n"
@@ -576,8 +583,18 @@ def precompute_split(
                 if keep <= 0:
                     break
                 if keep < len(batch["metadata"]):
-                    for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
-                        batch[key] = batch[key][:keep]
+                    for key in (
+                        "state",
+                        "actions",
+                        "action_time_mask",
+                        "action_dim_mask",
+                        "ctrl_freq",
+                        "joint_state",
+                        "joint_states",
+                        "joint_states_mask",
+                    ):
+                        if key in batch:
+                            batch[key] = batch[key][:keep]
                     batch["metadata"] = batch["metadata"][:keep]
                     batch["instructions"] = batch["instructions"][:keep]
                     batch["qwen_images"] = batch["qwen_images"][:keep]

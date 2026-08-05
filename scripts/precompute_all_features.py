@@ -401,7 +401,7 @@ def standardized_collate_fn(
         return None
 
     dataset_ids = [str(sample["dataset_id"]) for sample in kept]
-    return {
+    result = {
         "instructions": [str(sample["instruction"]) for sample in kept],
         "qwen_images": qwen_image_groups,
         "siglip_image_slots": siglip_image_slots,
@@ -451,6 +451,22 @@ def standardized_collate_fn(
         "kept_samples": kept,
         "skipped_no_image": skipped_no_image,
     }
+    if all("joint_state" in sample for sample in kept):
+        result["joint_state"] = torch.stack(
+            [torch.as_tensor(sample["joint_state"], dtype=torch.float32) for sample in kept]
+        )
+    if all("joint_states" in sample for sample in kept):
+        result["joint_states"] = torch.stack(
+            [torch.as_tensor(sample["joint_states"], dtype=torch.float32) for sample in kept]
+        )
+    if all("joint_states_mask" in sample for sample in kept):
+        result["joint_states_mask"] = torch.stack(
+            [
+                torch.as_tensor(sample["joint_states_mask"], dtype=torch.bool)
+                for sample in kept
+            ]
+        )
+    return result
 
 
 def nested_images_to_flat(
@@ -834,6 +850,12 @@ def save_batch_records(
             "ctrl_freq": float(batch["ctrl_freq"][batch_index].item()),
             **metadata,
         }
+        if "joint_state" in batch:
+            record["joint_state"] = batch["joint_state"][batch_index].cpu()
+        if "joint_states" in batch:
+            record["joint_states"] = batch["joint_states"][batch_index].cpu()
+        if "joint_states_mask" in batch:
+            record["joint_states_mask"] = batch["joint_states_mask"][batch_index].cpu()
         if sample_img_tokens is not None and sample_img_mask is not None:
             record["img_tokens"] = sample_img_tokens.cpu()
             record["img_mask"] = sample_img_mask.cpu()
@@ -1045,6 +1067,12 @@ def save_episode_anchor_records(
             "qwen_anchor_kind": anchor_kind(anchor_index, anchor),
             **metadata,
         }
+        if "joint_state" in batch:
+            record["joint_state"] = batch["joint_state"][batch_index].cpu()
+        if "joint_states" in batch:
+            record["joint_states"] = batch["joint_states"][batch_index].cpu()
+        if "joint_states_mask" in batch:
+            record["joint_states_mask"] = batch["joint_states_mask"][batch_index].cpu()
         if cache_image_slots:
             record["image_slot_jpegs"] = batch["image_slot_jpegs"][batch_index]
             record["image_slot_mask"] = batch["siglip_slot_mask"][batch_index].cpu()
@@ -1081,8 +1109,18 @@ def truncate_episode_batch(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if keep >= len(batch["metadata"]):
         return batch, kept_samples
-    for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
-        batch[key] = batch[key][:keep]
+    for key in (
+        "state",
+        "actions",
+        "action_time_mask",
+        "action_dim_mask",
+        "ctrl_freq",
+        "joint_state",
+        "joint_states",
+        "joint_states_mask",
+    ):
+        if key in batch:
+            batch[key] = batch[key][:keep]
     batch["metadata"] = batch["metadata"][:keep]
     if batch["image_slot_jpegs"] is not None:
         batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
@@ -1318,6 +1356,12 @@ def save_sample_shard(
         "instructions": [str(instruction) for instruction in batch["instructions"]],
         "sample_lang_index": sample_lang_index.cpu(),
     }
+    if "joint_state" in batch:
+        record["joint_state"] = batch["joint_state"].cpu()
+    if "joint_states" in batch:
+        record["joint_states"] = batch["joint_states"].cpu()
+    if "joint_states_mask" in batch:
+        record["joint_states_mask"] = batch["joint_states_mask"].cpu()
 
     if save_padded_features:
         record["lang_tokens"] = lang_tokens.cpu()
@@ -1366,6 +1410,7 @@ def save_sample_shard(
                 "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
                 "has_img_tokens": False,
                 "has_image_slots": True,
+                "has_joint_states": "joint_states" in record,
             }
         )
         + "\n"
@@ -1447,6 +1492,12 @@ def save_episode_anchor_pack_job(
         ),
         "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
     }
+    if "joint_state" in batch:
+        record["joint_state"] = batch["joint_state"].cpu()
+    if "joint_states" in batch:
+        record["joint_states"] = batch["joint_states"].cpu()
+    if "joint_states_mask" in batch:
+        record["joint_states_mask"] = batch["joint_states_mask"].cpu()
     save_start = time.perf_counter()
     torch.save(record, path)
     timings["torch_save"] = time.perf_counter() - save_start
@@ -2003,8 +2054,18 @@ def precompute_split(
             if args.max_samples_per_split is not None:
                 keep = min(args.max_samples_per_split - sample_count, qwen_kv.shape[0])
                 qwen_kv = qwen_kv[:keep]
-                for key in ("state", "actions", "action_time_mask", "action_dim_mask", "ctrl_freq"):
-                    batch[key] = batch[key][:keep]
+                for key in (
+                    "state",
+                    "actions",
+                    "action_time_mask",
+                    "action_dim_mask",
+                    "ctrl_freq",
+                    "joint_state",
+                    "joint_states",
+                    "joint_states_mask",
+                ):
+                    if key in batch:
+                        batch[key] = batch[key][:keep]
                 batch["metadata"] = batch["metadata"][:keep]
                 batch["image_slot_jpegs"] = batch["image_slot_jpegs"][:keep]
                 batch["siglip_slot_mask"] = batch["siglip_slot_mask"][:keep]

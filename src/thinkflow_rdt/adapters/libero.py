@@ -25,6 +25,7 @@ class LiberoEpisode:
     wrist_images: np.ndarray | None
     states: np.ndarray
     actions: np.ndarray
+    joint_states: np.ndarray | None = None
 
     @property
     def instructions(self) -> list[str]:
@@ -36,6 +37,38 @@ def _dataset(group, *names: str):
         if name in group:
             return np.asarray(group[name])
     raise KeyError(f"None of {names!r} found below {group.name}")
+
+
+def _optional_dataset(group, *names: str) -> np.ndarray | None:
+    for name in names:
+        if name in group:
+            return np.asarray(group[name])
+    return None
+
+
+def _libero_joint_positions(obs) -> np.ndarray | None:
+    direct = _optional_dataset(
+        obs,
+        "joint_states",
+        "robot0_joint_pos",
+        "joint_pos",
+        "joint_positions",
+        "joint_qpos",
+    )
+    if direct is not None:
+        values = np.asarray(direct, dtype=np.float32)
+    elif "robot0_joint_pos_sin" in obs and "robot0_joint_pos_cos" in obs:
+        # Some robomimic-style files store joints as sin/cos only. Recover the
+        # wrapped angle so the cache still has a plain joint-position signal.
+        values = np.arctan2(
+            np.asarray(obs["robot0_joint_pos_sin"], dtype=np.float32),
+            np.asarray(obs["robot0_joint_pos_cos"], dtype=np.float32),
+        )
+    else:
+        return None
+    if values.ndim == 1:
+        values = values[:, None]
+    return values.astype(np.float32, copy=False)
 
 
 def _instruction(group, fallback: str) -> str:
@@ -148,9 +181,12 @@ def convert_libero_demo(group, *, episode_id: str) -> LiberoEpisode:
         if key in obs:
             wrist = np.asarray(obs[key])
             break
+    joint_states = _libero_joint_positions(obs)
     length = min(len(actions), len(states), len(primary))
     if wrist is not None:
         length = min(length, len(wrist))
+    if joint_states is not None:
+        length = min(length, len(joint_states))
     return LiberoEpisode(
         episode_id=episode_id,
         instruction=_instruction(group, episode_id),
@@ -158,6 +194,7 @@ def convert_libero_demo(group, *, episode_id: str) -> LiberoEpisode:
         wrist_images=None if wrist is None else wrist[:length],
         states=states[:length].astype(np.float32),
         actions=actions[:length].astype(np.float32),
+        joint_states=None if joint_states is None else joint_states[:length].astype(np.float32),
     )
 
 
@@ -203,7 +240,7 @@ def libero_sample_from_episode(
     if action_stats is not None and action_target_mode == "delta":
         actions = normalize_action_horizon(actions, mask, action_stats)
     wrist = None if episode.wrist_images is None else Image.fromarray(episode.wrist_images[step_index]).copy()
-    return {
+    sample = {
         "dataset_id": dataset_id,
         "episode_id": episode.episode_id,
         "step_idx": str(step_index),
@@ -220,3 +257,15 @@ def libero_sample_from_episode(
         "actions_mask": mask,
         "ctrl_freq": 20.0,
     }
+    if episode.joint_states is not None:
+        joint_sequence = episode.joint_states
+        joint_horizon, joint_horizon_mask = pad_action_horizon(
+            joint_sequence,
+            step_index,
+            horizon=horizon,
+            action_dim=int(joint_sequence.shape[1]),
+        )
+        sample["joint_state"] = joint_sequence[step_index].copy()
+        sample["joint_states"] = joint_horizon
+        sample["joint_states_mask"] = joint_horizon_mask
+    return sample
