@@ -62,6 +62,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SPLIT_RATIOS = (0.8, 0.1, 0.1)
 SPLIT_NAMES = ("train", "validation", "test")
 ACTION_TARGET_MODES = ("delta", "absolute_state")
+LIBERO_DATASET_IDS = (
+    "libero_spatial",
+    "libero_object",
+    "libero_goal",
+    "libero_10",
+    "libero_90",
+)
 
 
 @dataclass
@@ -233,7 +240,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
         )
 
     def _iter_raw_episodes(self):
-        if self.dataset_id in {"libero_object", "libero_spatial"}:
+        if self.dataset_id in LIBERO_DATASET_IDS:
             for episode in iter_libero_episodes(self.data_dir):
                 self._current_libero_episode = episode
                 yield {"libero_episode": episode, "steps": range(len(episode.actions))}
@@ -260,7 +267,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
             raise KeyError(f"Unknown dataset_id: {self.dataset_id}")
 
     def _episode_id(self, raw_episode: Any, raw_episode_index: int) -> str:
-        if self.dataset_id in {"libero_object", "libero_spatial"}:
+        if self.dataset_id in LIBERO_DATASET_IDS:
             return raw_episode["libero_episode"].episode_id
         if self.dataset_id == "bc_z":
             return bcz_episode_id(raw_episode, raw_episode_index, split=self.source_split)
@@ -269,7 +276,7 @@ class LazyStandardizedDataset(TorchIterableDataset):
         return f"{self.source_split}_{raw_episode_index:06d}"
 
     def _convert_episode(self, raw_episode_index: int, episode_id: str, steps: list[Any]) -> Any:
-        if self.dataset_id in {"libero_object", "libero_spatial"}:
+        if self.dataset_id in LIBERO_DATASET_IDS:
             # The HDF5 reader has already converted this demonstration.
             return self._current_libero_episode
         if self.dataset_id == "bc_z":
@@ -318,14 +325,15 @@ class LazyStandardizedDataset(TorchIterableDataset):
         raise KeyError(f"Unknown dataset_id: {self.dataset_id}")
 
     def _sample_from_episode(self, episode: Any, step_index: int) -> dict[str, Any]:
-        if self.dataset_id in {"libero_object", "libero_spatial"}:
+        if self.dataset_id in LIBERO_DATASET_IDS:
             sample = libero_sample_from_episode(
                 episode,
                 step_index,
+                dataset_id=self.dataset_id,
                 horizon=self.horizon,
                 action_stats=self.action_stats,
+                action_target_mode=self.action_target_mode,
             )
-            sample["dataset_id"] = self.dataset_id
             return add_image_history(sample, episode, step_index)
         if self.dataset_id == "bc_z":
             sample = bcz_sample_from_episode(
@@ -562,7 +570,7 @@ def default_lazy_standardized_dataset_configs(
     # Preserve the historical default set; LIBERO is opt-in because most roots
     # do not contain it.
     selected = (
-        [name for name in configs if name != "libero_object"]
+        [name for name in configs if name not in LIBERO_DATASET_IDS]
         if dataset_ids is None
         else list(dataset_ids)
     )
@@ -892,11 +900,38 @@ def _mock_layout_configs(mock_root: Path) -> dict[str, LazyStandardizedDatasetCo
     return {
         "libero_object": LazyStandardizedDatasetConfig(
             dataset_id="libero_object",
-            data_dir=mock_root / "libero_object" / "data",
+            data_dir=_first_existing(
+                mock_root / "libero_object" / "data",
+                mock_root / "libero_object",
+            ),
         ),
         "libero_spatial": LazyStandardizedDatasetConfig(
             dataset_id="libero_spatial",
-            data_dir=mock_root / "libero_spatial" / "data",
+            data_dir=_first_existing(
+                mock_root / "libero_spatial" / "data",
+                mock_root / "libero_spatial",
+            ),
+        ),
+        "libero_goal": LazyStandardizedDatasetConfig(
+            dataset_id="libero_goal",
+            data_dir=_first_existing(
+                mock_root / "libero_goal" / "data",
+                mock_root / "libero_goal",
+            ),
+        ),
+        "libero_10": LazyStandardizedDatasetConfig(
+            dataset_id="libero_10",
+            data_dir=_first_existing(
+                mock_root / "libero_10" / "data",
+                mock_root / "libero_10",
+            ),
+        ),
+        "libero_90": LazyStandardizedDatasetConfig(
+            dataset_id="libero_90",
+            data_dir=_first_existing(
+                mock_root / "libero_90" / "data",
+                mock_root / "libero_90",
+            ),
         ),
         "bc_z": LazyStandardizedDatasetConfig(
             dataset_id="bc_z",
@@ -944,11 +979,23 @@ def _hf_layout_configs(root: Path) -> dict[str, LazyStandardizedDatasetConfig]:
     return {
         "libero_object": LazyStandardizedDatasetConfig(
             dataset_id="libero_object",
-            data_dir=root / "libero_object" / "data",
+            data_dir=_first_existing(root / "libero_object" / "data", root / "libero_object"),
         ),
         "libero_spatial": LazyStandardizedDatasetConfig(
             dataset_id="libero_spatial",
-            data_dir=root / "libero_spatial" / "data",
+            data_dir=_first_existing(root / "libero_spatial" / "data", root / "libero_spatial"),
+        ),
+        "libero_goal": LazyStandardizedDatasetConfig(
+            dataset_id="libero_goal",
+            data_dir=_first_existing(root / "libero_goal" / "data", root / "libero_goal"),
+        ),
+        "libero_10": LazyStandardizedDatasetConfig(
+            dataset_id="libero_10",
+            data_dir=_first_existing(root / "libero_10" / "data", root / "libero_10"),
+        ),
+        "libero_90": LazyStandardizedDatasetConfig(
+            dataset_id="libero_90",
+            data_dir=_first_existing(root / "libero_90" / "data", root / "libero_90"),
         ),
         "bc_z": LazyStandardizedDatasetConfig(
             dataset_id="bc_z",

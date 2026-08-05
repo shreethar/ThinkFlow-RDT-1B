@@ -183,15 +183,28 @@ def libero_sample_from_episode(
     episode: LiberoEpisode,
     step_index: int,
     *,
+    dataset_id: str = "libero_object",
     horizon: int,
     action_stats: ActionNormalizationStats | None,
+    action_target_mode: str = "delta",
 ) -> dict:
-    actions, mask = pad_action_horizon(episode.actions, step_index, horizon=horizon)
-    if action_stats is not None:
+    if action_target_mode == "delta":
+        target_sequence = episode.actions
+    elif action_target_mode == "absolute_state":
+        # For target-state RDT fine-tuning, the supervised "action" chunk is a
+        # horizon of absolute observed EEF states, not LIBERO controller deltas.
+        # Rollout converts each predicted absolute target back to a LIBERO
+        # delta-controller command using current_state -> target_state error.
+        target_sequence = episode.states
+    else:
+        raise ValueError(f"Unsupported action_target_mode: {action_target_mode}")
+
+    actions, mask = pad_action_horizon(target_sequence, step_index, horizon=horizon)
+    if action_stats is not None and action_target_mode == "delta":
         actions = normalize_action_horizon(actions, mask, action_stats)
     wrist = None if episode.wrist_images is None else Image.fromarray(episode.wrist_images[step_index]).copy()
     return {
-        "dataset_id": "libero_object",
+        "dataset_id": dataset_id,
         "episode_id": episode.episode_id,
         "step_idx": str(step_index),
         "instruction": episode.instruction,
