@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Extract B2/LatentStudent cached features for one LIBERO suite.
+#
+# Usage:
+#   scripts/run_libero_b2_feature_extraction.sh libero_object
+#
+# Common overrides:
+#   DATA_ROOT=dataset/datasets
+#   OUTPUT_ROOT=cache_features_libero_b2_absolute
+#   GCS_DEST=gs://my-bucket/libero_b2_absolute
+#   MAX_SAMPLES_PER_EPISODE=64
+#   OVERWRITE=1
+
+SUITE=${1:?suite is required, e.g. libero_object/libero_spatial/libero_goal/libero_10/libero_90}
+
+case "$SUITE" in
+  libero_object|libero_spatial|libero_goal|libero_10|libero_90) ;;
+  *)
+    echo "Unsupported LIBERO suite: $SUITE" >&2
+    exit 2
+    ;;
+esac
+
+CONFIG=${CONFIG:-configs/b2_rdt1b_lora.yaml}
+DATA_ROOT=${DATA_ROOT:-dataset/datasets}
+OUTPUT_ROOT=${OUTPUT_ROOT:-cache_features_libero_b2_absolute}
+OUT_DIR="${OUTPUT_ROOT}/${SUITE}"
+
+STUDENT_MODEL_ID=${STUDENT_MODEL_ID:-/workspace/model/LatentStudent-ckpt-400-fixed}
+PROCESSOR_ID=${PROCESSOR_ID:-/workspace/model/stage1_unsloth}
+LATENT_STUDENT_CODE_DIR=${LATENT_STUDENT_CODE_DIR:-/workspace/VLA-FYP/train/stage2}
+SPATIAL_PARAMETERS_PATH=${SPATIAL_PARAMETERS_PATH:-}
+
+T5_MODEL_ID=${T5_MODEL_ID:-/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v1_1-xxl}
+T5_PRECISION=${T5_PRECISION:-bf16}
+BATCH_SIZE=${BATCH_SIZE:-32}
+T5_BATCH_SIZE=${T5_BATCH_SIZE:-32}
+NUM_WORKERS=${NUM_WORKERS:-4}
+MAX_SAMPLES_PER_EPISODE=${MAX_SAMPLES_PER_EPISODE:-64}
+IMAGE_HISTORY_SIZE=${IMAGE_HISTORY_SIZE:-2}
+MAX_IMAGES_PER_SAMPLE=${MAX_IMAGES_PER_SAMPLE:-6}
+IMAGE_JPEG_QUALITY=${IMAGE_JPEG_QUALITY:-85}
+
+ARGS=(
+  --config "$CONFIG"
+  --root "$DATA_ROOT"
+  --dataset "$SUITE"
+  --output-dir "$OUT_DIR"
+  --split train
+  --split validation
+  --action-target-mode absolute_state
+  --max-samples-per-episode "$MAX_SAMPLES_PER_EPISODE"
+  --gripper-change-scope directional
+  --open-to-close-before 10
+  --open-to-close-after 8
+  --close-to-open-before 6
+  --close-to-open-after 6
+  --student-model-id "$STUDENT_MODEL_ID"
+  --processor-id "$PROCESSOR_ID"
+  --latent-student-code-dir "$LATENT_STUDENT_CODE_DIR"
+  --spatial-token-count 5
+  --layer-index 7
+  --include-t5
+  --t5-model-id "$T5_MODEL_ID"
+  --t5-precision "$T5_PRECISION"
+  --t5-batch-size "$T5_BATCH_SIZE"
+  --image-history-size "$IMAGE_HISTORY_SIZE"
+  --max-images-per-sample "$MAX_IMAGES_PER_SAMPLE"
+  --image-jpeg-quality "$IMAGE_JPEG_QUALITY"
+  --batch-size "$BATCH_SIZE"
+  --num-workers "$NUM_WORKERS"
+  --pin-memory
+)
+
+if [[ -n "$SPATIAL_PARAMETERS_PATH" ]]; then
+  ARGS+=(--spatial-parameters-path "$SPATIAL_PARAMETERS_PATH")
+fi
+
+if [[ "${OVERWRITE:-0}" == "1" ]]; then
+  ARGS+=(--overwrite)
+fi
+
+uv run --no-sync python scripts/precompute_latent_student_kv.py "${ARGS[@]}"
+
+if [[ -n "${GCS_DEST:-}" ]]; then
+  gsutil -m rsync -r "$OUT_DIR" "${GCS_DEST%/}/${SUITE}"
+fi
