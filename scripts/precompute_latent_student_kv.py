@@ -750,6 +750,14 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_SAMPLES_PER_EPISODE,
     )
     parser.add_argument(
+        "--all-samples-per-episode",
+        action="store_true",
+        help=(
+            "Disable per-episode timestep subsampling and emit every valid "
+            "timestep in each episode."
+        ),
+    )
+    parser.add_argument(
         "--gripper-window-before",
         type=int,
         default=DEFAULT_GRIPPER_WINDOW_BEFORE,
@@ -859,6 +867,11 @@ def main() -> None:
         raise ValueError("--spatial-token-count must be positive")
     if "{task}" not in args.prompt_template:
         raise ValueError("--prompt-template must contain {task}")
+    max_samples_per_episode = (
+        None if args.all_samples_per_episode else args.max_samples_per_episode
+    )
+    if max_samples_per_episode is not None and max_samples_per_episode <= 0:
+        raise ValueError("--max-samples-per-episode must be positive")
     normalize_actions = not args.no_normalize_actions
     if args.action_target_mode == "absolute_state":
         if normalize_actions:
@@ -885,7 +898,7 @@ def main() -> None:
         horizon=cfg.model.pred_horizon,
         normalize_actions=normalize_actions,
         action_target_mode=args.action_target_mode,
-        max_samples_per_episode=args.max_samples_per_episode,
+        max_samples_per_episode=max_samples_per_episode,
         gripper_window_before=args.gripper_window_before,
         gripper_window_after=args.gripper_window_after,
         gripper_change_scope=args.gripper_change_scope,
@@ -918,7 +931,8 @@ def main() -> None:
         "stage": args.stage,
         "normalize_actions": normalize_actions,
         "action_target_mode": args.action_target_mode,
-        "max_samples_per_episode": args.max_samples_per_episode,
+        "max_samples_per_episode": max_samples_per_episode,
+        "all_samples_per_episode": bool(args.all_samples_per_episode),
         "gripper_window_before": args.gripper_window_before,
         "gripper_window_after": args.gripper_window_after,
         "gripper_change_scope": args.gripper_change_scope,

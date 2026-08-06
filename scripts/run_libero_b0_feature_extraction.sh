@@ -10,7 +10,8 @@ set -euo pipefail
 #   DATA_ROOT=dataset/datasets
 #   OUTPUT_ROOT=cache_features_libero_b0_absolute
 #   GCS_DEST=gs://my-bucket/libero_b0_absolute
-#   MAX_SAMPLES_PER_EPISODE=128
+#   ALL_SAMPLES_PER_EPISODE=1
+#   MAX_SAMPLES_PER_EPISODE=128  # used only when ALL_SAMPLES_PER_EPISODE=0
 #   OVERWRITE=1
 
 SUITE=${1:?suite is required, e.g. libero_object/libero_spatial/libero_goal/libero_10/libero_90}
@@ -34,6 +35,7 @@ T5_MODEL_ID=${T5_MODEL_ID:-/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v
 T5_PRECISION=${T5_PRECISION:-bf16}
 BATCH_SIZE=${BATCH_SIZE:-32}
 NUM_WORKERS=${NUM_WORKERS:-4}
+ALL_SAMPLES_PER_EPISODE=${ALL_SAMPLES_PER_EPISODE:-1}
 MAX_SAMPLES_PER_EPISODE=${MAX_SAMPLES_PER_EPISODE:-128}
 OPEN_TO_CLOSE_BEFORE=${OPEN_TO_CLOSE_BEFORE:-10}
 OPEN_TO_CLOSE_AFTER=${OPEN_TO_CLOSE_AFTER:-11}
@@ -55,7 +57,6 @@ ARGS=(
   --cache-layout sample_shards
   --qwen-cache-scope per_sample
   --action-target-mode absolute_state
-  --max-samples-per-episode "$MAX_SAMPLES_PER_EPISODE"
   --gripper-change-scope directional
   --open-to-close-before "$OPEN_TO_CLOSE_BEFORE"
   --open-to-close-after "$OPEN_TO_CLOSE_AFTER"
@@ -75,6 +76,12 @@ ARGS=(
   --num-workers "$NUM_WORKERS"
   --pin-memory
 )
+
+if [[ "$ALL_SAMPLES_PER_EPISODE" == "1" ]]; then
+  ARGS+=(--all-samples-per-episode)
+else
+  ARGS+=(--max-samples-per-episode "$MAX_SAMPLES_PER_EPISODE")
+fi
 
 if [[ -n "$QWEN_PROCESSOR_ID" ]]; then
   ARGS+=(--qwen-processor-id "$QWEN_PROCESSOR_ID")

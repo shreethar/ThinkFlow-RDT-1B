@@ -2290,6 +2290,14 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_SAMPLES_PER_EPISODE,
     )
     parser.add_argument(
+        "--all-samples-per-episode",
+        action="store_true",
+        help=(
+            "Disable per-episode timestep subsampling and emit every valid "
+            "timestep in each episode."
+        ),
+    )
+    parser.add_argument(
         "--gripper-change-scope",
         choices=["all", "first", "directional"],
         default="directional",
@@ -2511,7 +2519,10 @@ def main() -> None:
         raise ValueError("--profile-every-episodes must be positive")
     if args.qwen_anchors_per_episode <= 0:
         raise ValueError("--qwen-anchors-per-episode must be positive")
-    if args.max_samples_per_episode is not None and args.max_samples_per_episode <= 0:
+    max_samples_per_episode = (
+        None if args.all_samples_per_episode else args.max_samples_per_episode
+    )
+    if max_samples_per_episode is not None and max_samples_per_episode <= 0:
         raise ValueError("--max-samples-per-episode must be positive")
     for name in (
         "open_to_close_before",
@@ -2552,7 +2563,7 @@ def main() -> None:
         horizon=cfg.model.pred_horizon,
         normalize_actions=normalize_actions,
         action_target_mode=args.action_target_mode,
-        max_samples_per_episode=args.max_samples_per_episode,
+        max_samples_per_episode=max_samples_per_episode,
         gripper_change_scope=args.gripper_change_scope,
         open_to_close_before=args.open_to_close_before,
         open_to_close_after=args.open_to_close_after,
@@ -2582,7 +2593,8 @@ def main() -> None:
         "episode_prefetch_size": args.episode_prefetch_size,
         "async_write_workers": args.async_write_workers,
         "max_pending_writes": args.max_pending_writes,
-        "max_samples_per_episode": args.max_samples_per_episode,
+        "max_samples_per_episode": max_samples_per_episode,
+        "all_samples_per_episode": bool(args.all_samples_per_episode),
         "gripper_change_scope": args.gripper_change_scope,
         "open_to_close_before": args.open_to_close_before,
         "open_to_close_after": args.open_to_close_after,
