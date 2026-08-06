@@ -34,6 +34,8 @@ class ModelConfig:
     # Qwen injection. This is useful for pretrained-only rollout baselines.
     # ``self_attention_kv`` projects the flattened Qwen K/V pair to one native
     # RDT K/V pair and appends it inside every RDT self-attention block.
+    # ``cross_attention_kv`` projects cached Qwen K/V directly to native RDT K/V
+    # and appends them after each cross-attention block's condition projection.
     # ``language`` is retained for backward compatibility with older artifacts.
     qwen_fusion: str = "language"
     # The official pretrained RDT state adaptor consumes a unified 128-D state.
@@ -151,11 +153,13 @@ class ExperimentConfig:
             "none",
             "language",
             "self_attention_kv",
+            "cross_attention_kv",
             "unified_cross_attention",
         }:
             raise ValueError(
                 "model.qwen_fusion must be 'none', 'language', "
-                "'self_attention_kv', or 'unified_cross_attention'"
+                "'self_attention_kv', 'cross_attention_kv', or "
+                "'unified_cross_attention'"
             )
         if self.model.pretrained_copy_mode not in {"selected", "compatible"}:
             raise ValueError(

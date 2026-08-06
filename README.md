@@ -1,5 +1,18 @@
 # ThinkFlow-VLA: cached-Qwen-conditioned RDT-1B
 
+## Fast-ThinkAct cross-attention K/V fusion
+
+The B0 and B2 configurations use `qwen_fusion: cross_attention_kv`. Cached
+Qwen/LatentStudent `[K; V]` vectors pass through the trainable two-layer adaptor
+once, producing native RDT `[K; V]` pairs. Each RDT cross-attention block first
+projects its normal language or image context, then appends the external keys
+and values along the attention sequence dimension. The external cache therefore
+bypasses the block's `cross_attn.kv` projection. B0 supplies one external token
+and B2 supplies five spatial tokens.
+
+The older `unified_cross_attention` condition-token path and
+`self_attention_kv` experimental path remain available as configuration modes.
+
 ## Part 3 KV-cache training
 
 The current full-RDT path consumes the episode-pack cache directly:

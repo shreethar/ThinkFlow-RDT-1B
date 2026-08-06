@@ -90,12 +90,120 @@ def _self_attention_with_external_kv(
     return attention.proj_drop(output)
 
 
+def _cross_attention_with_external_kv(
+    attention: nn.Module,
+    x: torch.Tensor,
+    condition: torch.Tensor,
+    condition_mask: torch.Tensor | None,
+    external_kv: torch.Tensor | None,
+) -> torch.Tensor:
+    """Run RDT cross-attention with already projected K/V appended directly."""
+    if external_kv is None:
+        return attention(x, condition, condition_mask)
+
+    batch_size, query_count, width = x.shape
+    condition_batch, condition_count, condition_width = condition.shape
+    if condition_batch != batch_size or condition_width != width:
+        raise ValueError(
+            "Cross-attention condition must be [B, L, hidden_size], got "
+            f"{tuple(condition.shape)} for queries {tuple(x.shape)}"
+        )
+    if external_kv.ndim != 3 or external_kv.shape[0] != batch_size:
+        raise ValueError(
+            "Projected external cross-attention KV must be "
+            f"[B, tokens, 2 * hidden_size], got {tuple(external_kv.shape)}"
+        )
+    if external_kv.shape[-1] != 2 * width:
+        raise ValueError(
+            "Projected external cross-attention KV width must be "
+            f"{2 * width}, got {external_kv.shape[-1]}"
+        )
+
+    query = attention.q(x).reshape(
+        batch_size, query_count, attention.num_heads, attention.head_dim
+    ).permute(0, 2, 1, 3)
+    native_kv = attention.kv(condition).reshape(
+        batch_size,
+        condition_count,
+        2,
+        attention.num_heads,
+        attention.head_dim,
+    ).permute(2, 0, 3, 1, 4)
+    key, value = native_kv.unbind(0)
+
+    external_key, external_value = external_kv.chunk(2, dim=-1)
+    external_token_count = external_key.shape[1]
+    external_key = external_key.reshape(
+        batch_size,
+        external_token_count,
+        attention.num_heads,
+        attention.head_dim,
+    ).permute(0, 2, 1, 3)
+    external_value = external_value.reshape(
+        batch_size,
+        external_token_count,
+        attention.num_heads,
+        attention.head_dim,
+    ).permute(0, 2, 1, 3)
+
+    query = attention.q_norm(query)
+    key = attention.k_norm(key)
+    external_key = attention.k_norm(external_key)
+    key = torch.cat([key, external_key], dim=2)
+    value = torch.cat([value, external_value], dim=2)
+
+    combined_mask = None
+    if condition_mask is not None:
+        condition_mask = condition_mask.to(device=x.device, dtype=torch.bool)
+        if condition_mask.shape != (batch_size, condition_count):
+            raise ValueError(
+                "Cross-attention condition mask must be [B, L], got "
+                f"{tuple(condition_mask.shape)}"
+            )
+        external_mask = torch.ones(
+            batch_size,
+            external_token_count,
+            dtype=torch.bool,
+            device=x.device,
+        )
+        combined_mask = torch.cat(
+            [condition_mask, external_mask], dim=1
+        ).reshape(batch_size, 1, 1, condition_count + external_token_count)
+        combined_mask = combined_mask.expand(-1, -1, query_count, -1)
+
+    if attention.fused_attn:
+        output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=attention.attn_drop.p if attention.training else 0.0,
+            attn_mask=combined_mask,
+        )
+    else:
+        scores = (query * attention.scale) @ key.transpose(-2, -1)
+        if combined_mask is not None:
+            scores = scores.masked_fill(combined_mask.logical_not(), float("-inf"))
+        probabilities = scores.softmax(dim=-1)
+        if attention.attn_drop.p > 0:
+            probabilities = attention.attn_drop(probabilities)
+        output = probabilities @ value
+
+    output = output.permute(0, 2, 1, 3).reshape(
+        batch_size, query_count, width
+    )
+    output = attention.proj(output)
+    if attention.proj_drop.p > 0:
+        output = attention.proj_drop(output)
+    return output
+
+
 def _rdt_block_with_external_kv(
     block: nn.Module,
     x: torch.Tensor,
     condition: torch.Tensor,
     condition_mask: torch.Tensor | None,
     external_kv: torch.Tensor | None,
+    external_cross_kv: torch.Tensor | None,
 ) -> torch.Tensor:
     residual = x
     x = _self_attention_with_external_kv(
@@ -106,7 +214,13 @@ def _rdt_block_with_external_kv(
     x = x + residual
 
     residual = x
-    x = block.cross_attn(block.norm2(x), condition, condition_mask)
+    x = _cross_attention_with_external_kv(
+        block.cross_attn,
+        block.norm2(x),
+        condition,
+        condition_mask,
+        external_cross_kv,
+    )
     x = x + residual
 
     residual = x
@@ -131,6 +245,7 @@ def install_kv_aware_forward(
         lang_mask=None,
         img_mask=None,
         external_kv=None,
+        external_cross_kv=None,
         extra_cross_cond=None,
         extra_cross_mask=None,
         unified_cross_attention=False,
@@ -178,37 +293,39 @@ def install_kv_aware_forward(
                 and self.training
                 and torch.is_grad_enabled()
             ):
-                if external_kv is None:
-                    def custom_forward(x_value, c_value, block=block, mask=mask):
-                        return _rdt_block_with_external_kv(
-                            block, x_value, c_value, mask, None
-                        )
-
-                    x = checkpoint(
-                        custom_forward, x, condition, use_reentrant=False
-                    )
-                else:
-                    def custom_forward(
+                def custom_forward(
+                    x_value,
+                    c_value,
+                    self_kv_value,
+                    cross_kv_value,
+                    block=block,
+                    mask=mask,
+                ):
+                    return _rdt_block_with_external_kv(
+                        block,
                         x_value,
                         c_value,
-                        kv_value,
-                        block=block,
-                        mask=mask,
-                    ):
-                        return _rdt_block_with_external_kv(
-                            block, x_value, c_value, mask, kv_value
-                        )
-
-                    x = checkpoint(
-                        custom_forward,
-                        x,
-                        condition,
-                        external_kv,
-                        use_reentrant=False,
+                        mask,
+                        self_kv_value,
+                        cross_kv_value,
                     )
+
+                x = checkpoint(
+                    custom_forward,
+                    x,
+                    condition,
+                    external_kv,
+                    external_cross_kv,
+                    use_reentrant=False,
+                )
             else:
                 x = _rdt_block_with_external_kv(
-                    block, x, condition, mask, external_kv
+                    block,
+                    x,
+                    condition,
+                    mask,
+                    external_kv,
+                    external_cross_kv,
                 )
         x = self.final_layer(x)
         return x[:, -self.horizon :]
@@ -303,7 +420,10 @@ class SFTConditionedRDT(nn.Module):
         )
 
         projector_width = cfg.model.hidden_size
-        if cfg.model.qwen_fusion == "self_attention_kv":
+        if cfg.model.qwen_fusion in {
+            "self_attention_kv",
+            "cross_attention_kv",
+        }:
             projector_width *= 2
         self.qwen_adaptor = nn.Sequential(
             nn.Linear(cfg.model.qwen_kv_dim, projector_width, dtype=dtype),
@@ -404,7 +524,9 @@ class SFTConditionedRDT(nn.Module):
         if self.action_adaptor is not None:
             self.action_adaptor.requires_grad_(True)
         self.qwen_adaptor.requires_grad_(True)
-        self.unified_cross_extra_pos_embed.requires_grad_(True)
+        self.unified_cross_extra_pos_embed.requires_grad_(
+            cfg.model.qwen_fusion == "unified_cross_attention"
+        )
 
     @property
     def model_dtype(self) -> torch.dtype:
@@ -565,11 +687,13 @@ class SFTConditionedRDT(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
+        torch.Tensor | None,
     ]:
         lang_cond = self.runner.lang_adaptor(batch["lang_tokens"])
         img_cond = self.runner.img_adaptor(batch["img_tokens"])
         lang_mask = batch["lang_mask"].bool()
         external_kv: torch.Tensor | None = None
+        external_cross_kv: torch.Tensor | None = None
         extra_cross_cond: torch.Tensor | None = None
         extra_cross_mask: torch.Tensor | None = None
         if self.cfg.model.qwen_fusion == "none":
@@ -586,6 +710,11 @@ class SFTConditionedRDT(nn.Module):
         elif self.cfg.model.qwen_fusion == "self_attention_kv":
             projected_qwen = self.qwen_adaptor(batch["qwen_kv"])
             external_kv = projected_qwen
+        elif self.cfg.model.qwen_fusion == "cross_attention_kv":
+            # This output is already an RDT-native [K; V] pair. Cross-attention
+            # appends it after projecting its ordinary language/image context,
+            # so the cached Qwen KV is not passed through attention.kv again.
+            external_cross_kv = self.qwen_adaptor(batch["qwen_kv"])
         elif self.cfg.model.qwen_fusion == "unified_cross_attention":
             projected_qwen = self.qwen_adaptor(batch["qwen_kv"])
             extra_parts = []
@@ -617,6 +746,7 @@ class SFTConditionedRDT(nn.Module):
             img_cond,
             lang_mask,
             external_kv,
+            external_cross_kv,
             extra_cross_cond,
             extra_cross_mask,
         )
@@ -657,6 +787,7 @@ class SFTConditionedRDT(nn.Module):
             img_cond,
             lang_mask,
             external_kv,
+            external_cross_kv,
             extra_cross_cond,
             extra_cross_mask,
         ) = (
@@ -671,6 +802,7 @@ class SFTConditionedRDT(nn.Module):
             lang_mask=lang_mask,
             img_mask=batch["img_mask"].bool(),
             external_kv=external_kv,
+            external_cross_kv=external_cross_kv,
             extra_cross_cond=extra_cross_cond,
             extra_cross_mask=extra_cross_mask,
             unified_cross_attention=(
@@ -764,6 +896,7 @@ class SFTConditionedRDT(nn.Module):
             img_cond,
             lang_mask,
             external_kv,
+            external_cross_kv,
             extra_cross_cond,
             extra_cross_mask,
         ) = (
@@ -801,6 +934,7 @@ class SFTConditionedRDT(nn.Module):
                 lang_mask=lang_mask,
                 img_mask=batch["img_mask"].bool(),
                 external_kv=external_kv,
+                external_cross_kv=external_cross_kv,
                 extra_cross_cond=extra_cross_cond,
                 extra_cross_mask=extra_cross_mask,
                 unified_cross_attention=(

@@ -20,7 +20,7 @@ model:
   lang_adaptor: linear
   img_adaptor: linear
   state_adaptor: mlp3x_gelu
-  qwen_fusion: unified_cross_attention
+  qwen_fusion: cross_attention_kv
   pretrained_copy_mode: compatible
   rdt_state_dim: 128
   state_encoder_layout: rdt_eef
