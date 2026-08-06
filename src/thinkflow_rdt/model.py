@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from .checkpoint import load_full_rdt_base
 from .config import ExperimentConfig
 from .lora import apply_lora, count_parameters
 from .rdt_imports import import_rdt_runner
@@ -403,7 +404,13 @@ def _copy_selected_pretrained_weights(target_runner, source_runner, cfg: Experim
 
 
 class SFTConditionedRDT(nn.Module):
-    def __init__(self, cfg: ExperimentConfig, load_pretrained: bool = True):
+    def __init__(
+        self,
+        cfg: ExperimentConfig,
+        load_pretrained: bool = True,
+        *,
+        base_artifact: str | None = None,
+    ):
         super().__init__()
         self.cfg = cfg
         RDTRunner = import_rdt_runner(cfg.rdt_repo)
@@ -502,6 +509,8 @@ class SFTConditionedRDT(nn.Module):
             self.runner.model,
             gradient_checkpointing=cfg.model.gradient_checkpointing,
         )
+        if base_artifact is not None:
+            load_full_rdt_base(self, base_artifact)
         if cfg.model.finetune_mode == "lora":
             self.runner.model, self.lora_targets = apply_lora(
                 self.runner.model, cfg.lora

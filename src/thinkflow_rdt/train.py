@@ -631,6 +631,7 @@ def train(
     *,
     online_siglip_model_id: str | None = None,
     online_siglip_fallback_model_id: str | None = "google/siglip-so400m-patch14-384",
+    base_artifact: str | Path | None = None,
     init_artifact: str | Path | None = None,
 ) -> None:
     seed_everything(cfg.seed)
@@ -702,7 +703,11 @@ def train(
         online_siglip=use_online_siglip,
         stratified=cfg.data.stratified_validation,
     )
-    model = SFTConditionedRDT(cfg, load_pretrained=load_pretrained)
+    model = SFTConditionedRDT(
+        cfg,
+        load_pretrained=load_pretrained,
+        base_artifact=base_artifact,
+    )
     if init_artifact is not None:
         load_trainable_artifact(model, init_artifact, trainable=True)
     online_siglip = None

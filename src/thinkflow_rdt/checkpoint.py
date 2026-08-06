@@ -230,23 +230,7 @@ def load_trainable_artifact(model, artifact_dir: str | Path, trainable: bool) ->
             artifact_format = _configured_artifact_format(model)
 
     if artifact_format == _LORA_FORMAT:
-        if not adapter_dir.exists():
-            raise FileNotFoundError(adapter_dir)
-        if not _is_peft_model(model.runner.model):
-            raise TypeError("A LoRA artifact requires a PEFT-wrapped RDT model")
-        # The model constructor has already created the same default LoRA
-        # layout. Load into it instead of wrapping the model a second time.
-        adapter_state = load_peft_weights(str(adapter_dir), device="cpu")
-        set_peft_model_state_dict(
-            model.runner.model,
-            adapter_state,
-            adapter_name="default",
-        )
-        if not trainable:
-            model.runner.model.requires_grad_(False)
-        for name, parameter in model.runner.model.named_parameters():
-            if "lora_" in name or "modules_to_save" in name:
-                parameter.requires_grad = trainable
+        load_lora_rdt_core(model, artifact, trainable=trainable)
     elif artifact_format == _FULL_FORMAT:
         if not full_rdt_path.exists():
             raise FileNotFoundError(full_rdt_path)
@@ -263,3 +247,53 @@ def load_trainable_artifact(model, artifact_dir: str | Path, trainable: bool) ->
         raise ValueError(f"Unsupported RDT artifact format: {artifact_format!r}")
 
     _load_interfaces(model, interfaces, trainable=trainable)
+
+
+def load_lora_rdt_core(model, artifact_dir: str | Path, *, trainable: bool) -> None:
+    """Load only an RDT LoRA adapter, without touching interface modules.
+
+    This is useful when an old checkpoint's Qwen/interface shapes no longer
+    match the current fusion design, but its RDT LoRA weights should still be
+    merged into the base transformer.
+    """
+    artifact = Path(artifact_dir)
+    adapter_dir = artifact / ADAPTER_DIR
+    if not adapter_dir.exists():
+        raise FileNotFoundError(adapter_dir)
+    if not _is_peft_model(model.runner.model):
+        raise TypeError("A LoRA artifact requires a PEFT-wrapped RDT model")
+    # The model constructor has already created the same default LoRA layout.
+    # Load into it instead of wrapping the model a second time.
+    adapter_state = load_peft_weights(str(adapter_dir), device="cpu")
+    set_peft_model_state_dict(
+        model.runner.model,
+        adapter_state,
+        adapter_name="default",
+    )
+    if not trainable:
+        model.runner.model.requires_grad_(False)
+    for name, parameter in model.runner.model.named_parameters():
+        if "lora_" in name or "modules_to_save" in name:
+            parameter.requires_grad = trainable
+
+
+def load_full_rdt_base(model, artifact_dir: str | Path, *, strict: bool = True) -> None:
+    """Load a merged/full RDT core before wrapping the core with fresh LoRA.
+
+    Use this for two-stage fine-tuning: first merge an earlier LoRA run into the
+    base RDT transformer, then initialize a new LoRA adapter for the next
+    dataset. This intentionally loads only ``rdt_full.pt``; interface modules
+    such as the Qwen projector may have changed shape between fusion designs.
+    """
+    artifact = Path(artifact_dir)
+    full_rdt_path = artifact / FULL_RDT_FILE
+    if not full_rdt_path.exists():
+        raise FileNotFoundError(full_rdt_path)
+    if _is_peft_model(model.runner.model):
+        raise TypeError("load_full_rdt_base must run before applying PEFT/LoRA")
+    state_dict = torch.load(
+        full_rdt_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    model.runner.model.load_state_dict(state_dict, strict=strict)

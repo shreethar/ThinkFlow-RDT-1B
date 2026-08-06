@@ -308,6 +308,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Initialize LoRA and trained interfaces from a prior checkpoint directory.",
     )
+    parser.add_argument(
+        "--base-artifact",
+        type=Path,
+        help=(
+            "Initialize the base RDT transformer from a merged/full artifact "
+            "before creating a fresh LoRA adapter. Use this after "
+            "scripts/merge_lora_adapter.py when moving from OXE to LIBERO."
+        ),
+    )
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
@@ -374,6 +383,7 @@ def main() -> None:
         load_pretrained=not args.no_pretrained,
         online_siglip_model_id=args.siglip_model_id if args.online_siglip else None,
         online_siglip_fallback_model_id=args.siglip_fallback_model_id,
+        base_artifact=args.base_artifact,
         init_artifact=args.init_artifact,
     )
 
