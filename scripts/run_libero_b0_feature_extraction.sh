@@ -10,7 +10,7 @@ set -euo pipefail
 #   DATA_ROOT=dataset/datasets
 #   OUTPUT_ROOT=cache_features_libero_b0_absolute
 #   GCS_DEST=gs://my-bucket/libero_b0_absolute
-#   MAX_SAMPLES_PER_EPISODE=64
+#   MAX_SAMPLES_PER_EPISODE=128
 #   OVERWRITE=1
 
 SUITE=${1:?suite is required, e.g. libero_object/libero_spatial/libero_goal/libero_10/libero_90}
@@ -34,11 +34,11 @@ T5_MODEL_ID=${T5_MODEL_ID:-/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v
 T5_PRECISION=${T5_PRECISION:-bf16}
 BATCH_SIZE=${BATCH_SIZE:-32}
 NUM_WORKERS=${NUM_WORKERS:-4}
-MAX_SAMPLES_PER_EPISODE=${MAX_SAMPLES_PER_EPISODE:-64}
-OPEN_TO_CLOSE_BEFORE=${OPEN_TO_CLOSE_BEFORE:-5}
-OPEN_TO_CLOSE_AFTER=${OPEN_TO_CLOSE_AFTER:-6}
-CLOSE_TO_OPEN_BEFORE=${CLOSE_TO_OPEN_BEFORE:-4}
-CLOSE_TO_OPEN_AFTER=${CLOSE_TO_OPEN_AFTER:-3}
+MAX_SAMPLES_PER_EPISODE=${MAX_SAMPLES_PER_EPISODE:-128}
+OPEN_TO_CLOSE_BEFORE=${OPEN_TO_CLOSE_BEFORE:-10}
+OPEN_TO_CLOSE_AFTER=${OPEN_TO_CLOSE_AFTER:-11}
+CLOSE_TO_OPEN_BEFORE=${CLOSE_TO_OPEN_BEFORE:-10}
+CLOSE_TO_OPEN_AFTER=${CLOSE_TO_OPEN_AFTER:-11}
 IMAGE_HISTORY_SIZE=${IMAGE_HISTORY_SIZE:-2}
 MAX_IMAGES_PER_SAMPLE=${MAX_IMAGES_PER_SAMPLE:-6}
 IMAGE_JPEG_QUALITY=${IMAGE_JPEG_QUALITY:-85}
@@ -50,6 +50,7 @@ ARGS=(
   --output-dir "$OUT_DIR"
   --split train
   --split validation
+  --split test
   --feature-set qwen_t5
   --cache-layout sample_shards
   --qwen-cache-scope per_sample
