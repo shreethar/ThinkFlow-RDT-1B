@@ -89,9 +89,26 @@ def _instruction(group, fallback: str) -> str:
 
 
 def libero_gripper_closed(raw: np.ndarray) -> np.ndarray:
-    """LIBERO/robosuite uses +1=open and -1=close."""
+    """Convert the project command convention (+1=open, -1=close) to closed."""
     values = np.asarray(raw, dtype=np.float32)
     return (values < 0.0).astype(np.float32)
+
+
+def libero_image_to_rgb(image: np.ndarray) -> np.ndarray:
+    """Flip a raw Robosuite RGB observation into conventional top-left origin.
+
+    Robosuite's MuJoCo camera arrays have an OpenGL-style bottom-left origin.
+    LIBERO stores those arrays directly in its demonstration HDF5 files, while
+    its own visualization utilities flip the image vertically. ``axis=-3`` is
+    the height axis for both ``[H, W, C]`` and ``[T, H, W, C]`` arrays.
+    """
+    values = np.asarray(image)
+    if values.ndim < 3 or values.shape[-1] not in (1, 3, 4):
+        raise ValueError(
+            "Expected a channel-last image [..., H, W, C], got "
+            f"{values.shape}"
+        )
+    return np.flip(values, axis=-3).copy()
 
 
 def libero_orientation_to_rpy(orientation: np.ndarray) -> np.ndarray:
@@ -134,11 +151,13 @@ def libero_observation_to_rdt(
     state = np.concatenate(
         [position, libero_orientation_to_rpy(orientation), [float(gripper_closed)]],
     ).astype(np.float32)
-    primary = _dataset(observation, "agentview_rgb", "agentview_image")
+    primary = libero_image_to_rgb(
+        _dataset(observation, "agentview_rgb", "agentview_image")
+    )
     wrist = None
     for key in ("eye_in_hand_rgb", "robot0_eye_in_hand_image"):
         if key in observation:
-            wrist = np.asarray(observation[key])
+            wrist = libero_image_to_rgb(observation[key])
             break
     return {"state": state, "primary": primary, "wrist": wrist}
 
@@ -147,10 +166,10 @@ def rdt_action_to_libero(
     normalized_action: np.ndarray,
     stats: ActionNormalizationStats,
 ) -> np.ndarray:
-    """Denormalize one RDT action and restore LIBERO's +1 open/-1 close command."""
+    """Denormalize one RDT action and restore the project gripper command."""
     action = denormalize_action_array(np.asarray(normalized_action, dtype=np.float32), stats)
     result = action[..., :7].copy()
-    result[..., 6] = np.where(action[..., 6] >= 0.5, -1.0, 1.0)
+    result[..., 6] = np.where(action[..., 6] >= 0.5, 1.0, -1.0)
     return result.astype(np.float32)
 
 
@@ -175,11 +194,13 @@ def convert_libero_demo(group, *, episode_id: str) -> LiberoEpisode:
         state_closed[1:] = actions[:-1, 6]
     states = np.concatenate([position[:, :3], rpy, state_closed[:, None]], axis=-1)
 
-    primary = _dataset(obs, "agentview_rgb", "agentview_image")
+    primary = libero_image_to_rgb(
+        _dataset(obs, "agentview_rgb", "agentview_image")
+    )
     wrist = None
     for key in ("eye_in_hand_rgb", "robot0_eye_in_hand_image"):
         if key in obs:
-            wrist = np.asarray(obs[key])
+            wrist = libero_image_to_rgb(obs[key])
             break
     joint_states = _libero_joint_positions(obs)
     length = min(len(actions), len(states), len(primary))
