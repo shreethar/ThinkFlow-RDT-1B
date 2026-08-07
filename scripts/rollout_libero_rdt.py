@@ -212,8 +212,7 @@ def absolute_target_state_to_libero_action(
         action[:3] = np.clip(action[:3], -float(max_delta_pos), float(max_delta_pos))
     if max_delta_rot is not None:
         action[3:6] = np.clip(action[3:6], -float(max_delta_rot), float(max_delta_rot))
-    # LIBERO/robosuite gripper command is +1=open and -1=close. The model
-    # predicts RDT gripper_open in [0, 1], so threshold at 0.5.
+    # Keep the project's signed convention: +1=open and -1=close.
     action[6] = 1.0 if float(target[6]) >= 0.5 else -1.0
     return action
 
@@ -652,7 +651,7 @@ def main() -> None:
                         "rot_scale": float(args.rot_scale),
                         "max_delta_pos": max_delta_pos,
                         "max_delta_rot": max_delta_rot,
-                        "gripper": "model dim 6 is gripper_open; LIBERO command is +1 open, -1 close",
+                        "gripper": "model dim 6 is gripper_open; project command is +1 open, -1 close",
                     }
             executed_actions: list[np.ndarray] = []
             for action_index in range(chunk):

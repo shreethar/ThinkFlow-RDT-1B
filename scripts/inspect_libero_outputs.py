@@ -267,7 +267,7 @@ def inspect_demo_file(path: Path, *, demo_name: str | None, step: int) -> dict[s
                     "libero_gripper_command",
                 ],
                 "values": raw_action,
-                "gripper_convention": "+1=open, -1=close in LIBERO/robosuite controller actions",
+                "gripper_convention": "+1=open, -1=close in the project command convention",
             },
             "adapter_binarized_action_at_step": {
                 "names": [
@@ -367,7 +367,7 @@ def main() -> None:
     args = parse_args()
     report: dict[str, Any] = {
         "conventions": {
-            "libero_controller_gripper": "+1=open, -1=close",
+            "project_gripper_command": "+1=open, -1=close",
             "adapter_state": "[x,y,z,roll,pitch,yaw,gripper_closed]",
             "model_state": "[x,y,z,roll,pitch,yaw,gripper_open]",
             "rdt_native_state": "256D = 128 values + 128 masks",
