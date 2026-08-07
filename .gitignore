@@ -19,6 +19,7 @@ dataset/mock_dataset/kuka_dataset/data
 src/thinkflow_rdt.egg-info/requires.txt
 src/thinkflow_rdt.egg-info/PKG-INFO
 src/thinkflow_rdt.egg-info/SOURCES.txt
+src/thinkflow_rdt.egg-info/
 
 src/thinkflow_rdt/adapters/__pycache__
 scripts/__pycache__/
@@ -52,3 +53,4 @@ dataset/LIBERO
 thinkflow-libero-features-b0
 checkpoint-1000/
 oxe_b0_merged_for_libero/
+libero-dataset/
