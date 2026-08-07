@@ -34,6 +34,7 @@ def test_collator_masks_padding():
     assert batch["action_time_mask"].tolist() == [[True, True, False, False, False]]
     assert batch["actions"].shape == (1, 5, 7)
     assert batch["qwen_kv"].shape == (1, 1, 8)
+    assert batch["dataset_id"] == ["unknown"]
 
 
 def test_collator_supports_separate_language_and_image_widths():

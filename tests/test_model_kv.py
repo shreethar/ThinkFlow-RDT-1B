@@ -248,3 +248,6 @@ def test_masked_loss_is_mean_of_per_example_losses():
     torch.testing.assert_close(metrics["loss"], torch.tensor(2.5))
     torch.testing.assert_close(metrics["train_target_mae"], torch.tensor(1.5))
     assert metrics["valid_count"].item() == 2.0
+    assert metrics["sample_imitation_loss"].shape == (2,)
+    assert metrics["horizon_loss_sum"].shape == (model.horizon,)
+    assert metrics["horizon_valid_count"].shape == (model.horizon,)
