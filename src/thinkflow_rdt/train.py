@@ -31,6 +31,15 @@ from .data import (
 from .model import SFTConditionedRDT, resolve_dtype
 
 
+LIBERO_SUITE_IDS = (
+    "libero_spatial",
+    "libero_object",
+    "libero_goal",
+    "libero_10",
+    "libero_90",
+)
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -483,6 +492,20 @@ def validate(
     gripper_valid_count = torch.zeros_like(loss_sum)
     sample_error_sum = torch.zeros_like(loss_sum)
     sample_valid_count = torch.zeros_like(loss_sum)
+    horizon_loss_sum = torch.zeros(
+        cfg.model.pred_horizon,
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    horizon_valid_count = torch.zeros_like(horizon_loss_sum)
+    # Columns: loss, MAE, examples, XYZ loss/count, rotation loss/count,
+    # gripper loss/count, sampled-action MSE/count.
+    suite_stats = torch.zeros(
+        len(LIBERO_SUITE_IDS),
+        11,
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
     devices = (
         [
             accelerator.device.index
@@ -513,6 +536,47 @@ def validate(
                     device=accelerator.device,
                 )
             metrics = model(batch)
+            horizon_loss_sum += metrics["horizon_loss_sum"].double()
+            horizon_valid_count += metrics["horizon_valid_count"].double()
+            dataset_ids = list(batch.get("dataset_id", []))
+            if len(dataset_ids) != int(metrics["sample_is_valid"].shape[0]):
+                raise ValueError(
+                    "Validation batches must carry one dataset_id per example; "
+                    f"got {len(dataset_ids)} ids for "
+                    f"{metrics['sample_is_valid'].shape[0]} examples"
+                )
+            for suite_index, suite_id in enumerate(LIBERO_SUITE_IDS):
+                selected = torch.as_tensor(
+                    [dataset_id == suite_id for dataset_id in dataset_ids],
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                )
+                sample_valid = metrics["sample_is_valid"].double() * selected
+                suite_stats[suite_index, 0] += (
+                    metrics["sample_imitation_loss"].double() * sample_valid
+                ).sum()
+                suite_stats[suite_index, 1] += (
+                    metrics["sample_target_mae"].double() * sample_valid
+                ).sum()
+                suite_stats[suite_index, 2] += sample_valid.sum()
+
+                xyz_valid = metrics["sample_xyz_valid"].double() * selected
+                suite_stats[suite_index, 3] += (
+                    metrics["sample_xyz_loss"].double() * xyz_valid
+                ).sum()
+                suite_stats[suite_index, 4] += xyz_valid.sum()
+                rot_valid = metrics["sample_rot_valid"].double() * selected
+                suite_stats[suite_index, 5] += (
+                    metrics["sample_rot_loss"].double() * rot_valid
+                ).sum()
+                suite_stats[suite_index, 6] += rot_valid.sum()
+                gripper_valid = (
+                    metrics["sample_gripper_valid"].double() * selected
+                )
+                suite_stats[suite_index, 7] += (
+                    metrics["sample_gripper_loss"].double() * gripper_valid
+                ).sum()
+                suite_stats[suite_index, 8] += gripper_valid.sum()
             loss_sum += accelerator.reduce(
                 metrics["loss_sum"].double(), reduction="sum"
             )
@@ -571,21 +635,37 @@ def validate(
                     ],
                     dim=-1,
                 )
-                error = (
+                per_sample_error = (
                     (diff.pow(2) * valid).sum(dim=(1, 2))
                     / per_sample_count.clamp_min(1.0)
                 )
-                error = (error * per_sample_valid).sum()
+                error = (per_sample_error * per_sample_valid).sum()
                 sample_error_sum += accelerator.reduce(
                     error.double(), reduction="sum"
                 )
                 sample_valid_count += accelerator.reduce(
                     per_sample_valid.sum().double(), reduction="sum"
                 )
+                for suite_index, suite_id in enumerate(LIBERO_SUITE_IDS):
+                    selected = torch.as_tensor(
+                        [dataset_id == suite_id for dataset_id in dataset_ids],
+                        device=accelerator.device,
+                        dtype=per_sample_error.dtype,
+                    )
+                    selected_valid = per_sample_valid * selected
+                    suite_stats[suite_index, 9] += (
+                        per_sample_error * selected_valid
+                    ).sum().double()
+                    suite_stats[suite_index, 10] += selected_valid.sum().double()
     model.train()
+    horizon_loss_sum = accelerator.reduce(horizon_loss_sum, reduction="sum")
+    horizon_valid_count = accelerator.reduce(
+        horizon_valid_count, reduction="sum"
+    )
+    suite_stats = accelerator.reduce(suite_stats, reduction="sum")
     loss_denominator = valid_count.clamp_min(1.0)
     sample_denominator = sample_valid_count.clamp_min(1.0)
-    return {
+    result = {
         "val/loss": (
             float((loss_sum / loss_denominator).cpu())
             if valid_count.item() > 0
@@ -623,6 +703,38 @@ def validate(
             else math.nan
         ),
     }
+    for horizon_index in range(cfg.model.pred_horizon):
+        count = horizon_valid_count[horizon_index]
+        result[f"val/horizon_mse/step_{horizon_index:02d}"] = (
+            float((horizon_loss_sum[horizon_index] / count.clamp_min(1.0)).cpu())
+            if count.item() > 0
+            else math.nan
+        )
+    for suite_index, suite_id in enumerate(LIBERO_SUITE_IDS):
+        stats = suite_stats[suite_index]
+        example_count = stats[2]
+        if example_count.item() <= 0:
+            continue
+        prefix = f"val/{suite_id}"
+        result[f"{prefix}/loss"] = float((stats[0] / example_count).cpu())
+        result[f"{prefix}/imitation_loss"] = result[f"{prefix}/loss"]
+        result[f"{prefix}/target_mae"] = float((stats[1] / example_count).cpu())
+        result[f"{prefix}/examples"] = float(example_count.cpu())
+        result[f"{prefix}/loss_xyz"] = float(
+            (stats[3] / stats[4].clamp_min(1.0)).cpu()
+        )
+        result[f"{prefix}/loss_rot"] = float(
+            (stats[5] / stats[6].clamp_min(1.0)).cpu()
+        )
+        result[f"{prefix}/loss_gripper"] = float(
+            (stats[7] / stats[8].clamp_min(1.0)).cpu()
+        )
+        result[f"{prefix}/sample_mse"] = (
+            float((stats[9] / stats[10].clamp_min(1.0)).cpu())
+            if stats[10].item() > 0
+            else math.nan
+        )
+    return result
 
 
 def train(
@@ -884,9 +996,10 @@ def train(
             pending_gripper_valid_count = 0.0
             pending_microbatches = 0
 
+            step_log_data: dict[str, float | int] = {}
             if cfg.training.log_every > 0 and global_step % cfg.training.log_every == 0:
                 average_step_time = running_step_time / max(running_steps, 1)
-                log_data = {
+                training_log_data = {
                     "train/loss": running_loss / max(running_steps, 1),
                     "train/imitation_loss": running_loss / max(running_steps, 1),
                     "train/loss_xyz": running_xyz_loss / max(running_steps, 1),
@@ -903,15 +1016,10 @@ def train(
                 }
                 for index, group in enumerate(optimizer.param_groups):
                     group_name = group.get("name", str(index))
-                    log_data[f"train/lr_{group_name}"] = group["lr"]
-                log_metrics(
-                    accelerator,
-                    log_data,
-                    step=global_step,
-                    report_to=report_to,
-                )
+                    training_log_data[f"train/lr_{group_name}"] = group["lr"]
+                step_log_data.update(training_log_data)
                 if accelerator.is_main_process:
-                    print(log_data)
+                    print(training_log_data)
                 running_loss = 0.0
                 running_mae = 0.0
                 running_xyz_loss = 0.0
@@ -931,14 +1039,21 @@ def train(
                     cfg,
                     online_siglip=online_siglip,
                 )
+                step_log_data.update(validation)
+                if accelerator.is_main_process:
+                    print(validation)
+
+            # Commit at most once for a given optimizer step. In particular,
+            # training and validation commonly coincide (for example every 100
+            # steps); separate committed W&B calls at the same explicit step can
+            # cause the second record to be discarded.
+            if step_log_data:
                 log_metrics(
                     accelerator,
-                    validation,
+                    step_log_data,
                     step=global_step,
                     report_to=report_to,
                 )
-                if accelerator.is_main_process:
-                    print(validation)
 
             if (
                 cfg.training.save_every > 0

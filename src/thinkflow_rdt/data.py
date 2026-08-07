@@ -538,7 +538,7 @@ class RDTBatchCollator:
         actions[..., 6] = 1.0 - actions[..., 6]
         return state, actions
 
-    def __call__(self, samples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
         batch: dict[str, list[torch.Tensor]] = {
             "qwen_kv": [],
             "lang_tokens": [],
@@ -551,6 +551,7 @@ class RDTBatchCollator:
             "action_dim_mask": [],
             "ctrl_freq": [],
         }
+        dataset_ids: list[str] = []
 
         for sample in samples:
             lang, default_lang_mask = self._pad_sequence(
@@ -606,8 +607,13 @@ class RDTBatchCollator:
             batch["ctrl_freq"].append(
                 torch.tensor(float(sample["ctrl_freq"]), dtype=torch.float32)
             )
+            dataset_ids.append(str(sample.get("dataset_id") or "unknown"))
 
-        return {key: torch.stack(values, dim=0) for key, values in batch.items()}
+        output: dict[str, Any] = {
+            key: torch.stack(values, dim=0) for key, values in batch.items()
+        }
+        output["dataset_id"] = dataset_ids
+        return output
 
 
 @dataclass
@@ -648,6 +654,7 @@ class RDTOnlineSiglipBatchCollator:
             "image_slot_mask": [],
         }
         image_slot_jpegs: list[list[bytes]] = []
+        dataset_ids: list[str] = []
 
         for sample in samples:
             lang, default_lang_mask = self._base._pad_sequence(
@@ -699,9 +706,11 @@ class RDTOnlineSiglipBatchCollator:
             )
             tensor_batch["image_slot_mask"].append(slot_mask)
             image_slot_jpegs.append(image_slots)
+            dataset_ids.append(str(sample.get("dataset_id") or "unknown"))
 
         batch: dict[str, Any] = {
             key: torch.stack(values, dim=0) for key, values in tensor_batch.items()
         }
         batch["image_slot_jpegs"] = image_slot_jpegs
+        batch["dataset_id"] = dataset_ids
         return batch

@@ -851,7 +851,10 @@ class SFTConditionedRDT(nn.Module):
         )
         squared_error = diff.pow(2) * valid
 
-        def component_loss_sum(start: int, stop: int) -> tuple[torch.Tensor, torch.Tensor]:
+        def component_losses(
+            start: int,
+            stop: int,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             component_valid = valid[..., start:stop]
             component_count = component_valid.sum(dim=(1, 2))
             component_is_valid = (component_count > 0).to(prediction.dtype)
@@ -859,14 +862,21 @@ class SFTConditionedRDT(nn.Module):
                 squared_error[..., start:stop].sum(dim=(1, 2))
                 / component_count.clamp_min(1.0)
             )
-            return (
-                (component_loss * component_is_valid).sum(),
-                component_is_valid.sum(),
-            )
+            return component_loss, component_is_valid
 
-        xyz_loss_sum, xyz_valid_count = component_loss_sum(0, 3)
-        rot_loss_sum, rot_valid_count = component_loss_sum(3, 6)
-        gripper_loss_sum, gripper_valid_count = component_loss_sum(6, 7)
+        sample_xyz_loss, sample_xyz_valid = component_losses(0, 3)
+        sample_rot_loss, sample_rot_valid = component_losses(3, 6)
+        sample_gripper_loss, sample_gripper_valid = component_losses(6, 7)
+        xyz_loss_sum = (sample_xyz_loss * sample_xyz_valid).sum()
+        xyz_valid_count = sample_xyz_valid.sum()
+        rot_loss_sum = (sample_rot_loss * sample_rot_valid).sum()
+        rot_valid_count = sample_rot_valid.sum()
+        gripper_loss_sum = (
+            sample_gripper_loss * sample_gripper_valid
+        ).sum()
+        gripper_valid_count = sample_gripper_valid.sum()
+        horizon_loss_sum = squared_error.sum(dim=(0, 2))
+        horizon_valid_count = valid.sum(dim=(0, 2))
         # The optimization objective is imitation loss: masked MSE between the
         # predicted clean action/target-state chunk and the ground-truth chunk.
         # XYZ/gripper use ordinary residuals; Euler rotation dims use wrapped
@@ -891,6 +901,19 @@ class SFTConditionedRDT(nn.Module):
             "rot_valid_count": rot_valid_count.detach(),
             "gripper_loss_sum": gripper_loss_sum.detach(),
             "gripper_valid_count": gripper_valid_count.detach(),
+            # Per-example values allow validation to aggregate by LIBERO suite.
+            "sample_imitation_loss": sample_imitation_loss.detach(),
+            "sample_target_mae": sample_mae.detach(),
+            "sample_is_valid": sample_is_valid.detach(),
+            "sample_xyz_loss": sample_xyz_loss.detach(),
+            "sample_xyz_valid": sample_xyz_valid.detach(),
+            "sample_rot_loss": sample_rot_loss.detach(),
+            "sample_rot_valid": sample_rot_valid.detach(),
+            "sample_gripper_loss": sample_gripper_loss.detach(),
+            "sample_gripper_valid": sample_gripper_valid.detach(),
+            # These are element-weighted MSE sums/counts for each future offset.
+            "horizon_loss_sum": horizon_loss_sum.detach(),
+            "horizon_valid_count": horizon_valid_count.detach(),
         }
 
     @torch.no_grad()
