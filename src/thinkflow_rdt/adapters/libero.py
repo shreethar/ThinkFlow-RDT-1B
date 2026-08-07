@@ -117,7 +117,7 @@ def libero_gripper_state_to_closed(gripper_state: np.ndarray) -> np.ndarray:
     if values.shape[-1] == 0:
         raise ValueError("Empty LIBERO gripper state")
     opening = np.mean(np.abs(values), axis=-1)
-    return (opening < 0.02).astype(np.float32)
+    return (opening < 0.035).astype(np.float32)
 
 
 def libero_observation_to_rdt(
