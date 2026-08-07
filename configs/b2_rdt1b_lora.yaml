@@ -52,6 +52,7 @@ data:
   num_workers: 4
   pin_memory: true
   persistent_workers: true
+  stratified_validation: true
 
 training:
   max_steps: 20000
