@@ -50,3 +50,5 @@ dataset/hf_parts
 dataset/LIBERO
 
 thinkflow-libero-features-b0
+checkpoint-1000/
+oxe_b0_merged_for_libero/
