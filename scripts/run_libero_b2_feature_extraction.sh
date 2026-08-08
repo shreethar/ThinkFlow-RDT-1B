@@ -8,8 +8,8 @@ set -euo pipefail
 #
 # Common overrides:
 #   DATA_ROOT=dataset/datasets
-#   OUTPUT_ROOT=cache_features_libero_b2_absolute
-#   GCS_DEST=gs://my-bucket/libero_b2_absolute
+#   OUTPUT_ROOT=cache_features_libero_b2_raw_ortho6d
+#   GCS_DEST=gs://my-bucket/libero_b2_raw_ortho6d
 #   ALL_SAMPLES_PER_EPISODE=1
 #   MAX_SAMPLES_PER_EPISODE=128  # used only when ALL_SAMPLES_PER_EPISODE=0
 #   OVERWRITE=1
@@ -26,7 +26,7 @@ esac
 
 CONFIG=${CONFIG:-configs/b2_rdt1b_lora.yaml}
 DATA_ROOT=${DATA_ROOT:-dataset/datasets}
-OUTPUT_ROOT=${OUTPUT_ROOT:-cache_features_libero_b2_absolute}
+OUTPUT_ROOT=${OUTPUT_ROOT:-cache_features_libero_b2_raw_ortho6d}
 OUT_DIR="${OUTPUT_ROOT}/${SUITE}"
 
 STUDENT_MODEL_ID=${STUDENT_MODEL_ID:-/workspace/model/LatentStudent-ckpt-400-fixed}
@@ -47,7 +47,7 @@ CLOSE_TO_OPEN_BEFORE=${CLOSE_TO_OPEN_BEFORE:-10}
 CLOSE_TO_OPEN_AFTER=${CLOSE_TO_OPEN_AFTER:-11}
 IMAGE_HISTORY_SIZE=${IMAGE_HISTORY_SIZE:-2}
 MAX_IMAGES_PER_SAMPLE=${MAX_IMAGES_PER_SAMPLE:-6}
-IMAGE_JPEG_QUALITY=${IMAGE_JPEG_QUALITY:-85}
+IMAGE_JPEG_QUALITY=${IMAGE_JPEG_QUALITY:-100}
 
 ARGS=(
   --config "$CONFIG"
@@ -57,7 +57,8 @@ ARGS=(
   --split train
   --split validation
   --split test
-  --action-target-mode absolute_state
+  --action-target-mode delta
+  --no-normalize-actions
   --gripper-change-scope directional
   --open-to-close-before "$OPEN_TO_CLOSE_BEFORE"
   --open-to-close-after "$OPEN_TO_CLOSE_AFTER"
