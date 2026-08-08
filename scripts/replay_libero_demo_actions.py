@@ -63,8 +63,10 @@ def action_stats(actions: np.ndarray) -> dict[str, Any]:
         "mean": actions.mean(axis=0).astype(float).tolist(),
         "std": actions.std(axis=0).astype(float).tolist(),
         "gripper_command_counts": {
-            "open_plus_1": int(np.sum(actions[:, 6] > 0.0)),
-            "close_minus_1": int(np.sum(actions[:, 6] < 0.0)),
+            # Keep the dataset/controller convention raw. Its physical meaning
+            # is environment/controller-specific and is not remapped here.
+            "positive": int(np.sum(actions[:, 6] > 0.0)),
+            "negative": int(np.sum(actions[:, 6] < 0.0)),
             "zero": int(np.sum(actions[:, 6] == 0.0)),
         },
     }

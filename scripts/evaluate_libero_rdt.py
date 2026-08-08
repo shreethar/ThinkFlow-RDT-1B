@@ -77,11 +77,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Spatial/datasets/libero_spatial/audit.json"))
     parser.add_argument(
         "--action-output-mode",
-        choices=["absolute_target_state", "normalized_delta"],
-        default="absolute_target_state",
+        choices=["raw_delta_ortho6d", "absolute_target_state", "normalized_delta"],
+        default="raw_delta_ortho6d",
         help=(
-            "Use absolute_target_state for the current B0 target-state model. "
-            "Use normalized_delta only for older LIBERO delta-action checkpoints."
+            "Use raw_delta_ortho6d for the current 10D LIBERO command model. "
+            "Other modes are retained for legacy checkpoints."
         ),
     )
     parser.add_argument(
@@ -267,6 +267,14 @@ def main() -> None:
     max_delta_pos = None if args.max_delta_pos < 0 else args.max_delta_pos
     max_delta_rot = None if args.max_delta_rot < 0 else args.max_delta_rot
     stats = load_action_stats(args.action_stats) if args.action_output_mode == "normalized_delta" else None
+    if (
+        args.action_output_mode != "raw_delta_ortho6d"
+        and cfg.model.action_encoder_layout == "libero_ortho6d"
+    ):
+        raise ValueError(
+            "libero_ortho6d checkpoints must use --action-output-mode "
+            "raw_delta_ortho6d"
+        )
     metadata = load_feature_metadata(args.cache_root)
     qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
     qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
@@ -436,6 +444,7 @@ def main() -> None:
                     lang_tokens, lang_mask = language_by_task[task_id]
                     policy_batch = {
                         "state": encoded["state"].to(device),
+                        "state_dim_mask": encoded["state_dim_mask"].to(device),
                         "action_dim_mask": encoded["action_dim_mask"].to(device),
                         "ctrl_freq": encoded["ctrl_freq"].to(device),
                         "lang_tokens": lang_tokens.expand(len(active), -1, -1).to(device),
@@ -449,7 +458,10 @@ def main() -> None:
                     torch.manual_seed(args.seed + task_id * 100_000 + batch_start * 1_000 + plan_index)
                     model_output = model.sample_actions(policy_batch).float().cpu().numpy()
                     predicted = None
-                    if args.action_output_mode == "normalized_delta":
+                    if args.action_output_mode == "raw_delta_ortho6d":
+                        predicted = rdt_action_to_libero(model_output)
+                        finite_actions = predicted
+                    elif args.action_output_mode == "normalized_delta":
                         assert stats is not None
                         predicted = rdt_action_to_libero(model_output, stats)
                         finite_actions = predicted

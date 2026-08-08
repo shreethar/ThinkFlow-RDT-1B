@@ -132,19 +132,22 @@ def masked_action_mse(
     target: torch.Tensor,
     time_mask: torch.Tensor,
     dim_mask: torch.Tensor,
+    *,
+    wrap_euler: bool = True,
 ) -> float:
     valid = time_mask.unsqueeze(-1).to(prediction.dtype) * dim_mask.unsqueeze(1).to(
         prediction.dtype
     )
     diff = prediction - target
-    diff = torch.cat(
-        [
-            diff[..., :3],
-            torch.atan2(torch.sin(diff[..., 3:6]), torch.cos(diff[..., 3:6])),
-            diff[..., 6:],
-        ],
-        dim=-1,
-    )
+    if wrap_euler:
+        diff = torch.cat(
+            [
+                diff[..., :3],
+                torch.atan2(torch.sin(diff[..., 3:6]), torch.cos(diff[..., 3:6])),
+                diff[..., 6:],
+            ],
+            dim=-1,
+        )
     return float((diff.pow(2).mul(valid).sum() / valid.sum().clamp_min(1.0)).detach().cpu())
 
 
@@ -200,6 +203,9 @@ def main() -> None:
             action_dim=cfg.model.action_dim,
             lang_token_dim=cfg.model.lang_token_dim,
             qwen_kv_dim=cfg.model.qwen_kv_dim,
+            convert_cached_gripper_closed_to_open=(
+                cfg.model.convert_cached_gripper_closed_to_open
+            ),
         )
     else:
         collator = RDTBatchCollator(
@@ -212,6 +218,9 @@ def main() -> None:
             lang_token_dim=cfg.model.lang_token_dim,
             img_token_dim=cfg.model.img_token_dim,
             qwen_kv_dim=cfg.model.qwen_kv_dim,
+            convert_cached_gripper_closed_to_open=(
+                cfg.model.convert_cached_gripper_closed_to_open
+            ),
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -292,6 +301,7 @@ def main() -> None:
                         target,
                         batch["action_time_mask"],
                         batch["action_dim_mask"],
+                        wrap_euler=(cfg.model.action_encoder_layout == "rdt_eef"),
                     ),
                     "sample_mse_xyz": masked_component_mse(
                         prediction,
@@ -307,8 +317,8 @@ def main() -> None:
                         batch["action_time_mask"],
                         batch["action_dim_mask"],
                         3,
-                        6,
-                        wrap_angles=True,
+                        9 if cfg.model.action_encoder_layout == "libero_ortho6d" else 6,
+                        wrap_angles=(cfg.model.action_encoder_layout == "rdt_eef"),
                     ),
                     "sample_mse_rot_raw": masked_component_mse(
                         prediction,
@@ -316,15 +326,15 @@ def main() -> None:
                         batch["action_time_mask"],
                         batch["action_dim_mask"],
                         3,
-                        6,
+                        9 if cfg.model.action_encoder_layout == "libero_ortho6d" else 6,
                     ),
                     "sample_mse_gripper": masked_component_mse(
                         prediction,
                         target,
                         batch["action_time_mask"],
                         batch["action_dim_mask"],
-                        6,
-                        7,
+                        9 if cfg.model.action_encoder_layout == "libero_ortho6d" else 6,
+                        10 if cfg.model.action_encoder_layout == "libero_ortho6d" else 7,
                     ),
                 }
                 sample_metrics.update(tensor_stats("prediction", prediction))
@@ -336,13 +346,18 @@ def main() -> None:
             key: sum(item[key] for item in loss_metrics) / len(loss_metrics)
             for key in loss_metrics[0]
         }
-        target_gripper_open = batch["actions"][..., 6].detach().float().cpu()
+        target_gripper = batch["actions"][..., -1].detach().float().cpu()
+        gripper_mean_name = (
+            "target_raw_gripper_command_mean"
+            if cfg.model.action_encoder_layout == "libero_ortho6d"
+            else "target_gripper_open_mean"
+        )
         summaries.append(
             {
                 "indices": batch_indices,
                 "metadata": [sample.get("metadata", {}) for sample in samples],
                 "loss_forward": averaged_loss,
-                "target_gripper_open_mean": float(target_gripper_open.mean()),
+                gripper_mean_name: float(target_gripper.mean()),
                 "valid_action_tokens": int(batch["action_time_mask"].sum().item()),
                 **sample_metrics,
             }

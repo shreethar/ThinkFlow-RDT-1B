@@ -334,19 +334,33 @@ def metric_sums(
     target: torch.Tensor,
     time_mask: torch.Tensor,
     dim_mask: torch.Tensor,
+    *,
+    action_layout: str,
 ) -> dict[str, torch.Tensor]:
     valid = time_mask.unsqueeze(-1).to(prediction.dtype) * dim_mask.unsqueeze(1).to(
         prediction.dtype
     )
     raw_diff = prediction - target
-    diff = torch.cat(
-        [
-            raw_diff[..., :3],
-            torch.atan2(torch.sin(raw_diff[..., 3:6]), torch.cos(raw_diff[..., 3:6])),
-            raw_diff[..., 6:],
-        ],
-        dim=-1,
-    )
+    if action_layout == "libero_ortho6d":
+        # The six rotation values are a continuous matrix representation, not
+        # angles. They must be compared directly rather than wrapped at pi.
+        diff = raw_diff
+        rotation_slice = slice(3, 9)
+        gripper_slice = slice(9, 10)
+    else:
+        diff = torch.cat(
+            [
+                raw_diff[..., :3],
+                torch.atan2(
+                    torch.sin(raw_diff[..., 3:6]),
+                    torch.cos(raw_diff[..., 3:6]),
+                ),
+                raw_diff[..., 6:],
+            ],
+            dim=-1,
+        )
+        rotation_slice = slice(3, 6)
+        gripper_slice = slice(6, 7)
     squared = diff.pow(2) * valid
     absolute = diff.abs() * valid
     return {
@@ -355,10 +369,10 @@ def metric_sums(
         "valid_count": valid.sum(),
         "xyz_loss_sum": squared[..., :3].sum(),
         "xyz_valid_count": valid[..., :3].sum(),
-        "rot_loss_sum": squared[..., 3:6].sum(),
-        "rot_valid_count": valid[..., 3:6].sum(),
-        "gripper_loss_sum": squared[..., 6:7].sum(),
-        "gripper_valid_count": valid[..., 6:7].sum(),
+        "rot_loss_sum": squared[..., rotation_slice].sum(),
+        "rot_valid_count": valid[..., rotation_slice].sum(),
+        "gripper_loss_sum": squared[..., gripper_slice].sum(),
+        "gripper_valid_count": valid[..., gripper_slice].sum(),
     }
 
 
@@ -374,7 +388,11 @@ def loss_at_timesteps(
     states = batch["state"].unsqueeze(1)
     actions = batch["actions"]
     time_mask = batch["action_time_mask"].bool()
-    dim_mask = batch["action_dim_mask"].to(actions.dtype).unsqueeze(1)
+    action_dim_mask = batch["action_dim_mask"].to(actions.dtype).unsqueeze(1)
+    state_dim_mask = batch.get(
+        "state_dim_mask",
+        torch.ones_like(batch["state"]),
+    ).to(states.dtype).unsqueeze(1)
     generator = torch.Generator(device=actions.device)
     generator.manual_seed(noise_seed)
     noise = torch.randn(
@@ -385,11 +403,11 @@ def loss_at_timesteps(
     )
     noisy_actions = model.runner.noise_scheduler.add_noise(actions, noise, timesteps)
     action_token_mask = (
-        dim_mask.expand(-1, actions.shape[1], -1)
+        action_dim_mask.expand(-1, actions.shape[1], -1)
         * time_mask.unsqueeze(-1).to(actions.dtype)
     )
     noisy_actions = noisy_actions * action_token_mask
-    state_input = model._state_encoder_input(states, dim_mask)
+    state_input = model._state_encoder_input(states, state_dim_mask)
     state_cond = model.runner.state_adaptor(state_input)
     action_cond = model._adapt_actions(noisy_actions, action_token_mask)
     state_action_cond = torch.cat([state_cond, action_cond], dim=1)
@@ -398,6 +416,7 @@ def loss_at_timesteps(
         img_cond,
         lang_mask,
         external_kv,
+        external_cross_kv,
         extra_cross_cond,
         extra_cross_mask,
     ) = model._adapt_static_conditions(batch, state_cond=state_cond)
@@ -410,6 +429,7 @@ def loss_at_timesteps(
         lang_mask=lang_mask,
         img_mask=batch["img_mask"].bool(),
         external_kv=external_kv,
+        external_cross_kv=external_cross_kv,
         extra_cross_cond=extra_cross_cond,
         extra_cross_mask=extra_cross_mask,
         unified_cross_attention=(
@@ -421,6 +441,7 @@ def loss_at_timesteps(
         actions.float(),
         batch["action_time_mask"],
         batch["action_dim_mask"],
+        action_layout=model.cfg.model.action_encoder_layout,
     )
 
 
@@ -463,6 +484,8 @@ def add_horizon_metrics(
     target: torch.Tensor,
     time_mask: torch.Tensor,
     dim_mask: torch.Tensor,
+    *,
+    action_layout: str,
 ) -> None:
     prediction = prediction.detach().float().cpu()
     target = target.detach().float().cpu()
@@ -470,23 +493,33 @@ def add_horizon_metrics(
     dim_mask = dim_mask.detach().float().cpu()
     valid = time_mask.unsqueeze(-1).float() * dim_mask.unsqueeze(1)
     raw_diff = prediction - target
-    diff = torch.cat(
-        [
-            raw_diff[..., :3],
-            torch.atan2(torch.sin(raw_diff[..., 3:6]), torch.cos(raw_diff[..., 3:6])),
-            raw_diff[..., 6:],
-        ],
-        dim=-1,
-    )
+    if action_layout == "libero_ortho6d":
+        diff = raw_diff
+        rotation_slice = slice(3, 9)
+        gripper_slice = slice(9, 10)
+    else:
+        diff = torch.cat(
+            [
+                raw_diff[..., :3],
+                torch.atan2(
+                    torch.sin(raw_diff[..., 3:6]),
+                    torch.cos(raw_diff[..., 3:6]),
+                ),
+                raw_diff[..., 6:],
+            ],
+            dim=-1,
+        )
+        rotation_slice = slice(3, 6)
+        gripper_slice = slice(6, 7)
     squared = diff.pow(2) * valid
     store["all_error"] += squared.sum(dim=(0, 2)).double()
     store["all_count"] += valid.sum(dim=(0, 2)).double()
     store["xyz_error"] += squared[..., :3].sum(dim=(0, 2)).double()
     store["xyz_count"] += valid[..., :3].sum(dim=(0, 2)).double()
-    store["rot_error"] += squared[..., 3:6].sum(dim=(0, 2)).double()
-    store["rot_count"] += valid[..., 3:6].sum(dim=(0, 2)).double()
-    store["gripper_error"] += squared[..., 6:7].sum(dim=(0, 2)).double()
-    store["gripper_count"] += valid[..., 6:7].sum(dim=(0, 2)).double()
+    store["rot_error"] += squared[..., rotation_slice].sum(dim=(0, 2)).double()
+    store["rot_count"] += valid[..., rotation_slice].sum(dim=(0, 2)).double()
+    store["gripper_error"] += squared[..., gripper_slice].sum(dim=(0, 2)).double()
+    store["gripper_count"] += valid[..., gripper_slice].sum(dim=(0, 2)).double()
 
 
 def finalize_horizon_metrics(store: dict[str, torch.Tensor]) -> dict[str, list[float]]:
@@ -507,16 +540,16 @@ def initialize_gripper_store() -> dict[str, float]:
     return {
         "valid": 0.0,
         "correct": 0.0,
-        "tp_open": 0.0,
-        "fp_open": 0.0,
-        "fn_open": 0.0,
-        "tp_closed": 0.0,
-        "fp_closed": 0.0,
-        "fn_closed": 0.0,
+        "tp_positive": 0.0,
+        "fp_positive": 0.0,
+        "fn_positive": 0.0,
+        "tp_negative": 0.0,
+        "fp_negative": 0.0,
+        "fn_negative": 0.0,
         "transition_valid": 0.0,
         "transition_correct": 0.0,
-        "target_open": 0.0,
-        "pred_open": 0.0,
+        "target_positive": 0.0,
+        "pred_positive": 0.0,
     }
 
 
@@ -526,21 +559,29 @@ def add_gripper_metrics(
     target: torch.Tensor,
     time_mask: torch.Tensor,
     dim_mask: torch.Tensor,
+    *,
+    action_layout: str,
 ) -> None:
-    pred = prediction.detach().float().cpu()[..., 6] >= 0.5
-    true = target.detach().float().cpu()[..., 6] >= 0.5
+    if action_layout == "libero_ortho6d":
+        gripper_index = 9
+        threshold = 0.0
+    else:
+        gripper_index = 6
+        threshold = 0.5
+    pred = prediction.detach().float().cpu()[..., gripper_index] >= threshold
+    true = target.detach().float().cpu()[..., gripper_index] >= threshold
     valid = time_mask.detach().bool().cpu()
-    valid &= dim_mask.detach().float().cpu()[:, 6].unsqueeze(1) > 0
+    valid &= dim_mask.detach().float().cpu()[:, gripper_index].unsqueeze(1) > 0
     store["valid"] += float(valid.sum())
     store["correct"] += float(((pred == true) & valid).sum())
-    store["target_open"] += float((true & valid).sum())
-    store["pred_open"] += float((pred & valid).sum())
-    store["tp_open"] += float((pred & true & valid).sum())
-    store["fp_open"] += float((pred & ~true & valid).sum())
-    store["fn_open"] += float((~pred & true & valid).sum())
-    store["tp_closed"] += float((~pred & ~true & valid).sum())
-    store["fp_closed"] += float((~pred & true & valid).sum())
-    store["fn_closed"] += float((pred & ~true & valid).sum())
+    store["target_positive"] += float((true & valid).sum())
+    store["pred_positive"] += float((pred & valid).sum())
+    store["tp_positive"] += float((pred & true & valid).sum())
+    store["fp_positive"] += float((pred & ~true & valid).sum())
+    store["fn_positive"] += float((~pred & true & valid).sum())
+    store["tp_negative"] += float((~pred & ~true & valid).sum())
+    store["fp_negative"] += float((~pred & true & valid).sum())
+    store["fn_negative"] += float((pred & ~true & valid).sum())
     transition_valid = valid[:, 1:] & valid[:, :-1] & (true[:, 1:] != true[:, :-1])
     store["transition_valid"] += float(transition_valid.sum())
     store["transition_correct"] += float(((pred[:, 1:] == true[:, 1:]) & transition_valid).sum())
@@ -550,16 +591,37 @@ def safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator > 0 else 0.0
 
 
-def finalize_gripper_metrics(store: dict[str, float]) -> dict[str, float]:
+def finalize_gripper_metrics(
+    store: dict[str, float],
+    *,
+    action_layout: str,
+) -> dict[str, float | str]:
     return {
         "accuracy": safe_ratio(store["correct"], store["valid"]),
         "valid": store["valid"],
-        "target_open_rate": safe_ratio(store["target_open"], store["valid"]),
-        "pred_open_rate": safe_ratio(store["pred_open"], store["valid"]),
-        "open_precision": safe_ratio(store["tp_open"], store["tp_open"] + store["fp_open"]),
-        "open_recall": safe_ratio(store["tp_open"], store["tp_open"] + store["fn_open"]),
-        "closed_precision": safe_ratio(store["tp_closed"], store["tp_closed"] + store["fp_closed"]),
-        "closed_recall": safe_ratio(store["tp_closed"], store["tp_closed"] + store["fn_closed"]),
+        "positive_label": (
+            "raw_action_ge_0"
+            if action_layout == "libero_ortho6d"
+            else "legacy_gripper_open_ge_0.5"
+        ),
+        "target_positive_rate": safe_ratio(store["target_positive"], store["valid"]),
+        "pred_positive_rate": safe_ratio(store["pred_positive"], store["valid"]),
+        "positive_precision": safe_ratio(
+            store["tp_positive"],
+            store["tp_positive"] + store["fp_positive"],
+        ),
+        "positive_recall": safe_ratio(
+            store["tp_positive"],
+            store["tp_positive"] + store["fn_positive"],
+        ),
+        "negative_precision": safe_ratio(
+            store["tp_negative"],
+            store["tp_negative"] + store["fp_negative"],
+        ),
+        "negative_recall": safe_ratio(
+            store["tp_negative"],
+            store["tp_negative"] + store["fn_negative"],
+        ),
         "transition_accuracy": safe_ratio(
             store["transition_correct"],
             store["transition_valid"],
@@ -578,6 +640,9 @@ def build_collator(cfg: ExperimentConfig, *, online_siglip: bool):
             action_dim=cfg.model.action_dim,
             lang_token_dim=cfg.model.lang_token_dim,
             qwen_kv_dim=cfg.model.qwen_kv_dim,
+            convert_cached_gripper_closed_to_open=(
+                cfg.model.convert_cached_gripper_closed_to_open
+            ),
         )
     return RDTBatchCollator(
         max_lang_tokens=cfg.model.max_lang_tokens,
@@ -589,6 +654,9 @@ def build_collator(cfg: ExperimentConfig, *, online_siglip: bool):
         lang_token_dim=cfg.model.lang_token_dim,
         img_token_dim=cfg.model.img_token_dim,
         qwen_kv_dim=cfg.model.qwen_kv_dim,
+        convert_cached_gripper_closed_to_open=(
+            cfg.model.convert_cached_gripper_closed_to_open
+        ),
     )
 
 
@@ -724,6 +792,7 @@ def evaluate_model(
                     target,
                     variant_batch["action_time_mask"],
                     variant_batch["action_dim_mask"],
+                    action_layout=cfg.model.action_encoder_layout,
                 )
                 add_sums(sample_loss_accumulators[variant], sums)
                 add_horizon_metrics(
@@ -732,6 +801,7 @@ def evaluate_model(
                     target,
                     variant_batch["action_time_mask"],
                     variant_batch["action_dim_mask"],
+                    action_layout=cfg.model.action_encoder_layout,
                 )
                 add_gripper_metrics(
                     gripper_accumulators[variant],
@@ -739,6 +809,7 @@ def evaluate_model(
                     target,
                     variant_batch["action_time_mask"],
                     variant_batch["action_dim_mask"],
+                    action_layout=cfg.model.action_encoder_layout,
                 )
 
         batches_seen += 1
@@ -762,7 +833,10 @@ def evaluate_model(
         sample_by_variant[variant] = {
             "sample_metrics": finalize_loss_sums(sample_loss_accumulators[variant]),
             "horizon": finalize_horizon_metrics(horizon_accumulators[variant]),
-            "gripper": finalize_gripper_metrics(gripper_accumulators[variant]),
+            "gripper": finalize_gripper_metrics(
+                gripper_accumulators[variant],
+                action_layout=cfg.model.action_encoder_layout,
+            ),
         }
 
     return {

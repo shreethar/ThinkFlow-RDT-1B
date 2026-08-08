@@ -154,10 +154,22 @@ def arrays_to_npz_bytes(sample: dict[str, Any]) -> bytes:
     np.savez_compressed(
         buffer,
         state=np.asarray(sample["state"], dtype=np.float32),
-        state_mask=np.asarray(sample.get("state_mask", np.ones((7,), dtype=np.float32)), dtype=np.float32),
+        state_mask=np.asarray(
+            sample.get(
+                "state_mask",
+                np.ones((np.asarray(sample["state"]).size,), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        ),
         actions=np.asarray(sample["actions"], dtype=np.float32),
         actions_mask=np.asarray(sample["actions_mask"], dtype=np.float32),
-        action_dim_mask=np.asarray(sample.get("action_dim_mask", np.ones((7,), dtype=np.float32)), dtype=np.float32),
+        action_dim_mask=np.asarray(
+            sample.get(
+                "action_dim_mask",
+                np.ones((np.asarray(sample["actions"]).shape[-1],), dtype=np.float32),
+            ),
+            dtype=np.float32,
+        ),
     )
     return buffer.getvalue()
 
@@ -225,8 +237,12 @@ def add_sample_to_shard(
         "images": image_members,
         "image_mask": image_mask,
         "ctrl_freq": float(sample.get("ctrl_freq", CTRL_FREQ_BY_DATASET.get(dataset_id, 10.0))),
-        "actions_are_normalized": True,
-        "gripper_convention_before_normalization": "0=open, 1=closed",
+        "actions_are_normalized": dataset_id not in LIBERO_DATASET_IDS,
+        "gripper_convention_before_normalization": (
+            "raw LIBERO command preserved"
+            if dataset_id in LIBERO_DATASET_IDS
+            else "0=open, 1=closed"
+        ),
     }
     metadata_member = f"{sample_dir}/metadata.json"
     add_bytes_to_tar(

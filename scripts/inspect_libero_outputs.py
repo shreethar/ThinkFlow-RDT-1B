@@ -20,10 +20,9 @@ for path in (REPO_ROOT / "src", REPO_ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 from thinkflow_rdt.adapters.libero import (  # noqa: E402
-    libero_gripper_closed,
-    libero_gripper_state_to_closed,
+    libero_action_to_rdt,
     libero_observation_to_rdt,
-    libero_orientation_to_rpy,
+    libero_orientation_to_ortho6d,
 )
 
 RDT_VALUE_DIM = 128
@@ -142,17 +141,19 @@ def hdf5_tree(group: Any, *, depth: int, max_items: int) -> dict[str, Any]:
     return result
 
 
-def rdt_256_from_state_open(state_open: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def rdt_256_from_libero_state(state: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     values = np.zeros((RDT_VALUE_DIM,), dtype=np.float32)
     masks = np.zeros((RDT_VALUE_DIM,), dtype=np.float32)
-    state = np.asarray(state_open, dtype=np.float32).reshape(-1)
-    if state.shape[0] != 7:
-        raise ValueError(f"Expected 7D [xyz,rpy,gripper_open], got {state.shape}")
-    values[10] = state[6]
-    masks[10] = 1.0
+    state = np.asarray(state, dtype=np.float32).reshape(-1)
+    if state.shape[0] != 11:
+        raise ValueError(
+            f"Expected 11D [xyz,ortho6D,finger0,finger1], got {state.shape}"
+        )
+    values[10:12] = state[9:11]
+    masks[10:12] = 1.0
     values[30:33] = state[:3]
     masks[30:33] = 1.0
-    values[33:39] = euler_xyz_to_ortho6d_numpy(state[3:6])
+    values[33:39] = state[3:9]
     masks[33:39] = 1.0
     packed = np.concatenate([values, masks], axis=0)
     return values, masks, packed
@@ -171,26 +172,25 @@ def euler_xyz_to_ortho6d_numpy(euler: np.ndarray) -> np.ndarray:
     return np.concatenate([first_column, second_column], axis=0)
 
 
-def rdt_conversion_report(state_closed: np.ndarray) -> dict[str, Any]:
-    state_closed = np.asarray(state_closed, dtype=np.float32).reshape(7)
-    state_open = state_closed.copy()
-    state_open[6] = 1.0 - state_open[6]
-    values, masks, packed = rdt_256_from_state_open(state_open)
+def rdt_conversion_report(state: np.ndarray) -> dict[str, Any]:
+    state = np.asarray(state, dtype=np.float32).reshape(11)
+    values, masks, packed = rdt_256_from_libero_state(state)
     nonzero_value_indices = np.flatnonzero(values).astype(int).tolist()
     nonzero_mask_indices = np.flatnonzero(masks).astype(int).tolist()
     return {
-        "adapter_7d_state_closed_convention": {
-            "names": ["x", "y", "z", "roll", "pitch", "yaw", "gripper_closed"],
-            "values": state_closed,
-        },
-        "model_7d_state_open_convention": {
-            "names": ["x", "y", "z", "roll", "pitch", "yaw", "gripper_open"],
-            "values": state_open,
+        "libero_11d_state": {
+            "names": [
+                "x", "y", "z",
+                "rot6d_0", "rot6d_1", "rot6d_2",
+                "rot6d_3", "rot6d_4", "rot6d_5",
+                "finger_0", "finger_1",
+            ],
+            "values": state,
         },
         "rdt_128_values_nonzero_indices": nonzero_value_indices,
         "rdt_128_mask_indices": nonzero_mask_indices,
         "rdt_slots": {
-            "gripper_open_index_10": float(values[10]),
+            "raw_fingers_indices_10_11": values[10:12],
             "xyz_indices_30_32": values[30:33],
             "ortho6d_indices_33_38": values[33:39],
         },
@@ -232,21 +232,18 @@ def inspect_demo_file(path: Path, *, demo_name: str | None, step: int) -> dict[s
                 break
         if position is None or orientation is None:
             raise KeyError("Could not find LIBERO EEF position/orientation keys in demo obs")
-        if gripper_state is not None:
-            gripper_closed = float(libero_gripper_state_to_closed(gripper_state))
-        else:
-            gripper_closed = float(libero_gripper_closed(actions[step_index, 6]))
-        state_closed = np.concatenate(
+        if gripper_state is None or np.asarray(gripper_state).size < 2:
+            raise KeyError("Could not find two raw LIBERO finger positions")
+        state = np.concatenate(
             [
                 np.asarray(position, dtype=np.float32).reshape(3),
-                libero_orientation_to_rpy(np.asarray(orientation)).reshape(3),
-                np.array([gripper_closed], dtype=np.float32),
+                libero_orientation_to_ortho6d(np.asarray(orientation)).reshape(6),
+                np.asarray(gripper_state, dtype=np.float32).reshape(-1)[:2],
             ],
             axis=0,
         )
         raw_action = actions[step_index, :7].copy()
-        binarized_action = raw_action.copy()
-        binarized_action[6] = libero_gripper_closed(raw_action[6])
+        encoded_action = libero_action_to_rdt(raw_action)
         return {
             "file": path,
             "root_attrs": {name: _json_default(value) for name, value in handle.attrs.items()},
@@ -267,21 +264,20 @@ def inspect_demo_file(path: Path, *, demo_name: str | None, step: int) -> dict[s
                     "libero_gripper_command",
                 ],
                 "values": raw_action,
-                "gripper_convention": "+1=open, -1=close in the project command convention",
+                "gripper_convention": "raw HDF5 value preserved without remapping",
             },
-            "adapter_binarized_action_at_step": {
+            "adapter_10d_action_at_step": {
                 "names": [
                     "delta_x",
                     "delta_y",
                     "delta_z",
-                    "delta_rx",
-                    "delta_ry",
-                    "delta_rz",
-                    "gripper_closed",
+                    "delta_rot6d_0", "delta_rot6d_1", "delta_rot6d_2",
+                    "delta_rot6d_3", "delta_rot6d_4", "delta_rot6d_5",
+                    "raw_gripper_command",
                 ],
-                "values": binarized_action,
+                "values": encoded_action,
             },
-            "state_conversion": rdt_conversion_report(state_closed),
+            "state_conversion": rdt_conversion_report(state),
         }
 
 
@@ -367,14 +363,15 @@ def main() -> None:
     args = parse_args()
     report: dict[str, Any] = {
         "conventions": {
-            "project_gripper_command": "+1=open, -1=close",
-            "adapter_state": "[x,y,z,roll,pitch,yaw,gripper_closed]",
-            "model_state": "[x,y,z,roll,pitch,yaw,gripper_open]",
+            "gripper_action": "raw HDF5 command, no remapping",
+            "adapter_state": "[xyz,absolute_ortho6d,finger0,finger1] (11D)",
+            "model_action": "[dxyz,relative_ortho6d,raw_gripper_command] (10D)",
             "rdt_native_state": "256D = 128 values + 128 masks",
             "rdt_slots": {
-                "values[10]": "gripper_open",
+                "state values[10:12]": "raw finger0/finger1",
+                "action values[10]": "raw gripper command",
                 "values[30:33]": "xyz position",
-                "values[33:39]": "ortho6d rotation converted from XYZ Euler RPY",
+                "values[33:39]": "ortho6d rotation",
             },
         }
     }

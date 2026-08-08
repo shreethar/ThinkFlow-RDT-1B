@@ -59,6 +59,8 @@ from thinkflow_rdt.adapters.action_stats import (  # noqa: E402
     load_action_stats,
 )
 from thinkflow_rdt.adapters.libero import (  # noqa: E402
+    LIBERO_ACTION_DIM,
+    LIBERO_STATE_DIM,
     libero_observation_to_rdt,
     rdt_action_to_libero,
 )
@@ -184,13 +186,8 @@ def wrap_rpy_delta(delta: np.ndarray) -> np.ndarray:
 
 
 def rdt_state_open_from_libero(observation: dict[str, Any]) -> np.ndarray:
-    converted = libero_observation_to_rdt(observation)
-    state = converted["state"].copy()
-    # Live rollout bypasses the training collator. The cached data is
-    # gripper_closed, but the current RDT checkpoint expects dim 6 to be
-    # gripper_open because that is the pretrained RDT convention.
-    state[..., 6] = 1.0 - state[..., 6]
-    return state
+    """Return the current raw-finger LIBERO state (legacy name)."""
+    return libero_observation_to_rdt(observation)["state"].copy()
 
 
 def absolute_target_state_to_libero_action(
@@ -212,7 +209,8 @@ def absolute_target_state_to_libero_action(
         action[:3] = np.clip(action[:3], -float(max_delta_pos), float(max_delta_pos))
     if max_delta_rot is not None:
         action[3:6] = np.clip(action[3:6], -float(max_delta_rot), float(max_delta_rot))
-    # Keep the project's signed convention: +1=open and -1=close.
+    # Legacy absolute-target thresholding only. The current raw-command path
+    # bypasses this function and preserves the demonstrated action sign.
     action[6] = 1.0 if float(target[6]) >= 0.5 else -1.0
     return action
 
@@ -227,9 +225,6 @@ def rollout_sample(
 ) -> dict[str, Any]:
     converted = libero_observation_to_rdt(observation)
     state = converted["state"].copy()
-    # Match the current model input convention. Cached training examples are
-    # flipped in the collator; live rollout has to perform the same conversion.
-    state[..., 6] = 1.0 - state[..., 6]
     current = {
         "primary": Image.fromarray(converted["primary"]).convert("RGB"),
         "wrist": None if converted["wrist"] is None else Image.fromarray(converted["wrist"]).convert("RGB"),
@@ -265,9 +260,10 @@ def rollout_sample(
         "image_history": [previous, current],
         "image_history_mask": [previous_mask, current_mask],
         "state": state,
-        "state_mask": np.ones(7, dtype=np.float32),
-        "actions": np.zeros((horizon, 7), dtype=np.float32),
+        "state_mask": np.ones(LIBERO_STATE_DIM, dtype=np.float32),
+        "actions": np.zeros((horizon, LIBERO_ACTION_DIM), dtype=np.float32),
         "actions_mask": np.ones(horizon, dtype=np.float32),
+        "action_dim_mask": np.ones(LIBERO_ACTION_DIM, dtype=np.float32),
         "ctrl_freq": 20.0,
     }
 
@@ -303,11 +299,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Spatial/datasets/libero_spatial/audit.json"))
     parser.add_argument(
         "--action-output-mode",
-        choices=["absolute_target_state", "normalized_delta"],
-        default="absolute_target_state",
+        choices=["raw_delta_ortho6d", "absolute_target_state", "normalized_delta"],
+        default="raw_delta_ortho6d",
         help=(
-            "Use absolute_target_state for the current B0 target-state model. "
-            "Use normalized_delta only for older LIBERO delta-action checkpoints."
+            "Use raw_delta_ortho6d for the 10D LIBERO command model. The other "
+            "modes are retained for legacy checkpoints."
         ),
     )
     parser.add_argument(
@@ -441,6 +437,14 @@ def main() -> None:
             "q99": stats.q99.astype(float).tolist(),
             "eps": stats.eps,
         }, indent=2))
+    if (
+        args.action_output_mode != "raw_delta_ortho6d"
+        and cfg.model.action_encoder_layout == "libero_ortho6d"
+    ):
+        raise ValueError(
+            "libero_ortho6d checkpoints must use --action-output-mode "
+            "raw_delta_ortho6d"
+        )
     metadata = load_feature_metadata(args.cache_root)
     qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
     qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
@@ -584,6 +588,7 @@ def main() -> None:
             )
             batch = {
                 "state": encoded["state"].to(device),
+                "state_dim_mask": encoded["state_dim_mask"].to(device),
                 "action_dim_mask": encoded["action_dim_mask"].to(device),
                 "ctrl_freq": encoded["ctrl_freq"].to(device),
                 "lang_tokens": lang_tokens.to(device),
@@ -596,7 +601,10 @@ def main() -> None:
                 batch["qwen_kv"] = cached_qwen
             torch.manual_seed(args.seed + plan_index)
             model_output = model.sample_actions(batch)[0].float().cpu().numpy()
-            if args.action_output_mode == "normalized_delta":
+            if args.action_output_mode == "raw_delta_ortho6d":
+                denormalized = None
+                actions = rdt_action_to_libero(model_output)
+            elif args.action_output_mode == "normalized_delta":
                 assert stats is not None
                 denormalized = denormalize_action_array(model_output, stats)
                 actions = rdt_action_to_libero(model_output, stats)
@@ -628,7 +636,16 @@ def main() -> None:
                     "simulator_step_start": simulator_step,
                     "pred_horizon": int(cfg.model.pred_horizon),
                     "executed_steps": int(chunk),
-                    "dim_names": ACTION_DIM_NAMES[: model_output.shape[-1]],
+                    "dim_names": (
+                        [
+                            "dx", "dy", "dz",
+                            "rot6d_0", "rot6d_1", "rot6d_2",
+                            "rot6d_3", "rot6d_4", "rot6d_5",
+                            "raw_gripper_command",
+                        ]
+                        if model_output.shape[-1] == LIBERO_ACTION_DIM
+                        else ACTION_DIM_NAMES[: model_output.shape[-1]]
+                    ),
                     "action_output_mode": args.action_output_mode,
                     "model_output_stats": action_debug_stats(model_output),
                     "model_outputs": array_to_nested_float_list(model_output),
@@ -644,14 +661,23 @@ def main() -> None:
                     }
                     debug_row["denormalized_delta_stats"] = action_debug_stats(denormalized)
                     debug_row["denormalized_delta_actions"] = array_to_nested_float_list(denormalized)
-                else:
+                elif args.action_output_mode == "absolute_target_state":
                     debug_row["absolute_target_state_conversion"] = {
                         "target_state_start_index": int(args.target_state_start_index),
                         "pos_scale": float(args.pos_scale),
                         "rot_scale": float(args.rot_scale),
                         "max_delta_pos": max_delta_pos,
                         "max_delta_rot": max_delta_rot,
-                        "gripper": "model dim 6 is gripper_open; project command is +1 open, -1 close",
+                        "gripper": (
+                            "legacy absolute-state binary conversion at dim 6; "
+                            "not used by raw_delta_ortho6d"
+                        ),
+                    }
+                else:
+                    debug_row["raw_delta_ortho6d_conversion"] = {
+                        "translation": "dims 0:3 copied and clipped to [-1,1]",
+                        "rotation": "dims 3:9 Gram-Schmidt -> rotvec / 0.5",
+                        "gripper": "dim 9 copied unchanged apart from [-1,1] clipping",
                     }
             executed_actions: list[np.ndarray] = []
             for action_index in range(chunk):
