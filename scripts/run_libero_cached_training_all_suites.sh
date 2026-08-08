@@ -14,7 +14,7 @@ set -euo pipefail
 #   2. Pass BASE_ARTIFACT=/path/to/merged_artifact here. The merged RDT core is
 #      loaded before a fresh LIBERO LoRA adapter is created.
 
-CACHE_ROOT=${1:-${CACHE_ROOT:-thinkflow-libero-features-b0}}
+CACHE_ROOT=${1:-${CACHE_ROOT:-cache_features_libero_b0_raw_ortho6d}}
 CONFIG=${CONFIG:-configs/b0_rdt1b_lora.yaml}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/libero_b0_all_suites}
 SUITES=${SUITES:-"libero_spatial libero_object libero_goal libero_10 libero_90"}
