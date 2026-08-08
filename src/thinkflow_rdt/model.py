@@ -420,10 +420,10 @@ class SFTConditionedRDT(nn.Module):
         self.horizon = cfg.model.pred_horizon
         self.rdt_state_dim = cfg.model.resolved_rdt_state_dim
         self.use_native_state_encoder = (
-            cfg.model.state_encoder_layout == "rdt_eef"
+            cfg.model.state_encoder_layout in {"rdt_eef", "libero_ortho6d"}
         )
         self.use_native_action_encoder = (
-            cfg.model.action_encoder_layout == "rdt_eef"
+            cfg.model.action_encoder_layout in {"rdt_eef", "libero_ortho6d"}
         )
 
         projector_width = cfg.model.hidden_size
@@ -590,6 +590,7 @@ class SFTConditionedRDT(nn.Module):
             "img_tokens",
             "qwen_kv",
             "state",
+            "state_dim_mask",
             "actions",
             "action_dim_mask",
             "ctrl_freq",
@@ -629,9 +630,9 @@ class SFTConditionedRDT(nn.Module):
             raise ValueError(
                 f"State values/mask shapes differ: {values.shape} vs {raw_mask.shape}"
             )
-        if values.shape[-1] != self.cfg.model.action_dim:
+        if values.shape[-1] != self.cfg.model.state_dim:
             raise ValueError(
-                f"Expected raw state width {self.cfg.model.action_dim}, got "
+                f"Expected raw state width {self.cfg.model.state_dim}, got "
                 f"{values.shape[-1]}"
             )
         if not self.use_native_state_encoder:
@@ -640,9 +641,17 @@ class SFTConditionedRDT(nn.Module):
         unified_values = values.new_zeros(*values.shape[:-1], self.rdt_state_dim)
         unified_masks = raw_mask.new_zeros(*raw_mask.shape[:-1], self.rdt_state_dim)
 
-        # Collators flip cached gripper_closed values into RDT's native
-        # gripper_open convention before tensors reach the model. Keep dim 6 as
-        # gripper_open here; do not flip it again.
+        if self.cfg.model.state_encoder_layout == "libero_ortho6d":
+            unified_values[..., 30:33] = values[..., :3] * raw_mask[..., :3]
+            unified_masks[..., 30:33] = raw_mask[..., :3]
+            unified_values[..., 33:39] = values[..., 3:9] * raw_mask[..., 3:9]
+            unified_masks[..., 33:39] = raw_mask[..., 3:9]
+            unified_values[..., 10:12] = values[..., 9:11] * raw_mask[..., 9:11]
+            unified_masks[..., 10:12] = raw_mask[..., 9:11]
+            return torch.cat([unified_values, unified_masks], dim=-1)
+
+        # Legacy rdt_eef caches arrive here after the optional collator flip
+        # from gripper_closed to the pretrained binary gripper_open convention.
         unified_values[..., 30:33] = values[..., :3] * raw_mask[..., :3]
         unified_masks[..., 30:33] = raw_mask[..., :3]
 
@@ -664,13 +673,29 @@ class SFTConditionedRDT(nn.Module):
         raw_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Build action-token inputs for delta actions or absolute targets."""
-        if self.use_native_action_encoder:
+        if self.cfg.model.action_encoder_layout == "rdt_eef":
             return self._state_encoder_input(values, raw_mask)
         if values.shape != raw_mask.shape:
             raise ValueError(
                 f"Action values/mask shapes differ: {values.shape} vs {raw_mask.shape}"
             )
-        return torch.cat([values * raw_mask, raw_mask], dim=-1)
+        if values.shape[-1] != self.cfg.model.action_dim:
+            raise ValueError(
+                f"Expected raw action width {self.cfg.model.action_dim}, got "
+                f"{values.shape[-1]}"
+            )
+        if self.cfg.model.action_encoder_layout != "libero_ortho6d":
+            return torch.cat([values * raw_mask, raw_mask], dim=-1)
+
+        unified_values = values.new_zeros(*values.shape[:-1], self.rdt_state_dim)
+        unified_masks = raw_mask.new_zeros(*raw_mask.shape[:-1], self.rdt_state_dim)
+        unified_values[..., 30:33] = values[..., :3] * raw_mask[..., :3]
+        unified_masks[..., 30:33] = raw_mask[..., :3]
+        unified_values[..., 33:39] = values[..., 3:9] * raw_mask[..., 3:9]
+        unified_masks[..., 33:39] = raw_mask[..., 3:9]
+        unified_values[..., 10] = values[..., 9] * raw_mask[..., 9]
+        unified_masks[..., 10] = raw_mask[..., 9]
+        return torch.cat([unified_values, unified_masks], dim=-1)
 
     def _adapt_actions(
         self,
@@ -765,7 +790,11 @@ class SFTConditionedRDT(nn.Module):
         states = batch["state"].unsqueeze(1)
         actions = batch["actions"]
         time_mask = batch["action_time_mask"].bool()
-        dim_mask = batch["action_dim_mask"].to(actions.dtype).unsqueeze(1)
+        action_dim_mask = batch["action_dim_mask"].to(actions.dtype).unsqueeze(1)
+        state_dim_mask = batch.get(
+            "state_dim_mask",
+            torch.ones_like(batch["state"]),
+        ).to(states.dtype).unsqueeze(1)
 
         batch_size = actions.shape[0]
         noise = torch.randn_like(actions)
@@ -781,12 +810,12 @@ class SFTConditionedRDT(nn.Module):
         )
 
         action_token_mask = (
-            dim_mask.expand(-1, actions.shape[1], -1)
+            action_dim_mask.expand(-1, actions.shape[1], -1)
             * time_mask.unsqueeze(-1).to(actions.dtype)
         )
         # Padded future positions must not inject random noise into valid tokens.
         noisy_actions = noisy_actions * action_token_mask
-        state_input = self._state_encoder_input(states, dim_mask)
+        state_input = self._state_encoder_input(states, state_dim_mask)
         state_cond = self.runner.state_adaptor(state_input)
         action_cond = self._adapt_actions(noisy_actions, action_token_mask)
         state_action_cond = torch.cat([state_cond, action_cond], dim=1)
@@ -826,21 +855,24 @@ class SFTConditionedRDT(nn.Module):
             )
         target = actions
 
-        valid = time_mask.unsqueeze(-1).to(prediction.dtype) * dim_mask
+        valid = time_mask.unsqueeze(-1).to(prediction.dtype) * action_dim_mask
         sample_valid_count = valid.sum(dim=(1, 2))
         sample_is_valid = (sample_valid_count > 0).to(prediction.dtype)
         sample_denominator = sample_valid_count.clamp_min(1.0)
         diff = prediction - target
-        # Rotation dims are Euler angles. Use shortest-angle error so equivalent
-        # poses near the -pi/pi boundary are not punished as large mistakes.
-        diff = torch.cat(
-            [
-                diff[..., :3],
-                torch.atan2(torch.sin(diff[..., 3:6]), torch.cos(diff[..., 3:6])),
-                diff[..., 6:],
-            ],
-            dim=-1,
-        )
+        if self.cfg.model.action_encoder_layout == "rdt_eef":
+            # Legacy absolute-state targets store Euler angles.
+            diff = torch.cat(
+                [
+                    diff[..., :3],
+                    torch.atan2(
+                        torch.sin(diff[..., 3:6]),
+                        torch.cos(diff[..., 3:6]),
+                    ),
+                    diff[..., 6:],
+                ],
+                dim=-1,
+            )
         sample_imitation_loss = (
             (diff.pow(2) * valid).sum(dim=(1, 2))
             / sample_denominator
@@ -865,8 +897,17 @@ class SFTConditionedRDT(nn.Module):
             return component_loss, component_is_valid
 
         sample_xyz_loss, sample_xyz_valid = component_losses(0, 3)
-        sample_rot_loss, sample_rot_valid = component_losses(3, 6)
-        sample_gripper_loss, sample_gripper_valid = component_losses(6, 7)
+        if self.cfg.model.action_encoder_layout == "libero_ortho6d":
+            rotation_stop = 9
+            gripper_start, gripper_stop = 9, 10
+        else:
+            rotation_stop = 6
+            gripper_start, gripper_stop = 6, 7
+        sample_rot_loss, sample_rot_valid = component_losses(3, rotation_stop)
+        sample_gripper_loss, sample_gripper_valid = component_losses(
+            gripper_start,
+            gripper_stop,
+        )
         xyz_loss_sum = (sample_xyz_loss * sample_xyz_valid).sum()
         xyz_valid_count = sample_xyz_valid.sum()
         rot_loss_sum = (sample_rot_loss * sample_rot_valid).sum()
@@ -879,9 +920,8 @@ class SFTConditionedRDT(nn.Module):
         horizon_valid_count = valid.sum(dim=(0, 2))
         # The optimization objective is imitation loss: masked MSE between the
         # predicted clean action/target-state chunk and the ground-truth chunk.
-        # XYZ/gripper use ordinary residuals; Euler rotation dims use wrapped
-        # shortest-angle residuals. Component losses are diagnostics only and
-        # are not separately weighted into the gradient objective.
+        # Components are diagnostics only and are not separately weighted into
+        # the gradient objective. Ortho6D targets use ordinary residuals.
         loss_sum = (sample_imitation_loss * sample_is_valid).sum()
         mae_sum = (sample_mae * sample_is_valid).sum()
         valid_count = sample_is_valid.sum()
@@ -920,8 +960,12 @@ class SFTConditionedRDT(nn.Module):
     def sample_actions(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         batch = self.cast_batch(batch)
         states = batch["state"].unsqueeze(1)
-        dim_mask = batch["action_dim_mask"].to(states.dtype).unsqueeze(1)
-        state_input = self._state_encoder_input(states, dim_mask)
+        state_dim_mask = batch.get(
+            "state_dim_mask",
+            torch.ones_like(batch["state"]),
+        ).to(states.dtype).unsqueeze(1)
+        action_dim_mask = batch["action_dim_mask"].to(states.dtype).unsqueeze(1)
+        state_input = self._state_encoder_input(states, state_dim_mask)
         state_cond = self.runner.state_adaptor(state_input)
         (
             lang_cond,
@@ -951,7 +995,7 @@ class SFTConditionedRDT(nn.Module):
         except TypeError:
             scheduler.set_timesteps(self.runner.num_inference_timesteps)
 
-        expanded_dim_mask = dim_mask.expand(-1, noisy.shape[1], -1)
+        expanded_dim_mask = action_dim_mask.expand(-1, noisy.shape[1], -1)
         for timestep in scheduler.timesteps:
             timestep = timestep.to(states.device)
             action_cond = self._adapt_actions(noisy, expanded_dim_mask)

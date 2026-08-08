@@ -92,6 +92,9 @@ def create_dataloader(
             action_dim=cfg.model.action_dim,
             lang_token_dim=cfg.model.lang_token_dim,
             qwen_kv_dim=cfg.model.qwen_kv_dim,
+            convert_cached_gripper_closed_to_open=(
+                cfg.model.convert_cached_gripper_closed_to_open
+            ),
         )
     else:
         dataset = CachedFeatureDataset(
@@ -108,6 +111,9 @@ def create_dataloader(
             lang_token_dim=cfg.model.lang_token_dim,
             img_token_dim=cfg.model.img_token_dim,
             qwen_kv_dim=cfg.model.qwen_kv_dim,
+            convert_cached_gripper_closed_to_open=(
+                cfg.model.convert_cached_gripper_closed_to_open
+            ),
         )
     persistent = cfg.data.persistent_workers and cfg.data.num_workers > 0
     sampler = None
@@ -624,17 +630,18 @@ def validate(
                     prediction.dtype
                 )
                 diff = prediction - target
-                diff = torch.cat(
-                    [
-                        diff[..., :3],
-                        torch.atan2(
-                            torch.sin(diff[..., 3:6]),
-                            torch.cos(diff[..., 3:6]),
-                        ),
-                        diff[..., 6:],
-                    ],
-                    dim=-1,
-                )
+                if cfg.model.action_encoder_layout == "rdt_eef":
+                    diff = torch.cat(
+                        [
+                            diff[..., :3],
+                            torch.atan2(
+                                torch.sin(diff[..., 3:6]),
+                                torch.cos(diff[..., 3:6]),
+                            ),
+                            diff[..., 6:],
+                        ],
+                        dim=-1,
+                    )
                 per_sample_error = (
                     (diff.pow(2) * valid).sum(dim=(1, 2))
                     / per_sample_count.clamp_min(1.0)

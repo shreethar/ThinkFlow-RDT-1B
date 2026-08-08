@@ -251,6 +251,11 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             "lang_tokens": pack["lang_tokens"],
             "lang_mask": pack["lang_mask"],
             "state": pack["state"][sample_index],
+            "state_dim_mask": (
+                pack["state_dim_mask"][sample_index]
+                if "state_dim_mask" in pack
+                else torch.ones_like(pack["state"][sample_index])
+            ),
             "actions": pack["actions"][sample_index],
             "action_time_mask": pack["action_time_mask"][sample_index],
             "action_dim_mask": pack["action_dim_mask"][sample_index],
@@ -331,6 +336,11 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         sample = {
             "qwen_kv": torch.as_tensor(pack["qwen_kv"])[sample_index],
             "state": pack["state"][sample_index],
+            "state_dim_mask": (
+                pack["state_dim_mask"][sample_index]
+                if "state_dim_mask" in pack
+                else torch.ones_like(pack["state"][sample_index])
+            ),
             "actions": pack["actions"][sample_index],
             "action_time_mask": pack["action_time_mask"][sample_index],
             "action_dim_mask": pack["action_dim_mask"][sample_index],
@@ -457,6 +467,7 @@ class RDTBatchCollator:
     lang_token_dim: int | None = None
     img_token_dim: int | None = None
     qwen_kv_dim: int | None = None
+    convert_cached_gripper_closed_to_open: bool = True
 
     def __post_init__(self) -> None:
         if self.lang_token_dim is None:
@@ -546,6 +557,7 @@ class RDTBatchCollator:
             "img_tokens": [],
             "img_mask": [],
             "state": [],
+            "state_dim_mask": [],
             "actions": [],
             "action_time_mask": [],
             "action_dim_mask": [],
@@ -582,9 +594,16 @@ class RDTBatchCollator:
             actions, action_time_mask = self._pad_actions(
                 sample["actions"], sample.get("action_time_mask")
             )
-            state, actions = self._convert_cached_gripper_to_rdt_open(
-                state, actions
-            )
+            if self.convert_cached_gripper_closed_to_open:
+                state, actions = self._convert_cached_gripper_to_rdt_open(
+                    state, actions
+                )
+            state_dim_mask = torch.as_tensor(
+                sample.get("state_dim_mask", torch.ones(self.state_dim)),
+                dtype=torch.float32,
+            ).flatten()
+            if state_dim_mask.numel() != self.state_dim:
+                raise ValueError("state_dim_mask has the wrong width")
             action_dim_mask = torch.as_tensor(
                 sample.get("action_dim_mask", torch.ones(self.action_dim)),
                 dtype=torch.float32,
@@ -601,6 +620,7 @@ class RDTBatchCollator:
             batch["img_tokens"].append(image)
             batch["img_mask"].append(default_img_mask)
             batch["state"].append(state)
+            batch["state_dim_mask"].append(state_dim_mask)
             batch["actions"].append(actions)
             batch["action_time_mask"].append(action_time_mask)
             batch["action_dim_mask"].append(action_dim_mask)
@@ -625,6 +645,7 @@ class RDTOnlineSiglipBatchCollator:
     action_dim: int
     lang_token_dim: int | None = None
     qwen_kv_dim: int | None = None
+    convert_cached_gripper_closed_to_open: bool = True
 
     def __post_init__(self) -> None:
         if self.lang_token_dim is None:
@@ -639,6 +660,9 @@ class RDTOnlineSiglipBatchCollator:
             lang_token_dim=self.lang_token_dim,
             img_token_dim=1,
             qwen_kv_dim=self.qwen_kv_dim,
+            convert_cached_gripper_closed_to_open=(
+                self.convert_cached_gripper_closed_to_open
+            ),
         )
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -647,6 +671,7 @@ class RDTOnlineSiglipBatchCollator:
             "lang_tokens": [],
             "lang_mask": [],
             "state": [],
+            "state_dim_mask": [],
             "actions": [],
             "action_time_mask": [],
             "action_dim_mask": [],
@@ -677,9 +702,16 @@ class RDTOnlineSiglipBatchCollator:
             actions, action_time_mask = self._base._pad_actions(
                 sample["actions"], sample.get("action_time_mask")
             )
-            state, actions = self._base._convert_cached_gripper_to_rdt_open(
-                state, actions
-            )
+            if self.convert_cached_gripper_closed_to_open:
+                state, actions = self._base._convert_cached_gripper_to_rdt_open(
+                    state, actions
+                )
+            state_dim_mask = torch.as_tensor(
+                sample.get("state_dim_mask", torch.ones(self.state_dim)),
+                dtype=torch.float32,
+            ).flatten()
+            if state_dim_mask.numel() != self.state_dim:
+                raise ValueError("state_dim_mask has the wrong width")
             action_dim_mask = torch.as_tensor(
                 sample.get("action_dim_mask", torch.ones(self.action_dim)),
                 dtype=torch.float32,
@@ -698,6 +730,7 @@ class RDTOnlineSiglipBatchCollator:
             tensor_batch["lang_tokens"].append(lang)
             tensor_batch["lang_mask"].append(default_lang_mask)
             tensor_batch["state"].append(state)
+            tensor_batch["state_dim_mask"].append(state_dim_mask)
             tensor_batch["actions"].append(actions)
             tensor_batch["action_time_mask"].append(action_time_mask)
             tensor_batch["action_dim_mask"].append(action_dim_mask)

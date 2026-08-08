@@ -43,15 +43,17 @@ class ModelConfig:
     rdt_state_dim: int | None = None
     freeze_state_adaptor: bool = False
     freeze_condition_adaptors: bool = False
-    # Cached shards store [xyz, Euler/axis-angle xyz, gripper_closed], but the
-    # collators flip dim 6 to RDT's native gripper_open convention at load time.
-    # ``rdt_eef`` then maps loaded [xyz, Euler/axis-angle xyz, gripper_open]
-    # observations to RDT's native [xyz, ortho6d, gripper_open] state slots.
+    # ``rdt_eef`` is the legacy compact 7D [xyz, Euler, binary gripper] layout.
+    # ``libero_ortho6d`` uses 11D state [xyz, absolute ortho6D, finger0,
+    # finger1] and 10D actions [dxyz, relative ortho6D, raw gripper command].
     state_encoder_layout: str = "raw"
     # ``raw`` keeps cached 7-D actions in the existing project convention.
     # ``rdt_eef`` treats action targets as absolute target states and encodes
     # them through the same native RDT EEF slots as current state observations.
     action_encoder_layout: str = "raw"
+    # Compatibility switch for old caches that store binary gripper_closed in
+    # dim 6. New LIBERO raw-command caches must leave this disabled.
+    convert_cached_gripper_closed_to_open: bool = True
     # Only smoke tests should freeze a randomly initialized native state adaptor.
     allow_random_frozen_state_adaptor: bool = False
     # ``compatible`` copies every shape-compatible runner tensor, including the
@@ -137,7 +139,10 @@ class ExperimentConfig:
     training: TrainingConfig
 
     def validate(self) -> None:
-        if self.model.action_dim != self.model.state_dim:
+        if (
+            self.model.action_dim != self.model.state_dim
+            and self.model.state_encoder_layout != "libero_ortho6d"
+        ):
             raise ValueError(
                 "This RDT runner concatenates state and action tokens, so "
                 "state_dim must equal action_dim. Pad/project proprioception "
@@ -165,13 +170,23 @@ class ExperimentConfig:
             raise ValueError(
                 "model.pretrained_copy_mode must be 'selected' or 'compatible'"
             )
-        if self.model.state_encoder_layout not in {"raw", "rdt_eef"}:
+        if self.model.state_encoder_layout not in {
+            "raw",
+            "rdt_eef",
+            "libero_ortho6d",
+        }:
             raise ValueError(
-                "model.state_encoder_layout must be 'raw' or 'rdt_eef'"
+                "model.state_encoder_layout must be 'raw', 'rdt_eef', or "
+                "'libero_ortho6d'"
             )
-        if self.model.action_encoder_layout not in {"raw", "rdt_eef"}:
+        if self.model.action_encoder_layout not in {
+            "raw",
+            "rdt_eef",
+            "libero_ortho6d",
+        }:
             raise ValueError(
-                "model.action_encoder_layout must be 'raw' or 'rdt_eef'"
+                "model.action_encoder_layout must be 'raw', 'rdt_eef', or "
+                "'libero_ortho6d'"
             )
         if (
             self.model.action_encoder_layout == "rdt_eef"
@@ -187,6 +202,24 @@ class ExperimentConfig:
                 raise ValueError("rdt_eef state layout requires 7-D state/actions")
             if self.model.resolved_rdt_state_dim < 39:
                 raise ValueError("rdt_eef state layout requires rdt_state_dim >= 39")
+        elif self.model.state_encoder_layout == "libero_ortho6d":
+            if self.model.state_dim != 11 or self.model.action_dim != 10:
+                raise ValueError(
+                    "libero_ortho6d requires 11-D state and 10-D actions"
+                )
+            if self.model.action_encoder_layout != "libero_ortho6d":
+                raise ValueError(
+                    "libero_ortho6d state layout requires the matching action layout"
+                )
+            if self.model.resolved_rdt_state_dim < 39:
+                raise ValueError(
+                    "libero_ortho6d requires rdt_state_dim >= 39"
+                )
+            if self.model.convert_cached_gripper_closed_to_open:
+                raise ValueError(
+                    "libero_ortho6d preserves raw gripper values; set "
+                    "convert_cached_gripper_closed_to_open=false"
+                )
         elif self.model.resolved_rdt_state_dim != self.model.state_dim:
             raise ValueError(
                 "raw state layout requires rdt_state_dim to equal state_dim"
