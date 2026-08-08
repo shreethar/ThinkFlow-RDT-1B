@@ -63,6 +63,37 @@ def test_collator_supports_separate_language_and_image_widths():
     assert batch["img_tokens"].shape == (1, 3, 6)
 
 
+def test_collator_preserves_unequal_raw_libero_state_and_action_dimensions():
+    collator = RDTBatchCollator(
+        max_lang_tokens=2,
+        image_tokens=3,
+        pred_horizon=2,
+        feature_dim=8,
+        state_dim=11,
+        action_dim=10,
+        convert_cached_gripper_closed_to_open=False,
+    )
+    state = torch.tensor([0.0] * 9 + [0.04, -0.04])
+    actions = torch.zeros(1, 10)
+    actions[0, 9] = -1.0
+    sample = {
+        "qwen_kv": torch.randn(1, 8),
+        "lang_tokens": torch.randn(2, 8),
+        "img_tokens": torch.randn(3, 8),
+        "state": state,
+        "state_dim_mask": torch.ones(11),
+        "actions": actions,
+        "ctrl_freq": 20.0,
+    }
+
+    batch = collator([sample])
+
+    torch.testing.assert_close(batch["state"][0], state)
+    assert batch["state_dim_mask"].shape == (1, 11)
+    assert batch["actions"][0, 0, 9].item() == -1.0
+    assert batch["action_dim_mask"].shape == (1, 10)
+
+
 def test_cached_feature_dataset_reads_episode_pack(tmp_path):
     pack_path = tmp_path / "episode_000000000.pt"
     manifest_path = tmp_path / "manifest.jsonl"

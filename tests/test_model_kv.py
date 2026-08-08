@@ -205,6 +205,45 @@ def test_native_state_conversion_uses_ortho6d_and_open_gripper():
     assert indicator[0, 0, 33:39].sum().item() == 6.0
 
 
+def test_libero_ortho6d_layout_maps_raw_fingers_and_raw_command_slots():
+    base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
+    model_config = replace(
+        base.model,
+        action_dim=10,
+        state_dim=11,
+        finetune_mode="full",
+        rdt_state_dim=128,
+        state_encoder_layout="libero_ortho6d",
+        action_encoder_layout="libero_ortho6d",
+        convert_cached_gripper_closed_to_open=False,
+        freeze_state_adaptor=True,
+        allow_random_frozen_state_adaptor=True,
+    )
+    cfg = replace(base, model=model_config)
+    cfg.validate()
+    model = SFTConditionedRDT(cfg, load_pretrained=False)
+
+    state = torch.tensor(
+        [[[1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.04, -0.04]]]
+    )
+    state_encoded = model._state_encoder_input(state, torch.ones_like(state))
+    state_values, state_mask = state_encoded.chunk(2, dim=-1)
+    torch.testing.assert_close(state_values[0, 0, 30:39], state[0, 0, :9])
+    torch.testing.assert_close(state_values[0, 0, 10:12], state[0, 0, 9:11])
+    assert state_mask[0, 0, 10:12].sum().item() == 2.0
+
+    action = torch.tensor(
+        [[[0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0]]]
+    )
+    action_encoded = model._action_encoder_input(action, torch.ones_like(action))
+    action_values, action_mask = action_encoded.chunk(2, dim=-1)
+    torch.testing.assert_close(action_values[0, 0, 30:39], action[0, 0, :9])
+    assert action_values[0, 0, 10].item() == -1.0
+    assert action_mask[0, 0, 10].item() == 1.0
+    assert model.action_adaptor is None
+    assert model.runner.model.final_layer.ffn_final.fc2.out_features == 10
+
+
 def test_masked_loss_is_mean_of_per_example_losses():
     base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
     model_config = replace(
