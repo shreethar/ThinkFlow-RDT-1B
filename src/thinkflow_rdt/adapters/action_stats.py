@@ -17,6 +17,18 @@ ACTION_DIM_NAMES = [
     "delta_rz",
     "gripper_closed",
 ]
+LIBERO_ORTHO6D_ACTION_DIM_NAMES = [
+    "delta_x",
+    "delta_y",
+    "delta_z",
+    "delta_rot6d_0",
+    "delta_rot6d_1",
+    "delta_rot6d_2",
+    "delta_rot6d_3",
+    "delta_rot6d_4",
+    "delta_rot6d_5",
+    "raw_gripper_command",
+]
 
 
 @dataclass(frozen=True)
@@ -51,9 +63,14 @@ class ActionNormalizationStats:
         *,
         source: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        dim_names = (
+            LIBERO_ORTHO6D_ACTION_DIM_NAMES
+            if len(self.q01) == len(LIBERO_ORTHO6D_ACTION_DIM_NAMES)
+            else ACTION_DIM_NAMES[: len(self.q01)]
+        )
         block: dict[str, Any] = {
             "method": "clip each standardized action dimension to q01/q99, then linearly map to [-1, 1]",
-            "dim_names": ACTION_DIM_NAMES[: len(self.q01)],
+            "dim_names": dim_names,
             "q01": self.q01.astype(float).tolist(),
             "q99": self.q99.astype(float).tolist(),
             "eps": self.eps,

@@ -50,10 +50,11 @@ def gripper_change_window_indices(
     action_array = np.asarray(actions, dtype=np.float32)
     if action_array.ndim != 2 or action_array.shape[0] == 0:
         return []
-    if action_array.shape[1] < 7:
-        raise ValueError(f"Expected action dim at least 7, got {action_array.shape}")
+    if action_array.shape[1] < 1:
+        raise ValueError(f"Expected at least one action dimension, got {action_array.shape}")
 
-    gripper = (action_array[:, 6] >= gripper_threshold).astype(np.int8)
+    # Every standardized action schema keeps gripper as its final dimension.
+    gripper = (action_array[:, -1] >= gripper_threshold).astype(np.int8)
     change_steps = np.flatnonzero(gripper[1:] != gripper[:-1]) + 1
     if change_scope == "first":
         change_steps = change_steps[:1]
@@ -79,10 +80,10 @@ def directional_gripper_change_window_indices(
     action_array = np.asarray(actions, dtype=np.float32)
     if action_array.ndim != 2 or action_array.shape[0] == 0:
         return []
-    if action_array.shape[1] < 7:
-        raise ValueError(f"Expected action dim at least 7, got {action_array.shape}")
+    if action_array.shape[1] < 1:
+        raise ValueError(f"Expected at least one action dimension, got {action_array.shape}")
 
-    gripper = (action_array[:, 6] >= gripper_threshold).astype(np.int8)
+    gripper = (action_array[:, -1] >= gripper_threshold).astype(np.int8)
     change_steps = np.flatnonzero(gripper[1:] != gripper[:-1]) + 1
     total_steps = action_array.shape[0]
 

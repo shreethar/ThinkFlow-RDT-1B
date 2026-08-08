@@ -17,6 +17,13 @@ from .action_stats import (
 from .fractal import pad_action_horizon
 
 
+LIBERO_STATE_DIM = 11
+LIBERO_ACTION_DIM = 10
+LIBERO_ROT_COMMAND_SCALE = 0.5
+LIBERO_STATE_NATIVE_INDICES = (30, 31, 32, 33, 34, 35, 36, 37, 38, 10, 11)
+LIBERO_ACTION_NATIVE_INDICES = (30, 31, 32, 33, 34, 35, 36, 37, 38, 10)
+
+
 @dataclass(frozen=True)
 class LiberoEpisode:
     episode_id: str
@@ -89,7 +96,11 @@ def _instruction(group, fallback: str) -> str:
 
 
 def libero_gripper_closed(raw: np.ndarray) -> np.ndarray:
-    """Convert the project command convention (+1=open, -1=close) to closed."""
+    """Legacy diagnostic helper that labels negative commands as closed.
+
+    The current LIBERO cache and rollout path never calls this helper: raw
+    action signs are preserved without assigning open/close semantics.
+    """
     values = np.asarray(raw, dtype=np.float32)
     return (values < 0.0).astype(np.float32)
 
@@ -128,8 +139,117 @@ def libero_orientation_to_rpy(orientation: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def rotation_matrix_to_ortho6d(matrix: np.ndarray) -> np.ndarray:
+    """Encode a rotation matrix as its first two columns."""
+    values = np.asarray(matrix, dtype=np.float64)
+    if values.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected rotation matrices [...,3,3], got {values.shape}")
+    return np.concatenate(
+        [values[..., :, 0], values[..., :, 1]],
+        axis=-1,
+    ).astype(np.float32)
+
+
+def ortho6d_to_rotation_matrix(ortho6d: np.ndarray, *, eps: float = 1e-8) -> np.ndarray:
+    """Project a 6D rotation prediction onto SO(3) with Gram-Schmidt."""
+    values = np.asarray(ortho6d, dtype=np.float64)
+    if values.shape[-1] != 6:
+        raise ValueError(f"Expected ortho6D values [...,6], got {values.shape}")
+
+    first = values[..., :3]
+    first_norm = np.linalg.norm(first, axis=-1, keepdims=True)
+    default_first = np.zeros_like(first)
+    default_first[..., 0] = 1.0
+    first = np.where(first_norm > eps, first, default_first)
+    first = first / np.maximum(np.linalg.norm(first, axis=-1, keepdims=True), eps)
+
+    second = values[..., 3:6]
+    second = second - np.sum(first * second, axis=-1, keepdims=True) * first
+    second_norm = np.linalg.norm(second, axis=-1, keepdims=True)
+
+    # A diffusion prediction can briefly contain parallel or zero columns.
+    # Choose the canonical axis least aligned with the first column as a stable
+    # fallback, then orthogonalize it in the same way.
+    fallback_index = np.argmin(np.abs(first), axis=-1)
+    fallback = np.eye(3, dtype=np.float64)[fallback_index]
+    fallback = fallback - np.sum(first * fallback, axis=-1, keepdims=True) * first
+    fallback /= np.maximum(np.linalg.norm(fallback, axis=-1, keepdims=True), eps)
+    second = np.where(second_norm > eps, second, fallback)
+    second /= np.maximum(np.linalg.norm(second, axis=-1, keepdims=True), eps)
+
+    third = np.cross(first, second)
+    return np.stack([first, second, third], axis=-1).astype(np.float32)
+
+
+def libero_orientation_to_ortho6d(orientation: np.ndarray) -> np.ndarray:
+    """Convert an absolute LIBERO rotvec/quaternion directly to ortho6D."""
+    values = np.asarray(orientation, dtype=np.float64)
+    if values.shape[-1] == 3:
+        rotation = Rotation.from_rotvec(values.reshape(-1, 3))
+    elif values.shape[-1] == 4:
+        rotation = Rotation.from_quat(values.reshape(-1, 4))
+    else:
+        raise ValueError(
+            "LIBERO orientation must be rotation-vector [...,3] or xyzw "
+            f"quaternion [...,4], got {values.shape}"
+        )
+    matrices = rotation.as_matrix().reshape(*values.shape[:-1], 3, 3)
+    return rotation_matrix_to_ortho6d(matrices)
+
+
+def ortho6d_to_libero_orientation(ortho6d: np.ndarray) -> np.ndarray:
+    """Convert an absolute ortho6D pose back to LIBERO's rotvec form."""
+    matrices = ortho6d_to_rotation_matrix(ortho6d)
+    flat = matrices.reshape(-1, 3, 3)
+    return Rotation.from_matrix(flat).as_rotvec().reshape(
+        *matrices.shape[:-2], 3
+    ).astype(np.float32)
+
+
+def libero_rot_command_to_ortho6d(command: np.ndarray) -> np.ndarray:
+    """Encode a raw OSC_POSE rotation command as a relative ortho6D rotation.
+
+    Robosuite scales each normalized rotation command by 0.5 radians before
+    constructing the controller's relative rotation.
+    """
+    values = np.asarray(command, dtype=np.float64)
+    if values.shape[-1] != 3:
+        raise ValueError(f"Expected LIBERO rotation commands [...,3], got {values.shape}")
+    delta_rotvec = values * LIBERO_ROT_COMMAND_SCALE
+    matrices = Rotation.from_rotvec(delta_rotvec.reshape(-1, 3)).as_matrix()
+    matrices = matrices.reshape(*values.shape[:-1], 3, 3)
+    return rotation_matrix_to_ortho6d(matrices)
+
+
+def ortho6d_to_libero_rot_command(ortho6d: np.ndarray) -> np.ndarray:
+    """Decode relative ortho6D rotations to raw normalized OSC_POSE commands."""
+    matrices = ortho6d_to_rotation_matrix(ortho6d)
+    delta_rotvec = Rotation.from_matrix(matrices.reshape(-1, 3, 3)).as_rotvec()
+    command = delta_rotvec.reshape(*matrices.shape[:-2], 3) / LIBERO_ROT_COMMAND_SCALE
+    return np.clip(command, -1.0, 1.0).astype(np.float32)
+
+
+def libero_action_to_rdt(raw_action: np.ndarray) -> np.ndarray:
+    """Convert raw 7D LIBERO commands to 10D command-space RDT targets.
+
+    Translation and gripper values are copied unchanged. Only the three-axis
+    normalized rotation command is represented as a relative ortho6D rotation.
+    """
+    values = np.asarray(raw_action, dtype=np.float32)
+    if values.shape[-1] < 7:
+        raise ValueError(f"Expected raw LIBERO actions [...,>=7], got {values.shape}")
+    return np.concatenate(
+        [
+            values[..., :3],
+            libero_rot_command_to_ortho6d(values[..., 3:6]),
+            values[..., 6:7],
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+
 def libero_gripper_state_to_closed(gripper_state: np.ndarray) -> np.ndarray:
-    """Binarize Panda finger joint positions: near zero is closed."""
+    """Legacy diagnostic binarization; the current state keeps both raw qpos."""
     values = np.asarray(gripper_state, dtype=np.float32)
     if values.shape[-1] == 0:
         raise ValueError("Empty LIBERO gripper state")
@@ -139,17 +259,15 @@ def libero_gripper_state_to_closed(gripper_state: np.ndarray) -> np.ndarray:
 
 def libero_observation_to_rdt(
     observation: dict,
-    *,
-    gripper_closed: float | None = None,
 ) -> dict:
-    """Convert one live LIBERO observation to the exact raw RDT cache convention."""
+    """Convert a live observation to [xyz, absolute ortho6D, raw finger qpos]."""
     position = _dataset(observation, "ee_pos", "robot0_eef_pos").reshape(-1)[:3]
     orientation = _dataset(observation, "ee_ori", "robot0_eef_quat").reshape(-1)
-    if gripper_closed is None:
-        gripper = _dataset(observation, "gripper_states", "robot0_gripper_qpos")
-        gripper_closed = float(libero_gripper_state_to_closed(gripper))
+    gripper = _dataset(observation, "gripper_states", "robot0_gripper_qpos").reshape(-1)
+    if gripper.size < 2:
+        raise ValueError(f"Expected two raw LIBERO finger positions, got {gripper.shape}")
     state = np.concatenate(
-        [position, libero_orientation_to_rpy(orientation), [float(gripper_closed)]],
+        [position, libero_orientation_to_ortho6d(orientation), gripper[:2]],
     ).astype(np.float32)
     primary = libero_image_to_rgb(
         _dataset(observation, "agentview_rgb", "agentview_image")
@@ -163,13 +281,22 @@ def libero_observation_to_rdt(
 
 
 def rdt_action_to_libero(
-    normalized_action: np.ndarray,
-    stats: ActionNormalizationStats,
+    encoded_action: np.ndarray,
+    stats: ActionNormalizationStats | None = None,
 ) -> np.ndarray:
-    """Denormalize one RDT action and restore the project gripper command."""
-    action = denormalize_action_array(np.asarray(normalized_action, dtype=np.float32), stats)
-    result = action[..., :7].copy()
-    result[..., 6] = np.where(action[..., 6] >= 0.5, 1.0, -1.0)
+    """Decode a 10D RDT target back to a raw 7D LIBERO command."""
+    values = np.asarray(encoded_action, dtype=np.float32)
+    action = denormalize_action_array(values, stats) if stats is not None else values
+    if action.shape[-1] != LIBERO_ACTION_DIM:
+        raise ValueError(
+            f"Expected encoded LIBERO actions [...,{LIBERO_ACTION_DIM}], got {action.shape}"
+        )
+    result = np.empty((*action.shape[:-1], 7), dtype=np.float32)
+    result[..., :3] = np.clip(action[..., :3], -1.0, 1.0)
+    result[..., 3:6] = ortho6d_to_libero_rot_command(action[..., 3:9])
+    # Preserve the raw demonstrated command convention and merely respect the
+    # environment's action bounds. There is no open/closed remapping here.
+    result[..., 6] = np.clip(action[..., 9], -1.0, 1.0)
     return result.astype(np.float32)
 
 
@@ -178,21 +305,21 @@ def convert_libero_demo(group, *, episode_id: str) -> LiberoEpisode:
     actions = np.asarray(group["actions"], dtype=np.float32)
     if actions.ndim != 2 or actions.shape[1] < 7:
         raise ValueError(f"{group.name}/actions must be [T, >=7], got {actions.shape}")
-    actions = actions[:, :7].copy()
-    actions[:, 6] = libero_gripper_closed(actions[:, 6])
+    raw_actions = actions[:, :7].copy()
+    actions = libero_action_to_rdt(raw_actions)
 
     position = _dataset(obs, "ee_pos", "robot0_eef_pos")
     orientation = _dataset(obs, "ee_ori", "robot0_eef_quat")
-    rpy = libero_orientation_to_rpy(orientation)
-
-    if "gripper_states" in obs:
-        state_closed = libero_gripper_state_to_closed(obs["gripper_states"])
-    else:
-        # Compatibility with datasets that omit finger observations.
-        state_closed = np.empty((actions.shape[0],), dtype=np.float32)
-        state_closed[0] = actions[0, 6]
-        state_closed[1:] = actions[:-1, 6]
-    states = np.concatenate([position[:, :3], rpy, state_closed[:, None]], axis=-1)
+    orientation_6d = libero_orientation_to_ortho6d(orientation)
+    gripper_states = _dataset(obs, "gripper_states", "robot0_gripper_qpos")
+    if gripper_states.ndim != 2 or gripper_states.shape[1] < 2:
+        raise ValueError(
+            f"Expected raw two-finger states [T,>=2], got {gripper_states.shape}"
+        )
+    states = np.concatenate(
+        [position[:, :3], orientation_6d, gripper_states[:, :2]],
+        axis=-1,
+    )
 
     primary = libero_image_to_rgb(
         _dataset(obs, "agentview_rgb", "agentview_image")
@@ -249,15 +376,20 @@ def libero_sample_from_episode(
     if action_target_mode == "delta":
         target_sequence = episode.actions
     elif action_target_mode == "absolute_state":
-        # For target-state RDT fine-tuning, the supervised "action" chunk is a
-        # horizon of absolute observed EEF states, not LIBERO controller deltas.
-        # Rollout converts each predicted absolute target back to a LIBERO
-        # delta-controller command using current_state -> target_state error.
-        target_sequence = episode.states
+        raise ValueError(
+            "LIBERO absolute_state targets are incompatible with the current "
+            "11-D observation / 10-D raw-command schema. Use "
+            "action_target_mode='delta'."
+        )
     else:
         raise ValueError(f"Unsupported action_target_mode: {action_target_mode}")
 
-    actions, mask = pad_action_horizon(target_sequence, step_index, horizon=horizon)
+    actions, mask = pad_action_horizon(
+        target_sequence,
+        step_index,
+        horizon=horizon,
+        action_dim=int(target_sequence.shape[1]),
+    )
     if action_stats is not None and action_target_mode == "delta":
         actions = normalize_action_horizon(actions, mask, action_stats)
     wrist = None if episode.wrist_images is None else Image.fromarray(episode.wrist_images[step_index]).copy()
@@ -273,9 +405,10 @@ def libero_sample_from_episode(
         },
         "image_mask": {"primary": 1, "wrist": int(wrist is not None), "secondary": 0},
         "state": episode.states[step_index].copy(),
-        "state_mask": np.ones((7,), dtype=np.float32),
+        "state_mask": np.ones((episode.states.shape[1],), dtype=np.float32),
         "actions": actions,
         "actions_mask": mask,
+        "action_dim_mask": np.ones((target_sequence.shape[1],), dtype=np.float32),
         "ctrl_freq": 20.0,
     }
     if episode.joint_states is not None:

@@ -232,6 +232,11 @@ class LazyStandardizedDataset(TorchIterableDataset):
         return bool(self.adapter_kwargs.get("only_success", True))
 
     def _resolve_action_stats(self) -> ActionNormalizationStats | None:
+        # The new LIBERO targets are already bounded controller commands plus
+        # an ortho6D rotation representation. Preserve them exactly instead of
+        # applying legacy 7D q01/q99 statistics.
+        if self.dataset_id in LIBERO_DATASET_IDS:
+            return None
         return resolve_action_stats(
             normalize_actions=self.normalize_actions,
             action_stats=self.adapter_kwargs.get("action_stats"),
