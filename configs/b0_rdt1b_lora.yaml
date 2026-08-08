@@ -4,8 +4,8 @@ pretrained_model: robotics-diffusion-transformer/rdt-1b
 output_dir: outputs/b0_sft_rdt1b_lora
 
 model:
-  action_dim: 7
-  state_dim: 7
+  action_dim: 10
+  state_dim: 11
   pred_horizon: 64
   qwen_hidden_size: 2560
   qwen_kv_dim: 2048
@@ -23,8 +23,9 @@ model:
   qwen_fusion: cross_attention_kv
   pretrained_copy_mode: compatible
   rdt_state_dim: 128
-  state_encoder_layout: rdt_eef
-  action_encoder_layout: rdt_eef
+  state_encoder_layout: libero_ortho6d
+  action_encoder_layout: libero_ortho6d
+  convert_cached_gripper_closed_to_open: false
   freeze_state_adaptor: true
   freeze_condition_adaptors: true
   copy_pretrained_final_fc1: true
