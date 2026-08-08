@@ -39,10 +39,20 @@ def main() -> None:
         "episodes": episodes,
         "steps": steps,
         "conventions": {
-            "state": ["x", "y", "z", "roll", "pitch", "yaw", "gripper_closed"],
-            "action": ["delta_x", "delta_y", "delta_z", "delta_rx", "delta_ry", "delta_rz", "gripper_closed"],
-            "gripper_open": 0,
-            "gripper_closed": 1,
+            "state": [
+                "x", "y", "z",
+                "rot6d_0", "rot6d_1", "rot6d_2",
+                "rot6d_3", "rot6d_4", "rot6d_5",
+                "finger_0", "finger_1",
+            ],
+            "action": [
+                "delta_x", "delta_y", "delta_z",
+                "delta_rot6d_0", "delta_rot6d_1", "delta_rot6d_2",
+                "delta_rot6d_3", "delta_rot6d_4", "delta_rot6d_5",
+                "raw_gripper_command",
+            ],
+            "raw_gripper_action": "preserved from HDF5 without remapping",
+            "action_normalization": "not used by the LIBERO ortho6D cache pipeline",
         },
         "action_normalization": stats.to_audit_block(source={"dataset_id": args.dataset_id, "steps": steps}),
     }

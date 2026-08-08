@@ -413,6 +413,18 @@ def standardized_collate_fn(
         "state": torch.stack(
             [torch.as_tensor(sample["state"], dtype=torch.float32) for sample in kept]
         ),
+        "state_dim_mask": torch.stack(
+            [
+                torch.as_tensor(
+                    sample.get(
+                        "state_mask",
+                        np.ones((np.asarray(sample["state"]).size,), dtype=np.float32),
+                    ),
+                    dtype=torch.float32,
+                )
+                for sample in kept
+            ]
+        ),
         "actions": torch.stack(
             [torch.as_tensor(sample["actions"], dtype=torch.float32) for sample in kept]
         ),
@@ -425,7 +437,13 @@ def standardized_collate_fn(
         "action_dim_mask": torch.stack(
             [
                 torch.as_tensor(
-                    sample.get("action_dim_mask", np.ones((7,), dtype=np.float32)),
+                    sample.get(
+                        "action_dim_mask",
+                        np.ones(
+                            (np.asarray(sample["actions"]).shape[-1],),
+                            dtype=np.float32,
+                        ),
+                    ),
                     dtype=torch.float32,
                 )
                 for sample in kept
@@ -445,6 +463,13 @@ def standardized_collate_fn(
                 "step_idx": str(sample["step_idx"]),
                 "image_count": int(sum(slot_mask)),
                 "image_slot_count": len(slot_mask),
+                "state_dim": int(np.asarray(sample["state"]).size),
+                "action_dim": int(np.asarray(sample["actions"]).shape[-1]),
+                "proprioception_schema": (
+                    "libero_ortho6d_raw_gripper_v1"
+                    if dataset_id in LIBERO_DATASET_IDS
+                    else "legacy_standardized_7d"
+                ),
             }
             for sample, dataset_id, slot_mask in zip(kept, dataset_ids, siglip_slot_masks)
         ],
@@ -844,6 +869,7 @@ def save_batch_records(
             "lang_tokens": sample_lang_tokens.cpu(),
             "lang_mask": sample_lang_mask.cpu(),
             "state": batch["state"][batch_index].cpu(),
+            "state_dim_mask": batch["state_dim_mask"][batch_index].cpu(),
             "actions": batch["actions"][batch_index].cpu(),
             "action_time_mask": batch["action_time_mask"][batch_index].cpu(),
             "action_dim_mask": batch["action_dim_mask"][batch_index].cpu(),
@@ -938,7 +964,7 @@ def iter_episode_sample_groups(dataset: Any) -> Iterable[list[dict[str, Any]]]:
 
 def sample_gripper_binary(sample: dict[str, Any], *, normalized_actions: bool) -> int:
     actions = np.asarray(sample["actions"], dtype=np.float32)
-    value = float(actions[0, 6])
+    value = float(actions[0, -1])
     threshold = 0.0 if normalized_actions else 0.5
     return int(value >= threshold)
 
@@ -1057,6 +1083,7 @@ def save_episode_anchor_records(
             "lang_tokens": episode_lang_tokens.cpu(),
             "lang_mask": episode_lang_mask.cpu(),
             "state": batch["state"][batch_index].cpu(),
+            "state_dim_mask": batch["state_dim_mask"][batch_index].cpu(),
             "actions": batch["actions"][batch_index].cpu(),
             "action_time_mask": batch["action_time_mask"][batch_index].cpu(),
             "action_dim_mask": batch["action_dim_mask"][batch_index].cpu(),
@@ -1111,6 +1138,7 @@ def truncate_episode_batch(
         return batch, kept_samples
     for key in (
         "state",
+        "state_dim_mask",
         "actions",
         "action_time_mask",
         "action_dim_mask",
@@ -1348,6 +1376,7 @@ def save_sample_shard(
         "sample_stop_index": sample_start_index + batch_size,
         "qwen_kv": qwen_kv.cpu(),
         "state": batch["state"].cpu(),
+        "state_dim_mask": batch["state_dim_mask"].cpu(),
         "actions": batch["actions"].cpu(),
         "action_time_mask": batch["action_time_mask"].cpu(),
         "action_dim_mask": batch["action_dim_mask"].cpu(),
@@ -1479,6 +1508,7 @@ def save_episode_anchor_pack_job(
         "lang_tokens": episode_lang_tokens.cpu(),
         "lang_mask": episode_lang_mask.cpu(),
         "state": batch["state"].cpu(),
+        "state_dim_mask": batch["state_dim_mask"].cpu(),
         "actions": batch["actions"].cpu(),
         "action_time_mask": batch["action_time_mask"].cpu(),
         "action_dim_mask": batch["action_dim_mask"].cpu(),
@@ -2337,9 +2367,9 @@ def parse_args() -> argparse.Namespace:
         choices=["delta", "absolute_state"],
         default="delta",
         help=(
-            "delta uses standardized relative action targets. absolute_state uses "
-            "future absolute [x,y,z,roll,pitch,yaw,gripper] state targets in "
-            "physical units and disables q01/q99 normalization."
+            "delta uses each adapter's command targets (raw 10D command-space "
+            "targets for LIBERO). absolute_state is a legacy 7D mode for other "
+            "adapters and disables q01/q99 normalization."
         ),
     )
     parser.add_argument(
@@ -2554,6 +2584,18 @@ def main() -> None:
         dataset_ids=args.dataset,
         max_episodes=args.max_episodes,
     )
+    if configs and all(config.dataset_id in LIBERO_DATASET_IDS for config in configs):
+        if args.action_target_mode != "delta":
+            raise ValueError(
+                "The 11D-state/10D-action LIBERO schema requires "
+                "--action-target-mode delta"
+            )
+        if normalize_actions:
+            print(
+                "Using raw LIBERO 10D command targets; disabling legacy q01/q99 "
+                "action normalization."
+            )
+        normalize_actions = False
     splits = build_combined_standardized_splits(
         configs=configs,
         seed=seed,
@@ -2602,6 +2644,15 @@ def main() -> None:
         "close_to_open_after": args.close_to_open_after,
         "normalize_actions": normalize_actions,
         "action_target_mode": args.action_target_mode,
+        "state_dim": cfg.model.state_dim,
+        "action_dim": cfg.model.action_dim,
+        "state_encoder_layout": cfg.model.state_encoder_layout,
+        "action_encoder_layout": cfg.model.action_encoder_layout,
+        "gripper_processing": (
+            "raw two-finger qpos state; raw HDF5 action command"
+            if all(config.dataset_id in LIBERO_DATASET_IDS for config in configs)
+            else "dataset-specific"
+        ),
         "feature_set": args.feature_set,
         "cache_layout": args.cache_layout,
         "qwen_cache_scope": args.qwen_cache_scope,

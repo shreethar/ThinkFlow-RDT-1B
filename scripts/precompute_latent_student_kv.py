@@ -465,6 +465,7 @@ def save_sample_shard(
         "qwen_kv": latent_kv.cpu(),
         "latent_waypoints": waypoints.cpu(),
         "state": batch["state"].cpu(),
+        "state_dim_mask": batch["state_dim_mask"].cpu(),
         "actions": batch["actions"].cpu(),
         "action_time_mask": batch["action_time_mask"].cpu(),
         "action_dim_mask": batch["action_dim_mask"].cpu(),
@@ -794,9 +795,9 @@ def parse_args() -> argparse.Namespace:
         choices=["delta", "absolute_state"],
         default="delta",
         help=(
-            "delta uses the old standardized relative action targets. "
-            "absolute_state uses future absolute [x,y,z,roll,pitch,yaw,gripper] "
-            "state targets in physical units."
+            "delta uses each adapter's command targets (raw 10D command-space "
+            "targets for LIBERO). absolute_state is a legacy 7D mode for other "
+            "adapters."
         ),
     )
     parser.add_argument("--overwrite", action="store_true")
@@ -889,6 +890,18 @@ def main() -> None:
         dataset_ids=args.dataset,
         max_episodes=args.max_episodes,
     )
+    if configs and all(config.dataset_id in LIBERO_DATASET_IDS for config in configs):
+        if args.action_target_mode != "delta":
+            raise ValueError(
+                "The 11D-state/10D-action LIBERO schema requires "
+                "--action-target-mode delta"
+            )
+        if normalize_actions:
+            print(
+                "Using raw LIBERO 10D command targets; disabling legacy q01/q99 "
+                "action normalization."
+            )
+        normalize_actions = False
     splits = build_combined_standardized_splits(
         configs=configs,
         seed=seed,
@@ -931,6 +944,15 @@ def main() -> None:
         "stage": args.stage,
         "normalize_actions": normalize_actions,
         "action_target_mode": args.action_target_mode,
+        "state_dim": cfg.model.state_dim,
+        "action_dim": cfg.model.action_dim,
+        "state_encoder_layout": cfg.model.state_encoder_layout,
+        "action_encoder_layout": cfg.model.action_encoder_layout,
+        "gripper_processing": (
+            "raw two-finger qpos state; raw HDF5 action command"
+            if all(config.dataset_id in LIBERO_DATASET_IDS for config in configs)
+            else "dataset-specific"
+        ),
         "max_samples_per_episode": max_samples_per_episode,
         "all_samples_per_episode": bool(args.all_samples_per_episode),
         "gripper_window_before": args.gripper_window_before,
