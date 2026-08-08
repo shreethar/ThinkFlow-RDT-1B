@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--online-siglip",
         action="store_true",
-        help="Use cached JPEG image slots and compute SigLIP features online.",
+        help="Use cached image slots and compute SigLIP features online.",
     )
     parser.add_argument(
         "--siglip-model-id",

@@ -151,7 +151,8 @@ def resolve_model_id(primary: str, fallback: str | None = None) -> str:
     return primary
 
 
-def decode_jpeg_image(payload: bytes) -> Image.Image:
+def decode_cached_image(payload: bytes) -> Image.Image:
+    """Decode legacy JPEG or current lossless PNG cache payloads."""
     return Image.open(io.BytesIO(payload)).convert("RGB")
 
 
@@ -221,7 +222,7 @@ def add_online_siglip_features(
         for slot_index, payload in enumerate(slots):
             if bool(slot_mask[sample_index, slot_index].item()):
                 valid_slots.append((sample_index, slot_index))
-                flat_images.append(decode_jpeg_image(payload))
+                flat_images.append(decode_cached_image(payload))
 
     if not flat_images:
         batch["img_tokens"] = torch.zeros(

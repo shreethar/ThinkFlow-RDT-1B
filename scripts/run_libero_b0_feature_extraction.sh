@@ -43,7 +43,6 @@ CLOSE_TO_OPEN_BEFORE=${CLOSE_TO_OPEN_BEFORE:-10}
 CLOSE_TO_OPEN_AFTER=${CLOSE_TO_OPEN_AFTER:-11}
 IMAGE_HISTORY_SIZE=${IMAGE_HISTORY_SIZE:-2}
 MAX_IMAGES_PER_SAMPLE=${MAX_IMAGES_PER_SAMPLE:-6}
-IMAGE_JPEG_QUALITY=${IMAGE_JPEG_QUALITY:-100}
 
 ARGS=(
   --config "$CONFIG"
@@ -72,7 +71,6 @@ ARGS=(
   --t5-precision "$T5_PRECISION"
   --image-history-size "$IMAGE_HISTORY_SIZE"
   --max-images-per-sample "$MAX_IMAGES_PER_SAMPLE"
-  --image-jpeg-quality "$IMAGE_JPEG_QUALITY"
   --batch-size "$BATCH_SIZE"
   --num-workers "$NUM_WORKERS"
   --pin-memory

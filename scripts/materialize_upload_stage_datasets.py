@@ -141,7 +141,13 @@ def as_rgb_pil(image: Any) -> Image.Image | None:
 def image_to_bytes(image: Image.Image, image_format: str, jpeg_quality: int) -> bytes:
     buffer = io.BytesIO()
     if image_format == "jpeg":
-        image.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=jpeg_quality,
+            subsampling=0,
+            optimize=True,
+        )
     elif image_format == "png":
         image.save(buffer, format="PNG", optimize=True)
     else:
@@ -635,7 +641,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-empty-language", action="store_true")
     parser.add_argument("--samples-per-shard", type=int, default=1024)
     parser.add_argument("--max-samples-per-split", type=int, default=None)
-    parser.add_argument("--image-format", choices=["jpeg", "png"], default="jpeg")
+    parser.add_argument("--image-format", choices=["jpeg", "png"], default="png")
     parser.add_argument("--jpeg-quality", type=int, default=90)
     parser.add_argument("--upload", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--delete-after-upload", action="store_true")

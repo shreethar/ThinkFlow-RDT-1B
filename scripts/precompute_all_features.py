@@ -126,7 +126,7 @@ class TimingProfiler:
             "qwen",
             "t5",
             "writer_wait",
-            "jpeg_pool",
+            "image_pool",
             "torch_save",
             "episode_pack_total",
         )
@@ -276,13 +276,19 @@ def apply_qwen_chat_template(
         return processor.apply_chat_template(messages, **kwargs)
 
 
-def image_to_jpeg_bytes(image: Image.Image, *, quality: int = 90) -> bytes:
+def image_to_lossless_png_bytes(image: Image.Image) -> bytes:
+    """Encode an RGB cache image losslessly.
+
+    Cache record keys retain their historical ``*_jpegs`` names so existing
+    loaders can read both old JPEG shards and new PNG shards. Pillow detects
+    the actual codec from the payload header when decoding.
+    """
     buffer = io.BytesIO()
-    image.convert("RGB").save(buffer, format="JPEG", quality=quality, optimize=True)
+    image.convert("RGB").save(buffer, format="PNG", compress_level=6)
     return buffer.getvalue()
 
 
-def jpeg_bytes_to_image(payload: bytes) -> Image.Image:
+def image_bytes_to_image(payload: bytes) -> Image.Image:
     return Image.open(io.BytesIO(payload)).convert("RGB")
 
 
@@ -407,7 +413,7 @@ def standardized_collate_fn(
         "siglip_image_slots": siglip_image_slots,
         "siglip_slot_mask": torch.as_tensor(siglip_slot_masks, dtype=torch.bool),
         "image_slot_jpegs": [
-            [image_to_jpeg_bytes(image, quality=image_jpeg_quality) for image in slots]
+            [image_to_lossless_png_bytes(image) for image in slots]
             for slots in siglip_image_slots
         ] if encode_image_slots else None,
         "state": torch.stack(
@@ -1225,7 +1231,7 @@ def build_episode_image_pool(
     key_to_index: dict[tuple[int, str] | tuple[str], int] = {}
     image_pool: list[bytes] = []
     sample_image_indices: list[list[int]] = []
-    blank_payload = image_to_jpeg_bytes(blank_rgb_image(), quality=image_jpeg_quality)
+    blank_payload = image_to_lossless_png_bytes(blank_rgb_image())
 
     for sample_index, (metadata, sample_slots) in enumerate(
         zip(batch["metadata"], batch["siglip_image_slots"])
@@ -1252,7 +1258,7 @@ def build_episode_image_pool(
                 image_index = len(image_pool)
                 key_to_index[pool_key] = image_index
                 payload = (
-                    image_to_jpeg_bytes(image, quality=image_jpeg_quality)
+                    image_to_lossless_png_bytes(image)
                     if valid
                     else blank_payload
                 )
@@ -1272,7 +1278,7 @@ def build_shard_image_pool(
     key_to_index: dict[tuple[str, ...], int] = {}
     image_pool: list[bytes] = []
     sample_image_indices: list[list[int]] = []
-    blank_payload = image_to_jpeg_bytes(blank_rgb_image(), quality=image_jpeg_quality)
+    blank_payload = image_to_lossless_png_bytes(blank_rgb_image())
 
     for sample_index, (metadata, sample_slots) in enumerate(
         zip(batch["metadata"], batch["siglip_image_slots"])
@@ -1303,7 +1309,7 @@ def build_shard_image_pool(
                 image_index = len(image_pool)
                 key_to_index[pool_key] = image_index
                 image_pool.append(
-                    image_to_jpeg_bytes(image, quality=image_jpeg_quality)
+                    image_to_lossless_png_bytes(image)
                     if valid
                     else blank_payload
                 )
@@ -1475,13 +1481,13 @@ def save_episode_anchor_pack_job(
             device=episode_lang_tokens.device,
         )
 
-    jpeg_start = time.perf_counter()
+    image_pool_start = time.perf_counter()
     image_pool, sample_image_indices = build_episode_image_pool(
         batch,
         image_history_size=image_history_size,
         image_jpeg_quality=image_jpeg_quality,
     )
-    timings["jpeg_pool"] = time.perf_counter() - jpeg_start
+    timings["image_pool"] = time.perf_counter() - image_pool_start
     sample_anchor_indices = [
         anchor_index_for_step(int(metadata["step_idx"]), anchors)
         for metadata in batch["metadata"]
@@ -2393,7 +2399,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image-history-size", type=int, default=2)
     parser.add_argument("--max-images-per-sample", type=int, default=6)
-    parser.add_argument("--image-jpeg-quality", type=int, default=90)
+    parser.add_argument(
+        "--image-jpeg-quality",
+        type=int,
+        default=100,
+        help="Deprecated compatibility option; image slots are always lossless PNG.",
+    )
     parser.add_argument("--keep-no-image", action="store_true")
     parser.add_argument(
         "--save-padded-features",
@@ -2410,7 +2421,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Background episode-pack writer threads. Set to 1-2 to overlap JPEG "
+            "Background episode-pack writer threads. Set to 1-2 to overlap PNG "
             "packing/torch.save with the next Qwen/T5 batch."
         ),
     )
@@ -2668,7 +2679,9 @@ def main() -> None:
         "qwen_trajectory_prompt_template": args.qwen_trajectory_prompt_template,
         "image_history_size": args.image_history_size,
         "max_images_per_sample": args.max_images_per_sample,
-        "image_jpeg_quality": args.image_jpeg_quality,
+        "image_storage_codec": "png",
+        "image_storage_lossless": True,
+        "image_jpeg_quality": None,
         "feature_storage": "padded" if args.save_padded_features else "compact_valid_tokens",
         "qwen_model_id": args.qwen_model_id,
         "qwen_processor_id": args.qwen_processor_id or args.qwen_model_id,

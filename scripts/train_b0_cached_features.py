@@ -290,7 +290,7 @@ def parse_args() -> argparse.Namespace:
         "--online-siglip",
         action="store_true",
         help=(
-            "Use cached JPEG image slots and compute SigLIP online. Leave off for "
+            "Use cached image slots and compute SigLIP online. Leave off for "
             "sample-by-sample caches that already contain img_tokens/img_mask."
         ),
     )

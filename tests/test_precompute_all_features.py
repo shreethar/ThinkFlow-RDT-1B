@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
+from PIL import Image
 
 from scripts.precompute_all_features import (
     anchor_kind,
+    image_bytes_to_image,
+    image_to_lossless_png_bytes,
     iter_episode_sample_groups,
     select_episode_qwen_anchors,
 )
@@ -25,6 +28,17 @@ def make_sample(
         "instruction": "move the object",
         "actions": actions,
     }
+
+
+def test_cached_png_round_trip_is_pixel_exact() -> None:
+    pixels = np.arange(17 * 19 * 3, dtype=np.uint16).reshape(17, 19, 3)
+    pixels = (pixels % 256).astype(np.uint8)
+
+    payload = image_to_lossless_png_bytes(Image.fromarray(pixels, mode="RGB"))
+    decoded = np.asarray(image_bytes_to_image(payload))
+
+    assert payload.startswith(b"\x89PNG\r\n\x1a\n")
+    np.testing.assert_array_equal(decoded, pixels)
 
 
 def test_anchor_policy_keeps_only_first_step_without_gripper_change() -> None:

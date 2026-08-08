@@ -30,7 +30,7 @@ from precompute_all_features import (  # noqa: E402
     build_lazy_configs,
     compact_tokens,
     format_qwen_trajectory_prompt,
-    image_to_jpeg_bytes,
+    image_to_lossless_png_bytes,
     layer_key_values_from_past,
     prepare_split_output,
     resolve_model_id,
@@ -378,7 +378,9 @@ def build_shard_image_pool(
     key_to_index: dict[tuple[str, ...], int] = {}
     image_pool: list[bytes] = []
     sample_image_indices: list[list[int]] = []
-    blank_payload = image_to_jpeg_bytes(Image.new("RGB", (384, 384), color=(0, 0, 0)), quality=image_jpeg_quality)
+    blank_payload = image_to_lossless_png_bytes(
+        Image.new("RGB", (384, 384), color=(0, 0, 0))
+    )
 
     for sample_index, (metadata, sample_slots) in enumerate(
         zip(batch["metadata"], batch["siglip_image_slots"])
@@ -413,7 +415,7 @@ def build_shard_image_pool(
                 image_index = len(image_pool)
                 key_to_index[pool_key] = image_index
                 image_pool.append(
-                    image_to_jpeg_bytes(image, quality=image_jpeg_quality)
+                    image_to_lossless_png_bytes(image)
                     if valid
                     else blank_payload
                 )
@@ -847,7 +849,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--image-history-size", type=int, default=2)
     parser.add_argument("--max-images-per-sample", type=int, default=6)
-    parser.add_argument("--image-jpeg-quality", type=int, default=85)
+    parser.add_argument(
+        "--image-jpeg-quality",
+        type=int,
+        default=100,
+        help="Deprecated compatibility option; image slots are always lossless PNG.",
+    )
     parser.add_argument("--keep-no-image", action="store_true")
     parser.add_argument("--cache-image-slots", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -977,7 +984,9 @@ def main() -> None:
         "cache_image_slots": args.cache_image_slots,
         "image_history_size": args.image_history_size,
         "max_images_per_sample": args.max_images_per_sample,
-        "image_jpeg_quality": args.image_jpeg_quality,
+        "image_storage_codec": "png",
+        "image_storage_lossless": True,
+        "image_jpeg_quality": None,
         "cache_layout": "sample_shard",
         "batch_size": args.batch_size,
     }

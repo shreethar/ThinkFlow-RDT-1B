@@ -428,7 +428,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--image-history-size", type=int, default=2)
     parser.add_argument("--max-images-per-sample", type=int, default=6)
-    parser.add_argument("--image-jpeg-quality", type=int, default=90)
+    parser.add_argument(
+        "--image-jpeg-quality",
+        type=int,
+        default=100,
+        help="Deprecated compatibility option; estimates use lossless PNG payloads.",
+    )
     parser.add_argument("--keep-no-image", action="store_true")
     parser.add_argument("--qwen-model-id", default="shreethar/stage1_unsloth")
     parser.add_argument("--qwen-layer-index", type=int, default=7)
