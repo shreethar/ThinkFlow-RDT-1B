@@ -23,7 +23,8 @@ src/thinkflow_rdt.egg-info/
 
 src/thinkflow_rdt/adapters/__pycache__
 scripts/__pycache__/
-tests/__pycache__
+tests/__pycache__/
+scratch/__pycache__/
 
 # Local training artifacts and offline experiment logs.
 outputs/
@@ -54,3 +55,6 @@ thinkflow-libero-features-b0
 checkpoint-1000/
 oxe_b0_merged_for_libero/
 libero-dataset/
+cache_features_libero_b0_raw_ortho6d/
+cache_features_libero_object_task0_10demos/
+cache_features_libero_object_task0_demo0/
