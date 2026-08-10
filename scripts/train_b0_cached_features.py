@@ -109,6 +109,32 @@ def optional_override(value: object | None, current: object) -> object:
     return current if value is None else value
 
 
+def parse_horizon_loss_schedule(schedule: str | None, horizon: int) -> list[float] | None:
+    if schedule is None:
+        return None
+    weights: list[float | None] = [None] * horizon
+    for block in schedule.split(","):
+        range_text, separator, weight_text = block.strip().partition(":")
+        if not separator:
+            raise ValueError(f"Invalid horizon weight block: {block!r}")
+        start_text, range_separator, stop_text = range_text.partition("-")
+        start = int(start_text)
+        stop = int(stop_text) if range_separator else start
+        weight = float(weight_text)
+        if start < 1 or stop < start or stop > horizon:
+            raise ValueError(
+                f"Horizon range {start}-{stop} is outside one-indexed [1,{horizon}]"
+            )
+        for index in range(start - 1, stop):
+            if weights[index] is not None:
+                raise ValueError(f"Horizon step {index + 1} is assigned more than once")
+            weights[index] = weight
+    missing = [index + 1 for index, value in enumerate(weights) if value is None]
+    if missing:
+        raise ValueError(f"Horizon schedule does not cover steps: {missing}")
+    return [float(value) for value in weights if value is not None]
+
+
 def build_config(args: argparse.Namespace):
     cfg = load_config(args.config)
     output_dir = str(args.output_dir.expanduser().resolve())
@@ -372,12 +398,37 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override cfg.model.pred_horizon; cached action horizons are truncated/padded.",
     )
+    parser.add_argument(
+        "--horizon-loss-schedule",
+        default=None,
+        help=(
+            "One-indexed, non-overlapping horizon weights, for example "
+            "'1-4:5,5-8:3,9-16:2,17-64:1'."
+        ),
+    )
+    parser.add_argument(
+        "--mask-noisy-gripper-input",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Hide the noised gripper channel from the action adaptor during "
+            "training and decode gripper from the final clean-x0 estimate at "
+            "inference. Recommended for discrete LIBERO gripper commands."
+        ),
+    )
+    parser.add_argument("--gripper-bce-weight", type=float, default=0.0)
+    parser.add_argument("--gripper-bce-logit-scale", type=float, default=1.0)
+    parser.add_argument("--rotation-geodesic-weight", type=float, default=0.0)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     cfg = build_config(args)
+    horizon_loss_weights = parse_horizon_loss_schedule(
+        args.horizon_loss_schedule,
+        cfg.model.pred_horizon,
+    )
     train(
         cfg,
         load_pretrained=not args.no_pretrained,
@@ -385,6 +436,11 @@ def main() -> None:
         online_siglip_fallback_model_id=args.siglip_fallback_model_id,
         base_artifact=args.base_artifact,
         init_artifact=args.init_artifact,
+        horizon_loss_weights=horizon_loss_weights,
+        mask_noisy_gripper_input=args.mask_noisy_gripper_input,
+        gripper_bce_weight=args.gripper_bce_weight,
+        gripper_bce_logit_scale=args.gripper_bce_logit_scale,
+        rotation_geodesic_weight=args.rotation_geodesic_weight,
     )
 
 

@@ -14,6 +14,7 @@ from thinkflow_rdt.checkpoint import (
     FULL_RDT_FILE,
     INTERFACE_FILE,
     METADATA_FILE,
+    load_full_rdt_base,
     load_trainable_artifact,
     save_trainable_artifact,
 )
@@ -28,6 +29,15 @@ class FakeFullCore(nn.Module):
 
     def save_pretrained(self, _path: str | Path) -> None:
         raise AssertionError("A non-PEFT model must use the full-state artifact")
+
+
+class FakeTransferCore(nn.Module):
+    def __init__(self, action_dim: int, hidden_dim: int = 4) -> None:
+        super().__init__()
+        self.block = nn.Linear(hidden_dim, hidden_dim)
+        self.final_layer = nn.Module()
+        self.final_layer.ffn_final = nn.Module()
+        self.final_layer.ffn_final.fc2 = nn.Linear(hidden_dim, action_dim)
 
 
 class FakeLoraCore(nn.Module):
@@ -134,6 +144,21 @@ def test_full_rdt_artifact_round_trip_includes_qwen_and_interfaces(tmp_path):
     assert all(not parameter.requires_grad for parameter in restored.parameters())
 
 
+def test_artifact_restores_noisy_gripper_mask_behavior(tmp_path):
+    source = FakeConditionedRDT(FakeFullCore(), finetune_mode="full")
+    save_trainable_artifact(
+        source,
+        tmp_path,
+        {"mask_noisy_gripper_input": True},
+    )
+
+    restored = FakeConditionedRDT(FakeFullCore(), finetune_mode="full")
+    restored.mask_noisy_gripper_input = False
+    load_trainable_artifact(restored, tmp_path, trainable=False)
+
+    assert restored.mask_noisy_gripper_input is True
+
+
 def test_non_peft_core_uses_full_state_even_if_it_has_save_pretrained(tmp_path):
     model = FakeConditionedRDT(FakeFullCore(), finetune_mode=None)
 
@@ -159,6 +184,47 @@ def test_full_artifact_accepts_accelerator_gathered_state(tmp_path):
     fill_parameters(restored, start=-30.0)
     load_trainable_artifact(restored, tmp_path, trainable=False)
     assert_states_equal(restored, expected)
+
+
+def test_full_base_can_reinitialize_only_a_changed_action_output_head(tmp_path):
+    source_core = FakeTransferCore(action_dim=7)
+    fill_parameters(source_core, start=3.0)
+    torch.save(source_core.state_dict(), tmp_path / FULL_RDT_FILE)
+
+    target_core = FakeTransferCore(action_dim=10)
+    original_head = {
+        name: tensor.detach().clone()
+        for name, tensor in target_core.final_layer.ffn_final.fc2.state_dict().items()
+    }
+    model = SimpleNamespace(runner=SimpleNamespace(model=target_core))
+    report = load_full_rdt_base(
+        model,
+        tmp_path,
+        allow_output_head_mismatch=True,
+    )
+
+    torch.testing.assert_close(target_core.block.weight, source_core.block.weight)
+    torch.testing.assert_close(target_core.block.bias, source_core.block.bias)
+    for name, tensor in target_core.final_layer.ffn_final.fc2.state_dict().items():
+        torch.testing.assert_close(tensor, original_head[name])
+    assert report["reinitialized_tensors"] == [
+        "final_layer.ffn_final.fc2.bias",
+        "final_layer.ffn_final.fc2.weight",
+    ]
+
+
+def test_full_base_still_rejects_other_shape_mismatches(tmp_path):
+    source_core = FakeTransferCore(action_dim=7, hidden_dim=4)
+    torch.save(source_core.state_dict(), tmp_path / FULL_RDT_FILE)
+    target_core = FakeTransferCore(action_dim=10, hidden_dim=5)
+    model = SimpleNamespace(runner=SimpleNamespace(model=target_core))
+
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        load_full_rdt_base(
+            model,
+            tmp_path,
+            allow_output_head_mismatch=True,
+        )
 
 
 def test_lora_artifact_round_trip_preserves_adapter_and_qwen(

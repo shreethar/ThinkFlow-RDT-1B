@@ -16,6 +16,7 @@ os.environ.setdefault("XDG_CACHE_HOME", "/tmp/thinkflow-cache")
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/thinkflow-matplotlib")
 
 import imageio.v2 as imageio
+import h5py
 import numpy as np
 import torch
 from transformers import (
@@ -60,6 +61,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/b0_rdt1b_lora.yaml")
     parser.add_argument("--benchmark", choices=LIBERO_BENCHMARK_CHOICES, default=LIBERO_DEFAULT_BENCHMARK)
     parser.add_argument("--checkpoint", type=Path, default=Path("outputs/libero_spatial_full/checkpoint-1600"))
+    parser.add_argument(
+        "--base-artifact",
+        type=Path,
+        default=None,
+        help=(
+            "Optional merged/full RDT base artifact to load before applying the "
+            "trainable checkpoint. Use the same base artifact used for training."
+        ),
+    )
     parser.add_argument(
         "--pretrained-only",
         action="store_true",
@@ -118,6 +128,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/libero_spatial_evaluation/checkpoint-1600"))
     parser.add_argument("--episodes-per-task", type=int, default=20, help="LIBERO official default is 20; each task has 50 available.")
     parser.add_argument("--all-episodes", action="store_true", help="Evaluate all 50 states for each of 10 tasks (500 rollouts).")
+    parser.add_argument(
+        "--demo-hdf5",
+        type=Path,
+        help=(
+            "Use exact initial simulator states from this LIBERO demonstration "
+            "file instead of benchmark init-state files. Requires one --task-id."
+        ),
+    )
+    parser.add_argument(
+        "--demo-name",
+        action="append",
+        help=(
+            "HDF5 demo group to evaluate; may be repeated. With --demo-hdf5 "
+            "and no names, evaluates every demo group."
+        ),
+    )
     parser.add_argument("--env-batch-size", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument(
@@ -213,6 +239,31 @@ def existing_result_keys(path: Path) -> set[tuple[int, int]]:
     return keys
 
 
+def load_demo_initial_states(
+    path: Path,
+    requested_names: list[str] | None,
+) -> tuple[list[str], np.ndarray]:
+    """Load exact initial MuJoCo states from selected HDF5 demonstrations."""
+    with h5py.File(path, "r") as handle:
+        root = handle["data"] if "data" in handle else handle
+        available = sorted(
+            name for name in root if hasattr(root[name], "keys") and "states" in root[name]
+        )
+        names = available if not requested_names else list(dict.fromkeys(requested_names))
+        missing = [name for name in names if name not in root]
+        if missing:
+            raise KeyError(
+                f"Demo groups not found in {path}: {missing}; available examples: {available[:10]}"
+            )
+        if not names:
+            raise ValueError(f"No demonstrations with states found in {path}")
+        states = [np.asarray(root[name]["states"][0], dtype=np.float64) for name in names]
+    shapes = {state.shape for state in states}
+    if len(shapes) != 1:
+        raise ValueError(f"Selected demo initial states have inconsistent shapes: {shapes}")
+    return names, np.stack(states)
+
+
 def write_summary(results_path: Path, summary_path: Path) -> dict[str, Any]:
     rows = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     tasks: dict[str, dict[str, Any]] = {}
@@ -242,6 +293,20 @@ def main() -> None:
     if args.all_episodes:
         args.episodes_per_task = 50
     task_ids = sorted(set(args.task_id)) if args.task_id else list(range(10))
+    demo_names: list[str] | None = None
+    demo_initial_states: np.ndarray | None = None
+    if args.demo_hdf5 is not None:
+        if args.all_episodes:
+            raise ValueError("--all-episodes cannot be combined with --demo-hdf5")
+        if len(task_ids) != 1:
+            raise ValueError("--demo-hdf5 requires exactly one --task-id")
+        demo_names, demo_initial_states = load_demo_initial_states(
+            args.demo_hdf5.expanduser().resolve(),
+            args.demo_name,
+        )
+        args.episodes_per_task = len(demo_names)
+    elif args.demo_name:
+        raise ValueError("--demo-name requires --demo-hdf5")
     if args.env_batch_size <= 0:
         raise ValueError("--env-batch-size must be positive")
     if not torch.cuda.is_available():
@@ -328,7 +393,13 @@ def main() -> None:
         print(f"Loading pretrained RDT baseline {cfg.pretrained_model}...")
     else:
         print(f"Loading RDT artifact {args.checkpoint}...")
-    model = SFTConditionedRDT(cfg, load_pretrained=True)
+    model = SFTConditionedRDT(
+        cfg,
+        load_pretrained=True,
+        base_artifact=(
+            None if args.base_artifact is None else str(args.base_artifact)
+        ),
+    )
     if not args.pretrained_only:
         load_trainable_artifact(model, args.checkpoint, trainable=False)
     model.to(device).eval()
@@ -343,11 +414,19 @@ def main() -> None:
     with results_path.open("a", encoding="utf-8") as output:
         for task_id in task_ids:
             task = benchmark.get_task(task_id)
-            all_init_states = torch.load(
-                args.libero_root / "libero" / "libero" / "init_files" / task.problem_folder / task.init_states_file,
-                map_location="cpu",
-                weights_only=False,
-            )
+            if demo_initial_states is not None:
+                all_init_states = demo_initial_states
+                assert demo_names is not None
+                state_labels = demo_names
+                settle_steps = 0
+            else:
+                all_init_states = torch.load(
+                    args.libero_root / "libero" / "libero" / "init_files" / task.problem_folder / task.init_states_file,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                state_labels = [f"init{index:02d}" for index in range(args.episodes_per_task)]
+                settle_steps = 5
             pending = [index for index in range(args.episodes_per_task) if (task_id, index) not in completed]
             for batch_start in range(0, len(pending), args.env_batch_size):
                 indices = pending[batch_start : batch_start + args.env_batch_size]
@@ -372,7 +451,7 @@ def main() -> None:
                 env = SubprocVectorEnv(env_fns)
                 env.reset()
                 observations = list(env.set_init_state(all_init_states[indices]))
-                for _ in range(5):
+                for _ in range(settle_steps):
                     observations, _, _, _ = env.step(np.zeros((len(indices), 7), dtype=np.float32))
                     observations = list(observations)
 
@@ -388,7 +467,8 @@ def main() -> None:
                     video_dir = args.output_dir / "videos"
                     video_dir.mkdir(parents=True, exist_ok=True)
                     for local_index, init_index in enumerate(indices):
-                        video_path = video_dir / f"task{task_id:02d}_init{init_index:02d}.mp4"
+                        state_label = state_labels[init_index]
+                        video_path = video_dir / f"task{task_id:02d}_{state_label}.mp4"
                         video_paths[local_index] = video_path
                         writers[local_index] = imageio.get_writer(
                             video_path,
@@ -510,7 +590,7 @@ def main() -> None:
                                 if writer is None or done_before_step[local_index]:
                                     continue
                                 label = (
-                                    f"task={task_id} init={indices[local_index]} "
+                                    f"task={task_id} state={state_labels[indices[local_index]]} "
                                     f"step={simulator_step} success={int(done[local_index])}"
                                 )
                                 writer.append_data(frame_for_video(rendered[local_index], label))
@@ -536,11 +616,18 @@ def main() -> None:
                         "task_name": task.name,
                         "instruction": task.language,
                         "init_state_index": init_index,
+                        "initial_state_label": state_labels[init_index],
+                        "initial_state_source": (
+                            "demo_hdf5" if demo_initial_states is not None else "benchmark"
+                        ),
                         "success": bool(done[local_index]),
                         "steps": int(success_step[local_index]),
                         "checkpoint": "pretrained-only" if args.pretrained_only else str(args.checkpoint.resolve()),
                         "pretrained_only": bool(args.pretrained_only),
                     }
+                    if demo_initial_states is not None:
+                        row["demo_hdf5"] = str(args.demo_hdf5.resolve())
+                        row["demo_name"] = state_labels[init_index]
                     if video_paths[local_index] is not None:
                         row["video"] = str(video_paths[local_index].resolve())
                     output.write(json.dumps(row) + "\n")

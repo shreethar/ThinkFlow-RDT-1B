@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from transformers import get_scheduler
 from transformers import SiglipImageProcessor, SiglipVisionModel
 
+from .adapters.libero import rdt_action_to_libero
 from .checkpoint import load_trainable_artifact, save_trainable_artifact
 from .config import ExperimentConfig
 from .data import (
@@ -38,6 +39,50 @@ LIBERO_SUITE_IDS = (
     "libero_10",
     "libero_90",
 )
+
+LIBERO_RAW_ACTION_NAMES = (
+    "dx",
+    "dy",
+    "dz",
+    "dRx",
+    "dRy",
+    "dRz",
+    "gripper",
+)
+
+
+def infer_gripper_release_mask(
+    target_gripper: torch.Tensor,
+    time_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Infer release-open command positions from a cached future-action chunk.
+
+    Raw LIBERO gripper commands use positive values for close/hold and negative
+    values for open. An open command is considered a release after the final
+    visible close-to-open transition. A truncated, entirely-open chunk is an
+    episode tail and is therefore also considered release-open. Full-length
+    entirely-open chunks remain approach-open.
+    """
+    if target_gripper.ndim != 2 or time_mask.shape != target_gripper.shape:
+        raise ValueError("target_gripper and time_mask must both have shape [B, T]")
+    valid = time_mask.to(device=target_gripper.device, dtype=torch.bool)
+    positive = target_gripper >= 0.0
+    release = torch.zeros_like(valid)
+    horizon = target_gripper.shape[1]
+    for row in range(target_gripper.shape[0]):
+        valid_count = int(valid[row].sum().item())
+        if valid_count == 0:
+            continue
+        row_positive = positive[row, :valid_count]
+        starts = torch.nonzero(
+            row_positive[:-1] & ~row_positive[1:], as_tuple=False
+        ).flatten()
+        if starts.numel() > 0:
+            start = int(starts[-1].item()) + 1
+            release[row, start:valid_count] = ~row_positive[start:]
+        elif valid_count < horizon and not bool(row_positive.any().item()):
+            release[row, :valid_count] = True
+    return release & valid
 
 
 def seed_everything(seed: int) -> None:
@@ -477,6 +522,29 @@ def log_metrics(
     accelerator.log(values, step=step)
 
 
+def attach_training_objective(
+    batch: dict[str, object],
+    *,
+    horizon_loss_weights: list[float] | None,
+    gripper_bce_weight: float,
+    gripper_bce_logit_scale: float,
+    rotation_geodesic_weight: float,
+) -> None:
+    """Attach device/dtype-correct loss controls to a collated batch."""
+    actions = batch["actions"]
+    if not isinstance(actions, torch.Tensor):
+        raise TypeError("batch['actions'] must be a tensor")
+    if horizon_loss_weights is not None:
+        batch["horizon_loss_weights"] = actions.new_tensor(horizon_loss_weights)
+    batch["gripper_bce_weight"] = actions.new_tensor(gripper_bce_weight)
+    batch["gripper_bce_logit_scale"] = actions.new_tensor(
+        gripper_bce_logit_scale
+    )
+    batch["rotation_geodesic_weight"] = actions.new_tensor(
+        rotation_geodesic_weight
+    )
+
+
 @torch.no_grad()
 def validate(
     model: SFTConditionedRDT,
@@ -485,6 +553,10 @@ def validate(
     cfg: ExperimentConfig,
     *,
     online_siglip: tuple[SiglipImageProcessor, SiglipVisionModel] | None = None,
+    horizon_loss_weights: list[float] | None = None,
+    gripper_bce_weight: float = 0.0,
+    gripper_bce_logit_scale: float = 1.0,
+    rotation_geodesic_weight: float = 0.0,
 ) -> dict[str, float]:
     model.eval()
     validation_batch_limit = resolve_validation_batch_limit(cfg, accelerator)
@@ -497,19 +569,54 @@ def validate(
     rot_valid_count = torch.zeros_like(loss_sum)
     gripper_loss_sum = torch.zeros_like(loss_sum)
     gripper_valid_count = torch.zeros_like(loss_sum)
+    gripper_bce_sum = torch.zeros_like(loss_sum)
+    rotation_geodesic_sum = torch.zeros_like(loss_sum)
     sample_error_sum = torch.zeros_like(loss_sum)
     sample_valid_count = torch.zeros_like(loss_sum)
-    horizon_loss_sum = torch.zeros(
-        cfg.model.pred_horizon,
+    sampled_horizons = tuple(
+        horizon for horizon in (1, 4, 8, 64) if horizon <= cfg.model.pred_horizon
+    )
+    sampled_command_squared_error = torch.zeros(
+        len(sampled_horizons), device=accelerator.device, dtype=torch.float64
+    )
+    sampled_motion_squared_error = torch.zeros_like(sampled_command_squared_error)
+    sampled_gripper_squared_error = torch.zeros_like(sampled_command_squared_error)
+    sampled_command_count = torch.zeros_like(sampled_command_squared_error)
+    sampled_motion_count = torch.zeros_like(sampled_command_squared_error)
+    sampled_gripper_count = torch.zeros_like(sampled_command_squared_error)
+    # Per decoded dimension: sum(pred), sum(target), sum(pred^2),
+    # sum(target^2), sum(pred*target), count.
+    sampled_dimension_stats = torch.zeros(
+        len(LIBERO_RAW_ACTION_NAMES),
+        6,
         device=accelerator.device,
         dtype=torch.float64,
     )
-    horizon_valid_count = torch.zeros_like(horizon_loss_sum)
+    # Per decoded dimension: correct signs, saturated predictions, count.
+    sampled_dimension_classification = torch.zeros(
+        len(LIBERO_RAW_ACTION_NAMES),
+        3,
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    # TP, FP, FN, TN for positive (close/hold) gripper commands.
+    sampled_gripper_confusion = torch.zeros(
+        4, device=accelerator.device, dtype=torch.float64
+    )
+    # approach-open, close/hold, release-open; columns are correct commands,
+    # command count, and sampled chunks containing at least one phase command.
+    sampled_gripper_phase = torch.zeros(
+        3, 3, device=accelerator.device, dtype=torch.float64
+    )
+    # opportunities, detected, missed, signed-error sum, abs-error sum.
+    sampled_release_transition = torch.zeros(
+        5, device=accelerator.device, dtype=torch.float64
+    )
     # Columns: loss, MAE, examples, XYZ loss/count, rotation loss/count,
-    # gripper loss/count, sampled-action MSE/count.
+    # gripper loss/count.
     suite_stats = torch.zeros(
         len(LIBERO_SUITE_IDS),
-        11,
+        9,
         device=accelerator.device,
         dtype=torch.float64,
     )
@@ -542,9 +649,14 @@ def validate(
                     cfg=cfg,
                     device=accelerator.device,
                 )
+            attach_training_objective(
+                batch,
+                horizon_loss_weights=horizon_loss_weights,
+                gripper_bce_weight=gripper_bce_weight,
+                gripper_bce_logit_scale=gripper_bce_logit_scale,
+                rotation_geodesic_weight=rotation_geodesic_weight,
+            )
             metrics = model(batch)
-            horizon_loss_sum += metrics["horizon_loss_sum"].double()
-            horizon_valid_count += metrics["horizon_valid_count"].double()
             dataset_ids = list(batch.get("dataset_id", []))
             if len(dataset_ids) != int(metrics["sample_is_valid"].shape[0]):
                 raise ValueError(
@@ -611,6 +723,20 @@ def validate(
             gripper_valid_count += accelerator.reduce(
                 metrics["gripper_valid_count"].double(), reduction="sum"
             )
+            gripper_bce_sum += accelerator.reduce(
+                (
+                    metrics["sample_gripper_bce_loss"].double()
+                    * metrics["sample_is_valid"].double()
+                ).sum(),
+                reduction="sum",
+            )
+            rotation_geodesic_sum += accelerator.reduce(
+                (
+                    metrics["sample_rotation_geodesic_loss"].double()
+                    * metrics["sample_is_valid"].double()
+                ).sum(),
+                reduction="sum",
+            )
             if index < cfg.training.sample_validation_batches:
                 # Route sampling through DDP/FSDP so parameter-gathering hooks
                 # run just as they do for the training forward.
@@ -654,33 +780,234 @@ def validate(
                 sample_valid_count += accelerator.reduce(
                     per_sample_valid.sum().double(), reduction="sum"
                 )
-                for suite_index, suite_id in enumerate(LIBERO_SUITE_IDS):
-                    selected = torch.as_tensor(
-                        [dataset_id == suite_id for dataset_id in dataset_ids],
-                        device=accelerator.device,
-                        dtype=per_sample_error.dtype,
+                if cfg.model.action_encoder_layout == "libero_ortho6d":
+                    prediction_raw = torch.from_numpy(
+                        rdt_action_to_libero(prediction.float().cpu().numpy())
+                    ).to(accelerator.device, dtype=torch.float64)
+                    target_raw = torch.from_numpy(
+                        rdt_action_to_libero(target.float().cpu().numpy())
+                    ).to(accelerator.device, dtype=torch.float64)
+                    raw_time_mask = batch["action_time_mask"].to(
+                        accelerator.device,
+                        dtype=torch.bool,
                     )
-                    selected_valid = per_sample_valid * selected
-                    suite_stats[suite_index, 9] += (
-                        per_sample_error * selected_valid
-                    ).sum().double()
-                    suite_stats[suite_index, 10] += selected_valid.sum().double()
+                    for horizon_slot, horizon in enumerate(sampled_horizons):
+                        horizon_valid = raw_time_mask[:, :horizon]
+                        raw_diff = (
+                            prediction_raw[:, :horizon]
+                            - target_raw[:, :horizon]
+                        )
+                        sampled_command_squared_error[horizon_slot] += (
+                            raw_diff.pow(2)
+                            * horizon_valid.unsqueeze(-1).to(raw_diff.dtype)
+                        ).sum()
+                        sampled_motion_squared_error[horizon_slot] += (
+                            raw_diff[..., :6].pow(2)
+                            * horizon_valid.unsqueeze(-1).to(raw_diff.dtype)
+                        ).sum()
+                        sampled_gripper_squared_error[horizon_slot] += (
+                            raw_diff[..., 6].pow(2)
+                            * horizon_valid.to(raw_diff.dtype)
+                        ).sum()
+                        valid_commands = horizon_valid.sum().double()
+                        sampled_command_count[horizon_slot] += valid_commands * 7
+                        sampled_motion_count[horizon_slot] += valid_commands * 6
+                        sampled_gripper_count[horizon_slot] += valid_commands
+
+                    valid_raw = raw_time_mask.unsqueeze(-1).expand_as(
+                        prediction_raw
+                    )
+                    for dimension in range(len(LIBERO_RAW_ACTION_NAMES)):
+                        dimension_valid = valid_raw[..., dimension]
+                        predicted_values = prediction_raw[..., dimension][
+                            dimension_valid
+                        ]
+                        target_values = target_raw[..., dimension][
+                            dimension_valid
+                        ]
+                        if predicted_values.numel() == 0:
+                            continue
+                        sampled_dimension_stats[dimension] += torch.stack(
+                            (
+                                predicted_values.sum(),
+                                target_values.sum(),
+                                predicted_values.square().sum(),
+                                target_values.square().sum(),
+                                (predicted_values * target_values).sum(),
+                                predicted_values.new_tensor(
+                                    predicted_values.numel()
+                                ),
+                            )
+                        )
+                        predicted_sign = torch.where(
+                            predicted_values > 1e-6,
+                            torch.ones_like(predicted_values),
+                            torch.where(
+                                predicted_values < -1e-6,
+                                -torch.ones_like(predicted_values),
+                                torch.zeros_like(predicted_values),
+                            ),
+                        )
+                        target_sign = torch.where(
+                            target_values > 1e-6,
+                            torch.ones_like(target_values),
+                            torch.where(
+                                target_values < -1e-6,
+                                -torch.ones_like(target_values),
+                                torch.zeros_like(target_values),
+                            ),
+                        )
+                        sampled_dimension_classification[dimension] += torch.stack(
+                            (
+                                (predicted_sign == target_sign).sum().double(),
+                                (
+                                    predicted_values.abs() >= 1.0 - 1e-6
+                                ).sum().double(),
+                                predicted_values.new_tensor(
+                                    predicted_values.numel()
+                                ),
+                            )
+                        )
+
+                    predicted_positive = prediction_raw[..., 6] >= 0.0
+                    target_positive = target_raw[..., 6] >= 0.0
+                    sampled_gripper_confusion += torch.stack(
+                        (
+                            (
+                                predicted_positive
+                                & target_positive
+                                & raw_time_mask
+                            ).sum().double(),
+                            (
+                                predicted_positive
+                                & ~target_positive
+                                & raw_time_mask
+                            ).sum().double(),
+                            (
+                                ~predicted_positive
+                                & target_positive
+                                & raw_time_mask
+                            ).sum().double(),
+                            (
+                                ~predicted_positive
+                                & ~target_positive
+                                & raw_time_mask
+                            ).sum().double(),
+                        )
+                    )
+
+                    release_mask = infer_gripper_release_mask(
+                        target_raw[..., 6], raw_time_mask
+                    )
+                    phase_masks = (
+                        raw_time_mask & ~target_positive & ~release_mask,
+                        raw_time_mask & target_positive,
+                        release_mask,
+                    )
+                    for phase_index, phase_mask in enumerate(phase_masks):
+                        sampled_gripper_phase[phase_index, 0] += (
+                            (predicted_positive == target_positive) & phase_mask
+                        ).sum().double()
+                        sampled_gripper_phase[phase_index, 1] += (
+                            phase_mask.sum().double()
+                        )
+                        sampled_gripper_phase[phase_index, 2] += (
+                            phase_mask.any(dim=1).sum().double()
+                        )
+
+                    for row in range(prediction_raw.shape[0]):
+                        row_valid_count = int(raw_time_mask[row].sum().item())
+                        if row_valid_count < 2:
+                            continue
+                        row_release = release_mask[row, :row_valid_count]
+                        release_starts = torch.nonzero(
+                            row_release[1:] & ~row_release[:-1],
+                            as_tuple=False,
+                        ).flatten()
+                        if release_starts.numel() == 0:
+                            continue
+                        target_start = int(release_starts[0].item()) + 1
+                        sampled_release_transition[0] += 1
+                        row_prediction = predicted_positive[
+                            row, :row_valid_count
+                        ]
+                        prediction_starts = torch.nonzero(
+                            row_prediction[:-1] & ~row_prediction[1:],
+                            as_tuple=False,
+                        ).flatten()
+                        if prediction_starts.numel() == 0:
+                            sampled_release_transition[2] += 1
+                            continue
+                        prediction_starts = prediction_starts + 1
+                        closest_index = torch.argmin(
+                            (prediction_starts - target_start).abs()
+                        )
+                        error_steps = (
+                            prediction_starts[closest_index].double()
+                            - target_start
+                        )
+                        sampled_release_transition[1] += 1
+                        sampled_release_transition[3] += error_steps
+                        sampled_release_transition[4] += error_steps.abs()
     model.train()
-    horizon_loss_sum = accelerator.reduce(horizon_loss_sum, reduction="sum")
-    horizon_valid_count = accelerator.reduce(
-        horizon_valid_count, reduction="sum"
-    )
     suite_stats = accelerator.reduce(suite_stats, reduction="sum")
+    sampled_command_squared_error = accelerator.reduce(
+        sampled_command_squared_error, reduction="sum"
+    )
+    sampled_motion_squared_error = accelerator.reduce(
+        sampled_motion_squared_error, reduction="sum"
+    )
+    sampled_gripper_squared_error = accelerator.reduce(
+        sampled_gripper_squared_error, reduction="sum"
+    )
+    sampled_command_count = accelerator.reduce(
+        sampled_command_count, reduction="sum"
+    )
+    sampled_motion_count = accelerator.reduce(
+        sampled_motion_count, reduction="sum"
+    )
+    sampled_gripper_count = accelerator.reduce(
+        sampled_gripper_count, reduction="sum"
+    )
+    sampled_dimension_stats = accelerator.reduce(
+        sampled_dimension_stats, reduction="sum"
+    )
+    sampled_dimension_classification = accelerator.reduce(
+        sampled_dimension_classification, reduction="sum"
+    )
+    sampled_gripper_confusion = accelerator.reduce(
+        sampled_gripper_confusion, reduction="sum"
+    )
+    sampled_gripper_phase = accelerator.reduce(
+        sampled_gripper_phase, reduction="sum"
+    )
+    sampled_release_transition = accelerator.reduce(
+        sampled_release_transition, reduction="sum"
+    )
     loss_denominator = valid_count.clamp_min(1.0)
     sample_denominator = sample_valid_count.clamp_min(1.0)
+    imitation_loss = loss_sum / loss_denominator
+    gripper_bce_loss = gripper_bce_sum / loss_denominator
+    rotation_geodesic_loss = rotation_geodesic_sum / loss_denominator
+    total_loss = (
+        imitation_loss
+        + float(gripper_bce_weight) * gripper_bce_loss
+        + float(rotation_geodesic_weight) * rotation_geodesic_loss
+    )
     result = {
-        "val/loss": (
-            float((loss_sum / loss_denominator).cpu())
+        "val/loss": float(total_loss.cpu()) if valid_count.item() > 0 else math.nan,
+        "val/imitation_loss": (
+            float(imitation_loss.cpu())
             if valid_count.item() > 0
             else math.nan
         ),
-        "val/imitation_loss": (
-            float((loss_sum / loss_denominator).cpu())
+        "val/gripper_bce_loss": (
+            float(gripper_bce_loss.cpu())
+            if valid_count.item() > 0
+            else math.nan
+        ),
+        "val/rotation_geodesic_loss": (
+            float(rotation_geodesic_loss.cpu())
             if valid_count.item() > 0
             else math.nan
         ),
@@ -711,11 +1038,161 @@ def validate(
             else math.nan
         ),
     }
-    for horizon_index in range(cfg.model.pred_horizon):
-        count = horizon_valid_count[horizon_index]
-        result[f"val/horizon_mse/step_{horizon_index:02d}"] = (
-            float((horizon_loss_sum[horizon_index] / count.clamp_min(1.0)).cpu())
-            if count.item() > 0
+    if cfg.model.action_encoder_layout == "libero_ortho6d":
+        for slot, horizon in enumerate(sampled_horizons):
+            prefix = f"val/sampled_command/horizon_{horizon}"
+            result[f"{prefix}/command_rmse_7d"] = (
+                float(
+                    torch.sqrt(
+                        sampled_command_squared_error[slot]
+                        / sampled_command_count[slot].clamp_min(1.0)
+                    ).cpu()
+                )
+                if sampled_command_count[slot].item() > 0
+                else math.nan
+            )
+            result[f"{prefix}/motion_rmse_6d"] = (
+                float(
+                    torch.sqrt(
+                        sampled_motion_squared_error[slot]
+                        / sampled_motion_count[slot].clamp_min(1.0)
+                    ).cpu()
+                )
+                if sampled_motion_count[slot].item() > 0
+                else math.nan
+            )
+            result[f"{prefix}/gripper_rmse"] = (
+                float(
+                    torch.sqrt(
+                        sampled_gripper_squared_error[slot]
+                        / sampled_gripper_count[slot].clamp_min(1.0)
+                    ).cpu()
+                )
+                if sampled_gripper_count[slot].item() > 0
+                else math.nan
+            )
+            result[f"{prefix}/valid_commands"] = float(
+                sampled_gripper_count[slot].cpu()
+            )
+
+        total_sign_correct = sampled_dimension_classification[:, 0].sum()
+        total_saturated = sampled_dimension_classification[:, 1].sum()
+        total_dimensions = sampled_dimension_classification[:, 2].sum()
+        for dimension, name in enumerate(LIBERO_RAW_ACTION_NAMES):
+            stats = sampled_dimension_stats[dimension]
+            count = stats[5]
+            correlation = math.nan
+            if count.item() >= 2:
+                covariance = stats[4] - stats[0] * stats[1] / count
+                predicted_variance = stats[2] - stats[0].square() / count
+                target_variance = stats[3] - stats[1].square() / count
+                denominator = torch.sqrt(
+                    predicted_variance.clamp_min(0.0)
+                    * target_variance.clamp_min(0.0)
+                )
+                if denominator.item() > 1e-12:
+                    correlation = float((covariance / denominator).cpu())
+            result[
+                f"val/sampled_command/per_dimension_correlation/{name}"
+            ] = correlation
+            classification = sampled_dimension_classification[dimension]
+            result[
+                f"val/sampled_command/per_dimension_sign_agreement/{name}"
+            ] = (
+                float((classification[0] / classification[2]).cpu())
+                if classification[2].item() > 0
+                else math.nan
+            )
+            result[
+                f"val/sampled_command/per_dimension_saturation_fraction/{name}"
+            ] = (
+                float((classification[1] / classification[2]).cpu())
+                if classification[2].item() > 0
+                else math.nan
+            )
+        result["val/sampled_command/overall_sign_agreement"] = (
+            float((total_sign_correct / total_dimensions).cpu())
+            if total_dimensions.item() > 0
+            else math.nan
+        )
+        result["val/sampled_command/overall_saturation_fraction"] = (
+            float((total_saturated / total_dimensions).cpu())
+            if total_dimensions.item() > 0
+            else math.nan
+        )
+
+        tp, fp, fn, tn = sampled_gripper_confusion
+        gripper_total = sampled_gripper_confusion.sum()
+        precision_denominator = tp + fp
+        recall_denominator = tp + fn
+        precision = (
+            tp / precision_denominator
+            if precision_denominator.item() > 0
+            else tp.new_zeros(())
+        )
+        recall = (
+            tp / recall_denominator
+            if recall_denominator.item() > 0
+            else tp.new_zeros(())
+        )
+        f1_denominator = precision + recall
+        f1 = (
+            2.0 * precision * recall / f1_denominator
+            if f1_denominator.item() > 0
+            else tp.new_zeros(())
+        )
+        result.update(
+            {
+                "val/sampled_command/gripper/accuracy": (
+                    float(((tp + tn) / gripper_total).cpu())
+                    if gripper_total.item() > 0
+                    else math.nan
+                ),
+                "val/sampled_command/gripper/precision": float(precision.cpu()),
+                "val/sampled_command/gripper/recall": float(recall.cpu()),
+                "val/sampled_command/gripper/f1": float(f1.cpu()),
+                "val/sampled_command/gripper/tp": float(tp.cpu()),
+                "val/sampled_command/gripper/fp": float(fp.cpu()),
+                "val/sampled_command/gripper/fn": float(fn.cpu()),
+                "val/sampled_command/gripper/tn": float(tn.cpu()),
+                "val/sampled_command/sampled_trajectories": float(
+                    sample_valid_count.cpu()
+                ),
+            }
+        )
+
+        for phase_index, phase_name in enumerate(
+            ("approach_open", "close_hold", "release_open")
+        ):
+            correct, count, samples = sampled_gripper_phase[phase_index]
+            phase_prefix = f"val/sampled_command/gripper_phase/{phase_name}"
+            result[f"{phase_prefix}/accuracy"] = (
+                float((correct / count).cpu())
+                if count.item() > 0
+                else math.nan
+            )
+            result[f"{phase_prefix}/commands"] = float(count.cpu())
+            result[f"{phase_prefix}/samples"] = float(samples.cpu())
+
+        opportunities, detected, missed, signed_sum, absolute_sum = (
+            sampled_release_transition
+        )
+        transition_prefix = (
+            "val/sampled_command/gripper_phase/release_transition_timing"
+        )
+        result[f"{transition_prefix}/opportunities"] = float(
+            opportunities.cpu()
+        )
+        result[f"{transition_prefix}/detected"] = float(detected.cpu())
+        result[f"{transition_prefix}/missed"] = float(missed.cpu())
+        result[f"{transition_prefix}/mean_signed_error_steps"] = (
+            float((signed_sum / detected).cpu())
+            if detected.item() > 0
+            else math.nan
+        )
+        result[f"{transition_prefix}/mae_steps"] = (
+            float((absolute_sum / detected).cpu())
+            if detected.item() > 0
             else math.nan
         )
     for suite_index, suite_id in enumerate(LIBERO_SUITE_IDS):
@@ -737,11 +1214,6 @@ def validate(
         result[f"{prefix}/loss_gripper"] = float(
             (stats[7] / stats[8].clamp_min(1.0)).cpu()
         )
-        result[f"{prefix}/sample_mse"] = (
-            float((stats[9] / stats[10].clamp_min(1.0)).cpu())
-            if stats[10].item() > 0
-            else math.nan
-        )
     return result
 
 
@@ -753,6 +1225,11 @@ def train(
     online_siglip_fallback_model_id: str | None = "google/siglip-so400m-patch14-384",
     base_artifact: str | Path | None = None,
     init_artifact: str | Path | None = None,
+    horizon_loss_weights: list[float] | None = None,
+    mask_noisy_gripper_input: bool | None = None,
+    gripper_bce_weight: float = 0.0,
+    gripper_bce_logit_scale: float = 1.0,
+    rotation_geodesic_weight: float = 0.0,
 ) -> None:
     seed_everything(cfg.seed)
     output_dir = Path(cfg.output_dir)
@@ -801,6 +1278,13 @@ def train(
                 "wandb": {"name": cfg.training.wandb_run_name}
             }
         tracker_config = asdict(cfg)
+        tracker_config["training_objective"] = {
+            "horizon_loss_weights": horizon_loss_weights,
+            "mask_noisy_gripper_input": mask_noisy_gripper_input,
+            "gripper_bce_weight": float(gripper_bce_weight),
+            "gripper_bce_logit_scale": float(gripper_bce_logit_scale),
+            "rotation_geodesic_weight": float(rotation_geodesic_weight),
+        }
         if report_to.lower() == "tensorboard":
             tracker_config = _tensorboard_hparams(tracker_config)
         accelerator.init_trackers(
@@ -810,6 +1294,22 @@ def train(
         )
 
     use_online_siglip = online_siglip_model_id is not None
+    if horizon_loss_weights is not None:
+        if len(horizon_loss_weights) != cfg.model.pred_horizon:
+            raise ValueError(
+                "horizon_loss_weights must match pred_horizon: "
+                f"{len(horizon_loss_weights)} vs {cfg.model.pred_horizon}"
+            )
+        if any(not math.isfinite(weight) or weight < 0 for weight in horizon_loss_weights):
+            raise ValueError("horizon_loss_weights must be finite and non-negative")
+    for name, value, strictly_positive in (
+        ("gripper_bce_weight", gripper_bce_weight, False),
+        ("gripper_bce_logit_scale", gripper_bce_logit_scale, True),
+        ("rotation_geodesic_weight", rotation_geodesic_weight, False),
+    ):
+        if not math.isfinite(value) or (value <= 0 if strictly_positive else value < 0):
+            qualifier = "positive" if strictly_positive else "non-negative"
+            raise ValueError(f"{name} must be finite and {qualifier}")
     train_loader = create_dataloader(
         cfg.data.train_manifest,
         cfg,
@@ -830,6 +1330,16 @@ def train(
     )
     if init_artifact is not None:
         load_trainable_artifact(model, init_artifact, trainable=True)
+    if mask_noisy_gripper_input is not None:
+        model.mask_noisy_gripper_input = bool(mask_noisy_gripper_input)
+    resolved_mask_noisy_gripper_input = bool(model.mask_noisy_gripper_input)
+    training_objective = {
+        "horizon_loss_weights": horizon_loss_weights,
+        "mask_noisy_gripper_input": resolved_mask_noisy_gripper_input,
+        "gripper_bce_weight": float(gripper_bce_weight),
+        "gripper_bce_logit_scale": float(gripper_bce_logit_scale),
+        "rotation_geodesic_weight": float(rotation_geodesic_weight),
+    }
     online_siglip = None
     if use_online_siglip:
         online_siglip = load_online_siglip(
@@ -887,6 +1397,9 @@ def train(
 
     global_step = 0
     running_loss = 0.0
+    running_imitation_loss = 0.0
+    running_gripper_bce_loss = 0.0
+    running_rotation_geodesic_loss = 0.0
     running_mae = 0.0
     running_xyz_loss = 0.0
     running_rot_loss = 0.0
@@ -894,6 +1407,9 @@ def train(
     running_step_time = 0.0
     running_steps = 0
     pending_loss = 0.0
+    pending_imitation_loss = 0.0
+    pending_gripper_bce_loss = 0.0
+    pending_rotation_geodesic_loss = 0.0
     pending_mae = 0.0
     pending_xyz_loss_sum = 0.0
     pending_xyz_valid_count = 0.0
@@ -919,6 +1435,13 @@ def train(
                     cfg=cfg,
                     device=accelerator.device,
                 )
+            attach_training_objective(
+                batch,
+                horizon_loss_weights=horizon_loss_weights,
+                gripper_bce_weight=gripper_bce_weight,
+                gripper_bce_logit_scale=gripper_bce_logit_scale,
+                rotation_geodesic_weight=rotation_geodesic_weight,
+            )
             with accelerator.accumulate(model):
                 metrics = model(batch)
                 loss = metrics["loss"]
@@ -937,6 +1460,13 @@ def train(
                 optimizer.zero_grad(set_to_none=True)
 
             pending_loss += float(loss.detach())
+            pending_imitation_loss += float(metrics["imitation_loss"].detach())
+            pending_gripper_bce_loss += float(
+                metrics["gripper_bce_loss"].detach()
+            )
+            pending_rotation_geodesic_loss += float(
+                metrics["rotation_geodesic_loss"].detach()
+            )
             pending_mae += float(metrics["train_target_mae"].detach())
             pending_xyz_loss_sum += float(metrics["xyz_loss_sum"].detach())
             pending_xyz_valid_count += float(metrics["xyz_valid_count"].detach())
@@ -953,6 +1483,9 @@ def train(
                 continue
             if not optimizer_update_succeeded:
                 pending_loss = 0.0
+                pending_imitation_loss = 0.0
+                pending_gripper_bce_loss = 0.0
+                pending_rotation_geodesic_loss = 0.0
                 pending_mae = 0.0
                 pending_xyz_loss_sum = 0.0
                 pending_xyz_valid_count = 0.0
@@ -977,6 +1510,10 @@ def train(
             step_metrics = torch.tensor(
                 [
                     pending_loss / max(pending_microbatches, 1),
+                    pending_imitation_loss / max(pending_microbatches, 1),
+                    pending_gripper_bce_loss / max(pending_microbatches, 1),
+                    pending_rotation_geodesic_loss
+                    / max(pending_microbatches, 1),
                     pending_mae / max(pending_microbatches, 1),
                     pending_xyz_loss_sum / max(pending_xyz_valid_count, 1.0),
                     pending_rot_loss_sum / max(pending_rot_valid_count, 1.0),
@@ -988,13 +1525,19 @@ def train(
             )
             step_metrics = accelerator.reduce(step_metrics, reduction="mean")
             running_loss += float(step_metrics[0].cpu())
-            running_mae += float(step_metrics[1].cpu())
-            running_xyz_loss += float(step_metrics[2].cpu())
-            running_rot_loss += float(step_metrics[3].cpu())
-            running_gripper_loss += float(step_metrics[4].cpu())
+            running_imitation_loss += float(step_metrics[1].cpu())
+            running_gripper_bce_loss += float(step_metrics[2].cpu())
+            running_rotation_geodesic_loss += float(step_metrics[3].cpu())
+            running_mae += float(step_metrics[4].cpu())
+            running_xyz_loss += float(step_metrics[5].cpu())
+            running_rot_loss += float(step_metrics[6].cpu())
+            running_gripper_loss += float(step_metrics[7].cpu())
             running_step_time += step_time
             running_steps += 1
             pending_loss = 0.0
+            pending_imitation_loss = 0.0
+            pending_gripper_bce_loss = 0.0
+            pending_rotation_geodesic_loss = 0.0
             pending_mae = 0.0
             pending_xyz_loss_sum = 0.0
             pending_xyz_valid_count = 0.0
@@ -1009,7 +1552,15 @@ def train(
                 average_step_time = running_step_time / max(running_steps, 1)
                 training_log_data = {
                     "train/loss": running_loss / max(running_steps, 1),
-                    "train/imitation_loss": running_loss / max(running_steps, 1),
+                    "train/imitation_loss": (
+                        running_imitation_loss / max(running_steps, 1)
+                    ),
+                    "train/gripper_bce_loss": (
+                        running_gripper_bce_loss / max(running_steps, 1)
+                    ),
+                    "train/rotation_geodesic_loss": (
+                        running_rotation_geodesic_loss / max(running_steps, 1)
+                    ),
                     "train/loss_xyz": running_xyz_loss / max(running_steps, 1),
                     "train/loss_rot": running_rot_loss / max(running_steps, 1),
                     "train/loss_gripper": running_gripper_loss
@@ -1029,6 +1580,9 @@ def train(
                 if accelerator.is_main_process:
                     print(training_log_data)
                 running_loss = 0.0
+                running_imitation_loss = 0.0
+                running_gripper_bce_loss = 0.0
+                running_rotation_geodesic_loss = 0.0
                 running_mae = 0.0
                 running_xyz_loss = 0.0
                 running_rot_loss = 0.0
@@ -1046,6 +1600,10 @@ def train(
                     accelerator,
                     cfg,
                     online_siglip=online_siglip,
+                    horizon_loss_weights=horizon_loss_weights,
+                    gripper_bce_weight=gripper_bce_weight,
+                    gripper_bce_logit_scale=gripper_bce_logit_scale,
+                    rotation_geodesic_weight=rotation_geodesic_weight,
                 )
                 step_log_data.update(validation)
                 if accelerator.is_main_process:
@@ -1081,6 +1639,11 @@ def train(
                             "effective_global_batch": effective_global_batch,
                             "pretrained_model": cfg.pretrained_model,
                             "model_report": model_report,
+                            "horizon_loss_weights": horizon_loss_weights,
+                            "mask_noisy_gripper_input": (
+                                resolved_mask_noisy_gripper_input
+                            ),
+                            "training_objective": training_objective,
                             "config": asdict(cfg),
                         },
                         model_state_dict=state_dict,
@@ -1112,6 +1675,9 @@ def train(
                 "effective_global_batch": effective_global_batch,
                 "pretrained_model": cfg.pretrained_model,
                 "model_report": model_report,
+                "horizon_loss_weights": horizon_loss_weights,
+                "mask_noisy_gripper_input": resolved_mask_noisy_gripper_input,
+                "training_objective": training_objective,
                 "config": asdict(cfg),
             },
             model_state_dict=state_dict,

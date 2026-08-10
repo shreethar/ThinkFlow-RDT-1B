@@ -247,6 +247,14 @@ def load_trainable_artifact(model, artifact_dir: str | Path, trainable: bool) ->
         raise ValueError(f"Unsupported RDT artifact format: {artifact_format!r}")
 
     _load_interfaces(model, interfaces, trainable=trainable)
+    metadata_path = artifact / METADATA_FILE
+    if metadata_path.exists():
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        if "mask_noisy_gripper_input" in metadata:
+            model.mask_noisy_gripper_input = bool(
+                metadata["mask_noisy_gripper_input"]
+            )
 
 
 def load_lora_rdt_core(model, artifact_dir: str | Path, *, trainable: bool) -> None:
@@ -277,7 +285,13 @@ def load_lora_rdt_core(model, artifact_dir: str | Path, *, trainable: bool) -> N
             parameter.requires_grad = trainable
 
 
-def load_full_rdt_base(model, artifact_dir: str | Path, *, strict: bool = True) -> None:
+def load_full_rdt_base(
+    model,
+    artifact_dir: str | Path,
+    *,
+    strict: bool = True,
+    allow_output_head_mismatch: bool = False,
+) -> dict[str, Any]:
     """Load a merged/full RDT core before wrapping the core with fresh LoRA.
 
     Use this for two-stage fine-tuning: first merge an earlier LoRA run into the
@@ -296,4 +310,61 @@ def load_full_rdt_base(model, artifact_dir: str | Path, *, strict: bool = True) 
         map_location="cpu",
         weights_only=True,
     )
-    model.runner.model.load_state_dict(state_dict, strict=strict)
+    target_state = model.runner.model.state_dict()
+    shape_mismatches = {
+        name: (tuple(tensor.shape), tuple(target_state[name].shape))
+        for name, tensor in state_dict.items()
+        if name in target_state and tensor.shape != target_state[name].shape
+    }
+    if not shape_mismatches:
+        model.runner.model.load_state_dict(state_dict, strict=strict)
+        return {
+            "loaded_tensors": len(state_dict),
+            "reinitialized_tensors": [],
+            "shape_mismatches": {},
+        }
+
+    output_head_keys = {
+        "final_layer.ffn_final.fc2.weight",
+        "final_layer.ffn_final.fc2.bias",
+    }
+    if not allow_output_head_mismatch or set(shape_mismatches) != output_head_keys:
+        # Preserve PyTorch's detailed size-mismatch error for any unsupported
+        # architecture difference.
+        model.runner.model.load_state_dict(state_dict, strict=strict)
+        raise AssertionError("unreachable")
+
+    source_weight = state_dict["final_layer.ffn_final.fc2.weight"]
+    target_weight = target_state["final_layer.ffn_final.fc2.weight"]
+    source_bias = state_dict["final_layer.ffn_final.fc2.bias"]
+    target_bias = target_state["final_layer.ffn_final.fc2.bias"]
+    valid_action_width_change = (
+        source_weight.ndim == target_weight.ndim == 2
+        and source_weight.shape[1] == target_weight.shape[1]
+        and source_bias.ndim == target_bias.ndim == 1
+        and source_weight.shape[0] == source_bias.shape[0]
+        and target_weight.shape[0] == target_bias.shape[0]
+    )
+    if not valid_action_width_change:
+        model.runner.model.load_state_dict(state_dict, strict=strict)
+        raise AssertionError("unreachable")
+
+    compatible_state = {
+        name: tensor
+        for name, tensor in state_dict.items()
+        if name not in output_head_keys
+    }
+    missing, unexpected = model.runner.model.load_state_dict(
+        compatible_state,
+        strict=False,
+    )
+    if set(missing) != output_head_keys or unexpected:
+        raise RuntimeError(
+            "Full RDT base differs outside the permitted action-output head: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    return {
+        "loaded_tensors": len(compatible_state),
+        "reinitialized_tensors": sorted(output_head_keys),
+        "shape_mismatches": shape_mismatches,
+    }

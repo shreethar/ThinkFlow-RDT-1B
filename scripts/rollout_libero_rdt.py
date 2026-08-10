@@ -283,6 +283,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark", choices=LIBERO_BENCHMARK_CHOICES, default=LIBERO_DEFAULT_BENCHMARK)
     parser.add_argument("--checkpoint", type=Path, default=Path("outputs/libero_spatial_full/checkpoint-1600"))
     parser.add_argument(
+        "--base-artifact",
+        type=Path,
+        default=None,
+        help="Optional merged/full RDT base loaded before the trainable artifact.",
+    )
+    parser.add_argument(
         "--pretrained-only",
         action="store_true",
         help=(
@@ -341,6 +347,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--libero-root", type=Path, default=LIBERO_ROOT_DEFAULT)
     parser.add_argument("--task-id", type=int, default=0, choices=range(10))
+    parser.add_argument(
+        "--instruction",
+        default=None,
+        help="Override the benchmark task language while keeping the same environment.",
+    )
     parser.add_argument("--init-state-index", type=int, default=0)
     parser.add_argument(
         "--demo-hdf5",
@@ -359,6 +370,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--qwen-refresh-every", type=int, default=1)
+    parser.add_argument(
+        "--clean-x0-gripper",
+        action="store_true",
+        help=(
+            "Use dimension 9 from the final clean-x0 model prediction for the "
+            "LIBERO gripper while retaining DPM-Solver output for motion."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument(
@@ -397,6 +416,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Write per-replan model outputs and final LIBERO actions to this JSONL file."
+        ),
+    )
+    parser.add_argument(
+        "--observation-debug-npz",
+        type=Path,
+        help=(
+            "Save synchronized policy agent-view/wrist frames and observed "
+            "11D states for notebook diagnostics."
         ),
     )
     return parser.parse_args()
@@ -457,7 +484,7 @@ def main() -> None:
 
     benchmark = get_benchmark(args.benchmark)(0)
     task = benchmark.get_task(args.task_id)
-    instruction = task.language
+    instruction = args.instruction or task.language
     use_qwen = cfg.model.qwen_fusion != "none"
     print("Loading T5, SigLIP, and optional Qwen encoders...")
     t5_tokenizer, t5 = load_t5_encoder(
@@ -497,9 +524,20 @@ def main() -> None:
         print(f"Loading pretrained RDT baseline {cfg.pretrained_model}...")
     else:
         print(f"Loading RDT artifact {args.checkpoint}...")
-    model = SFTConditionedRDT(cfg, load_pretrained=True)
+    model = SFTConditionedRDT(
+        cfg,
+        load_pretrained=True,
+        base_artifact=(
+            None if args.base_artifact is None else str(args.base_artifact)
+        ),
+    )
     if not args.pretrained_only:
         load_trainable_artifact(model, args.checkpoint, trainable=False)
+    model.decode_clean_x0_gripper = bool(args.clean_x0_gripper)
+    print(
+        "Gripper decoding:",
+        "final clean x0" if model.decode_clean_x0_gripper else "diffusion solver",
+    )
     model.to(device).eval()
 
     env = OffScreenRenderEnv(
@@ -543,6 +581,14 @@ def main() -> None:
     plan_index = 0
     start = time.perf_counter()
     action_debug_handle = None
+    initial_converted = libero_observation_to_rdt(observation)
+    debug_states = [initial_converted["state"].copy()]
+    debug_agent_frames = [np.asarray(initial_converted["primary"]).copy()]
+    debug_wrist_frames = (
+        []
+        if initial_converted["wrist"] is None
+        else [np.asarray(initial_converted["wrist"]).copy()]
+    )
     if args.action_debug_jsonl is not None:
         args.action_debug_jsonl.parent.mkdir(parents=True, exist_ok=True)
         action_debug_handle = args.action_debug_jsonl.open("w", encoding="utf-8")
@@ -680,6 +726,9 @@ def main() -> None:
                         "gripper": "dim 9 copied unchanged apart from [-1,1] clipping",
                     }
             executed_actions: list[np.ndarray] = []
+            observed_states = [
+                libero_observation_to_rdt(observation)["state"].copy()
+            ]
             for action_index in range(chunk):
                 if args.action_output_mode == "absolute_target_state":
                     target_index = min(action_index + args.target_state_start_index, len(model_output) - 1)
@@ -699,6 +748,16 @@ def main() -> None:
                 # the feature-precomputation contract even when actions are chunked.
                 previous_observation = observation
                 observation, reward, done, _ = env.step(action)
+                converted_observation = libero_observation_to_rdt(observation)
+                observed_states.append(converted_observation["state"].copy())
+                debug_states.append(converted_observation["state"].copy())
+                debug_agent_frames.append(
+                    np.asarray(converted_observation["primary"]).copy()
+                )
+                if converted_observation["wrist"] is not None:
+                    debug_wrist_frames.append(
+                        np.asarray(converted_observation["wrist"]).copy()
+                    )
                 simulator_step += 1
                 success = bool(done) or bool(env.check_success())
                 label = f"task={args.task_id} step={simulator_step} plan={plan_index} success={int(success)}"
@@ -712,6 +771,9 @@ def main() -> None:
                     break
             if action_debug_handle is not None and debug_row is not None:
                 debug_row["executed_libero_actions"] = array_to_nested_float_list(np.stack(executed_actions, axis=0))
+                debug_row["observed_rdt_states"] = array_to_nested_float_list(
+                    np.stack(observed_states, axis=0)
+                )
                 action_debug_handle.write(json.dumps(debug_row) + "\n")
                 action_debug_handle.flush()
             plan_index += 1
@@ -723,6 +785,18 @@ def main() -> None:
     finally:
         if action_debug_handle is not None:
             action_debug_handle.close()
+        if args.observation_debug_npz is not None:
+            args.observation_debug_npz.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                args.observation_debug_npz,
+                states=np.stack(debug_states),
+                agent_frames=np.stack(debug_agent_frames),
+                wrist_frames=(
+                    np.stack(debug_wrist_frames)
+                    if debug_wrist_frames
+                    else np.empty((0, 0, 0, 3), dtype=np.uint8)
+                ),
+            )
         writer.close()
         env.close()
 

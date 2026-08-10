@@ -419,6 +419,15 @@ class SFTConditionedRDT(nn.Module):
         self.compute_dtype = dtype
         self.horizon = cfg.model.pred_horizon
         self.rdt_state_dim = cfg.model.resolved_rdt_state_dim
+        # Discrete gripper commands can otherwise leak their clean sign through
+        # low-noise diffusion inputs.  Experiments may mask that input channel
+        # without changing the model architecture or its 10D output contract.
+        self.mask_noisy_gripper_input = False
+        # Inference-only option: retain the scheduler result for continuous
+        # motion, but take the gripper scalar from the final clean-x0 estimate.
+        # This is separate from input masking so older checkpoints can opt into
+        # clean-x0 decoding without changing their denoising input distribution.
+        self.decode_clean_x0_gripper = False
         self.use_native_state_encoder = (
             cfg.model.state_encoder_layout in {"rdt_eef", "libero_ortho6d"}
         )
@@ -480,6 +489,7 @@ class SFTConditionedRDT(nn.Module):
                 out_features=cfg.model.hidden_size,
             ).to(dtype=dtype)
         self.pretrained_report: dict[str, int] | None = None
+        self.base_artifact_report: dict[str, Any] | None = None
 
         if load_pretrained and cfg.pretrained_model:
             source = RDTRunner.from_pretrained(cfg.pretrained_model)
@@ -510,7 +520,11 @@ class SFTConditionedRDT(nn.Module):
             gradient_checkpointing=cfg.model.gradient_checkpointing,
         )
         if base_artifact is not None:
-            load_full_rdt_base(self, base_artifact)
+            self.base_artifact_report = load_full_rdt_base(
+                self,
+                base_artifact,
+                allow_output_head_mismatch=True,
+            )
         if cfg.model.finetune_mode == "lora":
             self.runner.model, self.lora_targets = apply_lora(
                 self.runner.model, cfg.lora
@@ -581,6 +595,7 @@ class SFTConditionedRDT(nn.Module):
             ),
             "lora_target_count": len(self.lora_targets),
             "pretrained": self.pretrained_report,
+            "base_artifact": self.base_artifact_report,
         }
 
     def cast_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -593,6 +608,12 @@ class SFTConditionedRDT(nn.Module):
             "state_dim_mask",
             "actions",
             "action_dim_mask",
+            "horizon_loss_weights",
+            "gripper_loss_weights",
+            "gripper_bce_weight",
+            "gripper_bce_logit_scale",
+            "rotation_geodesic_weight",
+            "diffusion_noise",
             "ctrl_freq",
         }
         return {
@@ -619,6 +640,37 @@ class SFTConditionedRDT(nn.Module):
             dim=-1,
         )
         return torch.cat([first_column, second_column], dim=-1)
+
+    @staticmethod
+    def _ortho6d_to_rotation_matrix(ortho6d: torch.Tensor) -> torch.Tensor:
+        """Differentiably project first-two-column 6D values onto SO(3)."""
+        if ortho6d.shape[-1] != 6:
+            raise ValueError(f"Expected ortho6D [...,6], got {tuple(ortho6d.shape)}")
+        values = ortho6d.float()
+        first_raw = values[..., :3]
+        default_first = torch.zeros_like(first_raw)
+        default_first[..., 0] = 1.0
+        first = torch.where(
+            first_raw.norm(dim=-1, keepdim=True) > 1e-6,
+            first_raw,
+            default_first,
+        )
+        first = F.normalize(first, dim=-1, eps=1e-6)
+
+        second_raw = values[..., 3:6]
+        second = second_raw - (first * second_raw).sum(dim=-1, keepdim=True) * first
+        fallback_index = first.abs().argmin(dim=-1)
+        fallback = F.one_hot(fallback_index, num_classes=3).to(first.dtype)
+        fallback = fallback - (first * fallback).sum(dim=-1, keepdim=True) * first
+        fallback = F.normalize(fallback, dim=-1, eps=1e-6)
+        second = torch.where(
+            second.norm(dim=-1, keepdim=True) > 1e-6,
+            second,
+            fallback,
+        )
+        second = F.normalize(second, dim=-1, eps=1e-6)
+        third = torch.cross(first, second, dim=-1)
+        return torch.stack([first, second, third], dim=-1)
 
     def _state_encoder_input(
         self,
@@ -797,27 +849,64 @@ class SFTConditionedRDT(nn.Module):
         ).to(states.dtype).unsqueeze(1)
 
         batch_size = actions.shape[0]
-        noise = torch.randn_like(actions)
-        timesteps = torch.randint(
-            0,
-            self.runner.num_train_timesteps,
-            (batch_size,),
-            device=actions.device,
-            dtype=torch.long,
-        )
+        noise = batch.get("diffusion_noise")
+        if noise is None:
+            noise = torch.randn_like(actions)
+        elif noise.shape != actions.shape:
+            raise ValueError(
+                "diffusion_noise must match actions, got "
+                f"{tuple(noise.shape)} vs {tuple(actions.shape)}"
+            )
+        timesteps = batch.get("diffusion_timesteps")
+        if timesteps is None:
+            timesteps = torch.randint(
+                0,
+                self.runner.num_train_timesteps,
+                (batch_size,),
+                device=actions.device,
+                dtype=torch.long,
+            )
+        else:
+            timesteps = timesteps.to(device=actions.device, dtype=torch.long)
+            if timesteps.shape != (batch_size,):
+                raise ValueError(
+                    "diffusion_timesteps must have shape [B], got "
+                    f"{tuple(timesteps.shape)}"
+                )
+            if bool((timesteps < 0).any()) or bool(
+                (timesteps >= self.runner.num_train_timesteps).any()
+            ):
+                raise ValueError("diffusion_timesteps are outside the scheduler range")
         noisy_actions = self.runner.noise_scheduler.add_noise(
             actions, noise, timesteps
         )
 
-        action_token_mask = (
-            action_dim_mask.expand(-1, actions.shape[1], -1)
-            * time_mask.unsqueeze(-1).to(actions.dtype)
+        if self.cfg.model.action_encoder_layout == "libero_ortho6d":
+            gripper_input_index = 9
+        else:
+            gripper_input_index = 6
+
+        # The action adaptor must see the same 64 valid temporal positions in
+        # training that it sees during sampling.  Passing `time_mask` here
+        # exposes the padded episode suffix and lets the model infer release
+        # timing from the distance to the end of a demonstration.  Keep the
+        # temporal mask exclusively for supervised losses below.
+        action_conditioning_mask = action_dim_mask.expand(
+            -1,
+            actions.shape[1],
+            -1,
         )
-        # Padded future positions must not inject random noise into valid tokens.
-        noisy_actions = noisy_actions * action_token_mask
+        noisy_actions = noisy_actions * action_conditioning_mask
+        model_noisy_actions = noisy_actions
+        if self.mask_noisy_gripper_input:
+            model_noisy_actions = noisy_actions.clone()
+            model_noisy_actions[..., gripper_input_index] = 0.0
         state_input = self._state_encoder_input(states, state_dim_mask)
         state_cond = self.runner.state_adaptor(state_input)
-        action_cond = self._adapt_actions(noisy_actions, action_token_mask)
+        action_cond = self._adapt_actions(
+            model_noisy_actions,
+            action_conditioning_mask,
+        )
         state_action_cond = torch.cat([state_cond, action_cond], dim=1)
 
         (
@@ -854,6 +943,12 @@ class SFTConditionedRDT(nn.Module):
                 f"Got {self.runner.prediction_type!r}."
             )
         target = actions
+        if self.cfg.model.action_encoder_layout == "libero_ortho6d":
+            rotation_stop = 9
+            gripper_start, gripper_stop = 9, 10
+        else:
+            rotation_stop = 6
+            gripper_start, gripper_stop = 6, 7
 
         valid = time_mask.unsqueeze(-1).to(prediction.dtype) * action_dim_mask
         sample_valid_count = valid.sum(dim=(1, 2))
@@ -873,9 +968,68 @@ class SFTConditionedRDT(nn.Module):
                 ],
                 dim=-1,
             )
-        sample_imitation_loss = (
+        sample_unweighted_imitation_loss = (
             (diff.pow(2) * valid).sum(dim=(1, 2))
             / sample_denominator
+        )
+        horizon_loss_weights = batch.get("horizon_loss_weights")
+        if horizon_loss_weights is None:
+            objective_valid = valid
+        else:
+            weights = horizon_loss_weights.to(
+                device=prediction.device,
+                dtype=prediction.dtype,
+            )
+            if weights.ndim == 1:
+                weights = weights.unsqueeze(0)
+            if weights.ndim != 2 or weights.shape[-1] != actions.shape[1]:
+                raise ValueError(
+                    "horizon_loss_weights must be [H] or [B,H], got "
+                    f"{tuple(weights.shape)} for horizon {actions.shape[1]}"
+                )
+            if weights.shape[0] not in {1, actions.shape[0]}:
+                raise ValueError(
+                    "horizon_loss_weights batch width must be 1 or match the "
+                    f"action batch, got {weights.shape[0]} vs {actions.shape[0]}"
+                )
+            if not bool(torch.isfinite(weights).all()) or bool((weights < 0).any()):
+                raise ValueError("horizon_loss_weights must be finite and non-negative")
+            objective_valid = valid * weights.unsqueeze(-1)
+        # Horizon weighting keeps its historical weighted-mean normalization.
+        # Additional phase weights below intentionally do not enter this
+        # denominator; otherwise a release-only sample multiplied by 5 would
+        # also be divided by 5 and receive no extra gradient at all.
+        objective_count = objective_valid.sum(dim=(1, 2))
+        base_gripper_bce_valid = objective_valid[..., gripper_start].clone()
+        gripper_loss_weights = batch.get("gripper_loss_weights")
+        if gripper_loss_weights is not None:
+            gripper_weights = gripper_loss_weights.to(
+                device=prediction.device,
+                dtype=prediction.dtype,
+            )
+            if gripper_weights.ndim == 1:
+                gripper_weights = gripper_weights.unsqueeze(0)
+            if gripper_weights.ndim != 2 or gripper_weights.shape[-1] != actions.shape[1]:
+                raise ValueError(
+                    "gripper_loss_weights must be [H] or [B,H], got "
+                    f"{tuple(gripper_weights.shape)} for horizon {actions.shape[1]}"
+                )
+            if gripper_weights.shape[0] not in {1, actions.shape[0]}:
+                raise ValueError(
+                    "gripper_loss_weights batch width must be 1 or match the "
+                    f"action batch, got {gripper_weights.shape[0]} vs {actions.shape[0]}"
+                )
+            if not bool(torch.isfinite(gripper_weights).all()) or bool(
+                (gripper_weights < 0).any()
+            ):
+                raise ValueError("gripper_loss_weights must be finite and non-negative")
+            objective_valid = objective_valid.clone()
+            objective_valid[..., gripper_start:gripper_stop] *= (
+                gripper_weights.unsqueeze(-1)
+            )
+        sample_imitation_loss = (
+            (diff.pow(2) * objective_valid).sum(dim=(1, 2))
+            / objective_count.clamp_min(1.0)
         )
         sample_mae = (
             (diff.abs() * valid).sum(dim=(1, 2))
@@ -897,12 +1051,6 @@ class SFTConditionedRDT(nn.Module):
             return component_loss, component_is_valid
 
         sample_xyz_loss, sample_xyz_valid = component_losses(0, 3)
-        if self.cfg.model.action_encoder_layout == "libero_ortho6d":
-            rotation_stop = 9
-            gripper_start, gripper_stop = 9, 10
-        else:
-            rotation_stop = 6
-            gripper_start, gripper_stop = 6, 7
         sample_rot_loss, sample_rot_valid = component_losses(3, rotation_stop)
         sample_gripper_loss, sample_gripper_valid = component_losses(
             gripper_start,
@@ -926,9 +1074,89 @@ class SFTConditionedRDT(nn.Module):
         mae_sum = (sample_mae * sample_is_valid).sum()
         valid_count = sample_is_valid.sum()
         imitation_loss = loss_sum / valid_count.clamp_min(1.0)
-        return {
-            "loss": imitation_loss,
+
+        # prediction_type="sample" means the RDT predicts the clean x0 action
+        # chunk at each denoising call. Apply sign classification directly to
+        # its existing gripper scalar; this adds no parameters or output head.
+        gripper_logits = prediction[..., gripper_start]
+        gripper_labels = (target[..., gripper_start] >= 0).to(gripper_logits.dtype)
+        logit_scale = batch.get("gripper_bce_logit_scale")
+        if logit_scale is None:
+            logit_scale = prediction.new_tensor(1.0)
+        if logit_scale.numel() != 1 or not bool(torch.isfinite(logit_scale).all()) or bool(
+            (logit_scale <= 0).any()
+        ):
+            raise ValueError("gripper_bce_logit_scale must be one finite positive scalar")
+        gripper_bce_elements = F.binary_cross_entropy_with_logits(
+            gripper_logits.float() * logit_scale.float(),
+            gripper_labels.float(),
+            reduction="none",
+        ).to(prediction.dtype)
+        gripper_bce_valid = objective_valid[..., gripper_start]
+        sample_gripper_bce_count = base_gripper_bce_valid.sum(dim=1)
+        sample_gripper_bce_loss = (
+            (gripper_bce_elements * gripper_bce_valid).sum(dim=1)
+            / sample_gripper_bce_count.clamp_min(1.0)
+        )
+        gripper_bce_sum = (sample_gripper_bce_loss * sample_is_valid).sum()
+        gripper_bce_loss = gripper_bce_sum / valid_count.clamp_min(1.0)
+        gripper_bce_weight = batch.get("gripper_bce_weight")
+        if gripper_bce_weight is None:
+            gripper_bce_weight = prediction.new_tensor(0.0)
+        if gripper_bce_weight.numel() != 1 or not bool(
+            torch.isfinite(gripper_bce_weight).all()
+        ) or bool((gripper_bce_weight < 0).any()):
+            raise ValueError("gripper_bce_weight must be one finite non-negative scalar")
+        rotation_geodesic_weight = batch.get("rotation_geodesic_weight")
+        if rotation_geodesic_weight is None:
+            rotation_geodesic_weight = prediction.new_tensor(0.0)
+        if rotation_geodesic_weight.numel() != 1 or not bool(
+            torch.isfinite(rotation_geodesic_weight).all()
+        ) or bool((rotation_geodesic_weight < 0).any()):
+            raise ValueError(
+                "rotation_geodesic_weight must be one finite non-negative scalar"
+            )
+        if self.cfg.model.action_encoder_layout == "libero_ortho6d":
+            predicted_rotation = self._ortho6d_to_rotation_matrix(
+                prediction[..., 3:9]
+            )
+            target_rotation = self._ortho6d_to_rotation_matrix(target[..., 3:9])
+            relative_rotation = predicted_rotation.transpose(-1, -2) @ target_rotation
+            cosine = (
+                relative_rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - 1.0
+            ) * 0.5
+            # 1-cos(theta) is the stable small-angle form of an SO(3)
+            # geodesic penalty and avoids acos gradients near identity.
+            rotation_geodesic_elements = 1.0 - cosine.clamp(-1.0, 1.0)
+            rotation_objective_valid = objective_valid[..., 3:9].amin(dim=-1).float()
+            sample_rotation_geodesic_count = rotation_objective_valid.sum(dim=1)
+            sample_rotation_geodesic_loss = (
+                (rotation_geodesic_elements * rotation_objective_valid).sum(dim=1)
+                / sample_rotation_geodesic_count.clamp_min(1.0)
+            )
+            rotation_geodesic_loss = (
+                (sample_rotation_geodesic_loss * sample_is_valid.float()).sum()
+                / valid_count.float().clamp_min(1.0)
+            )
+        else:
+            sample_rotation_geodesic_loss = prediction.new_zeros(batch_size)
+            rotation_geodesic_loss = prediction.new_tensor(0.0)
+            if bool((rotation_geodesic_weight > 0).any()):
+                raise ValueError(
+                    "rotation geodesic loss requires action_encoder_layout=libero_ortho6d"
+                )
+        total_loss = (
+            imitation_loss
+            + gripper_bce_weight * gripper_bce_loss
+            + rotation_geodesic_weight.float() * rotation_geodesic_loss
+        )
+        result = {
+            "loss": total_loss,
             "imitation_loss": imitation_loss.detach(),
+            "gripper_bce_loss": gripper_bce_loss.detach(),
+            "gripper_bce_weight": gripper_bce_weight.detach(),
+            "rotation_geodesic_loss": rotation_geodesic_loss.detach(),
+            "rotation_geodesic_weight": rotation_geodesic_weight.detach(),
             "train_target_mae": (
                 mae_sum / valid_count.clamp_min(1.0)
             ).detach(),
@@ -943,6 +1171,9 @@ class SFTConditionedRDT(nn.Module):
             "gripper_valid_count": gripper_valid_count.detach(),
             # Per-example values allow validation to aggregate by LIBERO suite.
             "sample_imitation_loss": sample_imitation_loss.detach(),
+            "sample_unweighted_imitation_loss": (
+                sample_unweighted_imitation_loss.detach()
+            ),
             "sample_target_mae": sample_mae.detach(),
             "sample_is_valid": sample_is_valid.detach(),
             "sample_xyz_loss": sample_xyz_loss.detach(),
@@ -951,10 +1182,16 @@ class SFTConditionedRDT(nn.Module):
             "sample_rot_valid": sample_rot_valid.detach(),
             "sample_gripper_loss": sample_gripper_loss.detach(),
             "sample_gripper_valid": sample_gripper_valid.detach(),
+            "sample_gripper_bce_loss": sample_gripper_bce_loss.detach(),
+            "sample_rotation_geodesic_loss": sample_rotation_geodesic_loss.detach(),
             # These are element-weighted MSE sums/counts for each future offset.
             "horizon_loss_sum": horizon_loss_sum.detach(),
             "horizon_valid_count": horizon_valid_count.detach(),
         }
+        if bool(batch.get("return_denoising_prediction", False)):
+            result["denoising_prediction"] = prediction.detach()
+            result["diffusion_timesteps"] = timesteps.detach()
+        return result
 
     @torch.no_grad()
     def sample_actions(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -996,9 +1233,19 @@ class SFTConditionedRDT(nn.Module):
             scheduler.set_timesteps(self.runner.num_inference_timesteps)
 
         expanded_dim_mask = action_dim_mask.expand(-1, noisy.shape[1], -1)
+        gripper_input_index = (
+            9
+            if self.cfg.model.action_encoder_layout == "libero_ortho6d"
+            else 6
+        )
+        final_clean_prediction = None
         for timestep in scheduler.timesteps:
             timestep = timestep.to(states.device)
-            action_cond = self._adapt_actions(noisy, expanded_dim_mask)
+            model_noisy = noisy
+            if self.mask_noisy_gripper_input:
+                model_noisy = noisy.clone()
+                model_noisy[..., gripper_input_index] = 0.0
+            action_cond = self._adapt_actions(model_noisy, expanded_dim_mask)
             state_action_cond = torch.cat([state_cond, action_cond], dim=1)
             model_timestep = timestep.reshape(1).expand(states.shape[0])
             output = self.runner.model(
@@ -1017,6 +1264,20 @@ class SFTConditionedRDT(nn.Module):
                     self.cfg.model.qwen_fusion == "unified_cross_attention"
                 ),
             )
+            final_clean_prediction = output
             noisy = scheduler.step(output, timestep, noisy).prev_sample
             noisy = noisy.to(states.dtype) * expanded_dim_mask
+        if self.mask_noisy_gripper_input or self.decode_clean_x0_gripper:
+            if final_clean_prediction is None:
+                raise RuntimeError("Diffusion scheduler produced no inference timesteps")
+            # With prediction_type="sample", `output` is the model's clean x0
+            # estimate.  DPM-Solver is appropriate for continuous motion, but
+            # integrating the binary gripper as a continuous trajectory can
+            # reverse an otherwise correct release sign.  Decode that existing
+            # output directly; no separate head or architecture change is used.
+            noisy = noisy.clone()
+            noisy[..., gripper_input_index] = (
+                final_clean_prediction[..., gripper_input_index]
+                * expanded_dim_mask[..., gripper_input_index]
+            )
         return noisy

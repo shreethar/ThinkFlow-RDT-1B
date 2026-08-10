@@ -290,3 +290,235 @@ def test_masked_loss_is_mean_of_per_example_losses():
     assert metrics["sample_imitation_loss"].shape == (2,)
     assert metrics["horizon_loss_sum"].shape == (model.horizon,)
     assert metrics["horizon_valid_count"].shape == (model.horizon,)
+
+
+def test_horizon_loss_weights_change_only_the_optimization_objective():
+    base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
+    model_config = replace(
+        base.model,
+        finetune_mode="full",
+        qwen_fusion="self_attention_kv",
+        rdt_state_dim=128,
+        state_encoder_layout="rdt_eef",
+        freeze_state_adaptor=True,
+        allow_random_frozen_state_adaptor=True,
+    )
+    model = SFTConditionedRDT(replace(base, model=model_config), load_pretrained=False)
+
+    def zero_prediction(self, x, *_args, **_kwargs):
+        return x.new_zeros(x.shape[0], model.horizon, 7)
+
+    model.runner.model.forward = MethodType(zero_prediction, model.runner.model)
+    actions = torch.ones(1, model.horizon, 7)
+    actions[:, 0] = 2.0
+    batch = {
+        "lang_tokens": torch.randn(1, 12, 64),
+        "lang_mask": torch.ones(1, 12, dtype=torch.bool),
+        "img_tokens": torch.randn(1, 16, 64),
+        "img_mask": torch.ones(1, 16, dtype=torch.bool),
+        "qwen_kv": torch.randn(1, 1, 64),
+        "state": torch.zeros(1, 7),
+        "actions": actions,
+        "action_time_mask": torch.ones(1, model.horizon, dtype=torch.bool),
+        "action_dim_mask": torch.ones(1, 7),
+        "horizon_loss_weights": torch.tensor([5.0] + [1.0] * (model.horizon - 1)),
+        "ctrl_freq": torch.full((1,), 10.0),
+    }
+
+    metrics = model(batch)
+    expected_unweighted = (4.0 + (model.horizon - 1)) / model.horizon
+    expected_weighted = (5.0 * 4.0 + (model.horizon - 1)) / (
+        5.0 + model.horizon - 1
+    )
+    torch.testing.assert_close(
+        metrics["sample_unweighted_imitation_loss"],
+        torch.tensor([expected_unweighted]),
+    )
+    torch.testing.assert_close(metrics["loss"], torch.tensor(expected_weighted))
+
+
+def test_auxiliary_gripper_bce_uses_existing_clean_output_without_a_head():
+    base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
+    model_config = replace(
+        base.model,
+        finetune_mode="full",
+        qwen_fusion="self_attention_kv",
+        rdt_state_dim=128,
+        state_encoder_layout="rdt_eef",
+        freeze_state_adaptor=True,
+        allow_random_frozen_state_adaptor=True,
+    )
+    model = SFTConditionedRDT(replace(base, model=model_config), load_pretrained=False)
+
+    def zero_prediction(self, x, *_args, **_kwargs):
+        return x.new_zeros(x.shape[0], model.horizon, 7)
+
+    model.runner.model.forward = MethodType(zero_prediction, model.runner.model)
+    actions = torch.zeros(1, model.horizon, 7)
+    actions[..., 6] = 1.0
+    batch = {
+        "lang_tokens": torch.randn(1, 12, 64),
+        "lang_mask": torch.ones(1, 12, dtype=torch.bool),
+        "img_tokens": torch.randn(1, 16, 64),
+        "img_mask": torch.ones(1, 16, dtype=torch.bool),
+        "qwen_kv": torch.randn(1, 1, 64),
+        "state": torch.zeros(1, 7),
+        "actions": actions,
+        "action_time_mask": torch.ones(1, model.horizon, dtype=torch.bool),
+        "action_dim_mask": torch.ones(1, 7),
+        "gripper_bce_weight": torch.tensor(2.0),
+        "gripper_bce_logit_scale": torch.tensor(5.0),
+        "ctrl_freq": torch.full((1,), 10.0),
+    }
+
+    metrics = model(batch)
+    expected_imitation = torch.tensor(1.0 / 7.0)
+    expected_bce = torch.log(torch.tensor(2.0))
+    torch.testing.assert_close(metrics["imitation_loss"], expected_imitation)
+    torch.testing.assert_close(metrics["gripper_bce_loss"], expected_bce)
+    torch.testing.assert_close(
+        metrics["loss"],
+        expected_imitation + 2.0 * expected_bce,
+    )
+
+    batch["gripper_loss_weights"] = torch.full((1, model.horizon), 5.0)
+    weighted_metrics = model(batch)
+    torch.testing.assert_close(
+        weighted_metrics["imitation_loss"],
+        torch.tensor(5.0 / 7.0),
+    )
+    torch.testing.assert_close(
+        weighted_metrics["gripper_bce_loss"],
+        5.0 * expected_bce,
+    )
+
+
+def test_noisy_gripper_mask_is_applied_in_training_and_sampling() -> None:
+    base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
+    model_config = replace(
+        base.model,
+        finetune_mode="full",
+        qwen_fusion="self_attention_kv",
+        rdt_state_dim=128,
+        state_encoder_layout="rdt_eef",
+        freeze_state_adaptor=True,
+        allow_random_frozen_state_adaptor=True,
+    )
+    model = SFTConditionedRDT(replace(base, model=model_config), load_pretrained=False)
+    model.mask_noisy_gripper_input = True
+
+    def zero_prediction(self, x, *_args, **_kwargs):
+        prediction = x.new_zeros(x.shape[0], model.horizon, 7)
+        prediction[..., 6] = -0.75
+        return prediction
+
+    model.runner.model.forward = MethodType(zero_prediction, model.runner.model)
+    captured_action_inputs: list[torch.Tensor] = []
+    captured_action_masks: list[torch.Tensor] = []
+    original_adapt_actions = model._adapt_actions
+
+    def capture_action_input(self, actions, action_mask):
+        captured_action_inputs.append(actions.detach().clone())
+        captured_action_masks.append(action_mask.detach().clone())
+        return original_adapt_actions(actions, action_mask)
+
+    model._adapt_actions = MethodType(capture_action_input, model)
+    batch = {
+        "lang_tokens": torch.randn(1, 12, 64),
+        "lang_mask": torch.ones(1, 12, dtype=torch.bool),
+        "img_tokens": torch.randn(1, 16, 64),
+        "img_mask": torch.ones(1, 16, dtype=torch.bool),
+        "qwen_kv": torch.randn(1, 1, 64),
+        "state": torch.zeros(1, 7),
+        "actions": torch.ones(1, model.horizon, 7),
+        "action_time_mask": torch.ones(1, model.horizon, dtype=torch.bool),
+        "action_dim_mask": torch.ones(1, 7),
+        "ctrl_freq": torch.full((1,), 10.0),
+        "diffusion_noise": torch.randn(1, model.horizon, 7),
+        "diffusion_timesteps": torch.tensor(
+            [model.runner.num_train_timesteps - 1]
+        ),
+        "return_denoising_prediction": True,
+    }
+
+    metrics = model(batch)
+    assert "denoising_prediction" in metrics
+    assert torch.count_nonzero(captured_action_inputs[-1][..., 6]) == 0
+    assert torch.count_nonzero(captured_action_inputs[-1][..., :6]) > 0
+
+    # Episode padding is a loss-only concern. Changing only the temporal loss
+    # mask must not change the action values or indicator mask presented to the
+    # diffusion model; inference always conditions on a full action horizon.
+    full_horizon_action_input = captured_action_inputs[-1].clone()
+    full_horizon_conditioning_mask = captured_action_masks[-1].clone()
+    batch["action_time_mask"][:, model.horizon // 2 :] = False
+    model(batch)
+    torch.testing.assert_close(
+        captured_action_inputs[-1],
+        full_horizon_action_input,
+    )
+    torch.testing.assert_close(
+        captured_action_masks[-1],
+        full_horizon_conditioning_mask,
+    )
+    torch.testing.assert_close(
+        captured_action_masks[-1],
+        batch["action_dim_mask"].unsqueeze(1).expand_as(batch["actions"]),
+    )
+
+    captured_action_inputs.clear()
+    captured_action_masks.clear()
+    sampling_batch = {
+        key: value
+        for key, value in batch.items()
+        if key
+        not in {
+            "actions",
+            "action_time_mask",
+            "diffusion_noise",
+            "diffusion_timesteps",
+            "return_denoising_prediction",
+        }
+    }
+    sampled = model.sample_actions(sampling_batch)
+    assert captured_action_inputs
+    assert all(
+        torch.count_nonzero(action_input[..., 6]) == 0
+        for action_input in captured_action_inputs
+    )
+    # The masked discrete channel is decoded from the model's final clean x0,
+    # rather than the continuously integrated solver state.
+    torch.testing.assert_close(
+        sampled[..., 6],
+        torch.full_like(sampled[..., 6], -0.75),
+    )
+
+    # Output-only clean-x0 decoding must not alter the noisy gripper input. This
+    # supports older checkpoints that were trained without gripper masking.
+    model.mask_noisy_gripper_input = False
+    model.decode_clean_x0_gripper = True
+    captured_action_inputs.clear()
+    sampled = model.sample_actions(sampling_batch)
+    assert any(
+        torch.count_nonzero(action_input[..., 6]) > 0
+        for action_input in captured_action_inputs
+    )
+    torch.testing.assert_close(
+        sampled[..., 6],
+        torch.full_like(sampled[..., 6], -0.75),
+    )
+
+
+def test_ortho6d_so3_penalty_measures_decoded_rotation() -> None:
+    identity = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    quarter_turn_z = torch.tensor([0.0, 1.0, 0.0, -1.0, 0.0, 0.0])
+    matrices = SFTConditionedRDT._ortho6d_to_rotation_matrix(
+        torch.stack([identity, quarter_turn_z])
+    )
+
+    relative = matrices[0].transpose(-1, -2) @ matrices[1]
+    cosine = (relative.diagonal().sum() - 1.0) * 0.5
+    penalty = 1.0 - cosine
+
+    torch.testing.assert_close(matrices[0], torch.eye(3))
+    torch.testing.assert_close(penalty, torch.tensor(1.0))
