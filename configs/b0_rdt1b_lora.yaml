@@ -53,6 +53,9 @@ data:
   num_workers: 4
   pin_memory: true
   persistent_workers: true
+  # Training uses DataLoader's global random shuffle. Keeping this false avoids
+  # long runs of correlated samples from the same episode/cache shard.
+  episode_aware_shuffle: false
   stratified_validation: true
 
 training:
