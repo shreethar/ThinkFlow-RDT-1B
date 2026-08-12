@@ -15,6 +15,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, T5EncoderModel, T5Tokenizer
+import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
