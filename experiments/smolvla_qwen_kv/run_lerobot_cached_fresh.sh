@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+LIBERO_ROOT=${SMOLVLA_QWEN_EVAL_LIBERO_ROOT:-"$REPO_ROOT/../LIBERO"}
+if [[ ! -d "$LIBERO_ROOT/libero/libero" ]]; then
+  echo "LIBERO source tree not found at: $LIBERO_ROOT" >&2
+  echo "Set SMOLVLA_QWEN_EVAL_LIBERO_ROOT=/absolute/path/to/LIBERO" >&2
+  exit 2
+fi
+
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export ACCELERATE_USE_DEEPSPEED=false
 export SMOLVLA_QWEN_EVAL_ENABLE=true
+export SMOLVLA_QWEN_EVAL_LIBERO_ROOT="$LIBERO_ROOT"
 export SMOLVLA_QWEN_EVAL_QWEN_MODEL=shreethar/stage1_unsloth
 export SMOLVLA_QWEN_EVAL_QWEN_PROCESSOR=shreethar/stage1_unsloth
 export SMOLVLA_QWEN_EVAL_TASK_IDS=0
