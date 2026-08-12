@@ -227,7 +227,15 @@ class QwenKVSmolVLMWithExpertModel(SmolVLMWithExpertModel):
                 f"past_key_values={past_key_values is not None}"
             )
 
-        if len(inputs_embeds) == 2 and not past_key_values:
+        # ``past_key_values`` is shared by every transformer layer. Once layer 0
+        # has populated the dictionary it is truthy, but later layers still need
+        # to build and store their own prefix K/V during the cache-fill pass.
+        # Only skip prefix projection when this invocation is explicitly reusing
+        # an already-filled cache.
+        reusing_kv_cache = (
+            use_cache and past_key_values is not None and not fill_kv_cache
+        )
+        if len(inputs_embeds) == 2 and not reusing_kv_cache:
             seq_len = inputs_embeds[0].shape[1]
             position_id = position_ids[:, :seq_len]
             expert_position_id = position_ids[:, seq_len:]
@@ -265,6 +273,10 @@ class QwenKVSmolVLMWithExpertModel(SmolVLMWithExpertModel):
                     "value_states": value_states,
                 }
             else:
+                if layer_idx not in past_key_values:
+                    raise KeyError(
+                        f"Missing cached prefix K/V for cross-attention layer {layer_idx}"
+                    )
                 key_states = past_key_values[layer_idx]["key_states"]
                 value_states = past_key_values[layer_idx]["value_states"]
 
