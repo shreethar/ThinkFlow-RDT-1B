@@ -1,0 +1,78 @@
+# Architecture recorded in checkpoint-1600/metadata.json.
+#
+# This config exists only so scripts/merge_lora_adapter.py can reconstruct the
+# legacy 7D RDT+LoRA model and merge its adapter into the transformer.  It is
+# not the LIBERO training config.  The suite-specific launcher subsequently
+# loads the merged transformer through configs/b0_rdt1b_lora.yaml, which uses
+# the current 11D state and 10D action layouts.
+
+seed: 42
+rdt_repo: /home/ubuntu/RoboticsDiffusionTransformer
+pretrained_model: robotics-diffusion-transformer/rdt-1b
+output_dir: outputs/checkpoint1600_legacy_merge_only
+
+model:
+  action_dim: 7
+  state_dim: 7
+  pred_horizon: 64
+  qwen_hidden_size: 2560
+  qwen_kv_dim: 2048
+  lang_token_dim: 4096
+  img_token_dim: 1152
+  max_lang_tokens: 128
+  image_tokens: 4374
+  hidden_size: 2048
+  depth: 28
+  num_heads: 32
+  dtype: bfloat16
+  lang_adaptor: linear
+  img_adaptor: linear
+  state_adaptor: mlp3x_gelu
+  copy_pretrained_final_fc1: true
+  gradient_checkpointing: true
+  finetune_mode: lora
+  qwen_fusion: language
+  state_encoder_layout: raw
+  action_encoder_layout: raw
+  pretrained_copy_mode: selected
+
+lora:
+  rank: 32
+  alpha: 64
+  dropout: 0.05
+  target_self_attention: true
+  target_cross_attention: true
+  target_ffn: true
+  train_final_layer: true
+
+noise_scheduler:
+  num_train_timesteps: 1000
+  num_inference_timesteps: 5
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: sample
+  clip_sample: false
+
+data:
+  train_manifest: unused-for-merge
+  val_manifest: unused-for-merge
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+
+training:
+  max_steps: 1
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate_lora: 1.0e-4
+  learning_rate_interfaces: 1.0e-4
+  weight_decay_interfaces: 0.01
+  warmup_steps: 0
+  max_grad_norm: 1.0
+  log_every: 1
+  validate_every: 1
+  save_every: 1
+  validation_batches: 1
+  sample_validation_batches: 0
+  mixed_precision: bf16
+  report_to: none
+
