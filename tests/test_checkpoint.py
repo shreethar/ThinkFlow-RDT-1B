@@ -32,8 +32,16 @@ class FakeFullCore(nn.Module):
 
 
 class FakeTransferCore(nn.Module):
-    def __init__(self, action_dim: int, hidden_dim: int = 4) -> None:
+    def __init__(
+        self,
+        action_dim: int,
+        hidden_dim: int = 4,
+        lang_tokens: int = 128,
+    ) -> None:
         super().__init__()
+        self.lang_cond_pos_embed = nn.Parameter(
+            torch.zeros(1, lang_tokens, hidden_dim)
+        )
         self.block = nn.Linear(hidden_dim, hidden_dim)
         self.final_layer = nn.Module()
         self.final_layer.ffn_final = nn.Module()
@@ -225,6 +233,33 @@ def test_full_base_still_rejects_other_shape_mismatches(tmp_path):
             tmp_path,
             allow_output_head_mismatch=True,
         )
+
+
+def test_full_base_truncates_legacy_extra_language_position(tmp_path):
+    source_core = FakeTransferCore(action_dim=7, lang_tokens=129)
+    fill_parameters(source_core, start=3.0)
+    torch.save(source_core.state_dict(), tmp_path / FULL_RDT_FILE)
+
+    target_core = FakeTransferCore(action_dim=10, lang_tokens=128)
+    original_head = {
+        name: tensor.detach().clone()
+        for name, tensor in target_core.final_layer.ffn_final.fc2.state_dict().items()
+    }
+    model = SimpleNamespace(runner=SimpleNamespace(model=target_core))
+    report = load_full_rdt_base(
+        model,
+        tmp_path,
+        allow_output_head_mismatch=True,
+        allow_language_position_mismatch=True,
+    )
+
+    torch.testing.assert_close(
+        target_core.lang_cond_pos_embed,
+        source_core.lang_cond_pos_embed[:, :128],
+    )
+    for name, tensor in target_core.final_layer.ffn_final.fc2.state_dict().items():
+        torch.testing.assert_close(tensor, original_head[name])
+    assert report["adapted_tensors"] == ["lang_cond_pos_embed"]
 
 
 def test_lora_artifact_round_trip_preserves_adapter_and_qwen(
