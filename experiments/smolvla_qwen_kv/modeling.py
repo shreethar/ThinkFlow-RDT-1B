@@ -218,30 +218,26 @@ class QwenKVSmolVLMWithExpertModel(SmolVLMWithExpertModel):
 
         attention_interface = self.get_attention_interface()
         att_outputs = []
-        if not (
-            len(inputs_embeds) == 2
-            or (use_cache and past_key_values is not None and not fill_kv_cache)
-        ):
+        if len(inputs_embeds) != 2:
             raise AssertionError(
                 f"Unexpected inputs/cache combination: inputs={len(inputs_embeds)}, "
                 f"past_key_values={past_key_values is not None}"
             )
 
-        # ``past_key_values`` is shared by every transformer layer. Once layer 0
-        # has populated the dictionary it is truthy, but later layers still need
-        # to build and store their own prefix K/V during the cache-fill pass.
-        # Only skip prefix projection when this invocation is explicitly reusing
-        # an already-filled cache.
-        reusing_kv_cache = (
-            use_cache and past_key_values is not None and not fill_kv_cache
-        )
-        if len(inputs_embeds) == 2 and not reusing_kv_cache:
-            seq_len = inputs_embeds[0].shape[1]
+        # SmolVLA prefill supplies [prefix_embeds, None]. Flow-matching denoise
+        # calls then supply [None, suffix_embeds] and reuse the prefix K/V. Use
+        # the actual prefix tensor as the phase signal: ``past_key_values`` is a
+        # shared per-layer dictionary, and ``fill_kv_cache`` has varied across
+        # LeRobot releases and cannot reliably distinguish these calls.
+        prefix_embeds = inputs_embeds[0]
+        has_prefix = prefix_embeds is not None
+        if has_prefix:
+            seq_len = prefix_embeds.shape[1]
             position_id = position_ids[:, :seq_len]
             expert_position_id = position_ids[:, seq_len:]
             prefix_attention_mask = attention_mask[:, :seq_len, :seq_len]
             layer = model_layers[0][layer_idx]
-            hidden_states = layer.input_layernorm(inputs_embeds[0])
+            hidden_states = layer.input_layernorm(prefix_embeds)
             hidden_shape = (*hidden_states.shape[:-1], -1, layer.self_attn.head_dim)
             hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
             query_states = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
@@ -262,23 +258,28 @@ class QwenKVSmolVLMWithExpertModel(SmolVLMWithExpertModel):
         else:
             expert_position_id = position_ids
 
-        if use_cache and past_key_values is None:
-            past_key_values = {}
-        if use_cache:
-            if fill_kv_cache:
+        if has_prefix:
+            if use_cache:
+                if past_key_values is None:
+                    past_key_values = {}
                 # The Qwen token is not put in the static cache: its layer adapter is
                 # applied at every expert CA invocation and remains differentiable.
                 past_key_values[layer_idx] = {
                     "key_states": key_states,
                     "value_states": value_states,
                 }
-            else:
-                if layer_idx not in past_key_values:
-                    raise KeyError(
-                        f"Missing cached prefix K/V for cross-attention layer {layer_idx}"
-                    )
-                key_states = past_key_values[layer_idx]["key_states"]
-                value_states = past_key_values[layer_idx]["value_states"]
+        else:
+            if not use_cache or past_key_values is None:
+                raise RuntimeError(
+                    "SmolVLA cross-attention received no prefix embeddings and no "
+                    "prefix K/V cache"
+                )
+            if layer_idx not in past_key_values:
+                raise KeyError(
+                    f"Missing cached prefix K/V for cross-attention layer {layer_idx}"
+                )
+            key_states = past_key_values[layer_idx]["key_states"]
+            value_states = past_key_values[layer_idx]["value_states"]
 
         expert_layer = model_layers[1][layer_idx]
         if expert_layer is None:
