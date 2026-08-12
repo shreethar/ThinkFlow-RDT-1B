@@ -117,6 +117,27 @@ def load_suite_metadata(cache_root: Path, suite: str) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def resolve_policy_checkpoint(path: Path) -> Path:
+    """Accept a policy dir, official checkpoint dir, or train_config.json."""
+
+    resolved = path.expanduser().resolve()
+    if resolved.is_file():
+        if resolved.name != "train_config.json":
+            raise ValueError(
+                f"Checkpoint file must be train_config.json, got {resolved.name!r}"
+            )
+        resolved = resolved.parent
+    if (resolved / "pretrained_model").is_dir():
+        resolved = resolved / "pretrained_model"
+    required = ("config.json", "model.safetensors", "policy_preprocessor.json")
+    missing = [name for name in required if not (resolved / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Resolved policy directory {resolved} is missing required files: {missing}"
+        )
+    return resolved
+
+
 def pil_images_to_float_batch(images) -> torch.Tensor:
     arrays = [np.asarray(image.convert("RGB"), dtype=np.uint8).copy() for image in images]
     return torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).float().div_(255.0)
@@ -206,11 +227,10 @@ def main() -> None:
         # that nested load as well and avoids unnecessary Hub HEAD requests.
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    checkpoint = args.checkpoint.expanduser().resolve()
+    requested_checkpoint = args.checkpoint.expanduser().resolve()
+    checkpoint = resolve_policy_checkpoint(requested_checkpoint)
     cache_root = args.cache_root.expanduser().resolve()
     libero_root = args.libero_root.expanduser().resolve()
-    if not checkpoint.is_dir():
-        raise FileNotFoundError(checkpoint)
     if not 1 <= args.episodes_per_task <= 50:
         raise ValueError("--episodes-per-task must be in [1, 50]")
     if args.env_batch_size <= 0 or args.action_chunk <= 0:
@@ -233,6 +253,11 @@ def main() -> None:
             f"Expected a smolvla_qwen_kv checkpoint, got {getattr(config, 'type', None)!r}"
         )
     config.device = str(device)
+    # A LeRobot pretrained_model directory is a full policy checkpoint. Build
+    # the architecture without separately loading SmolVLM Hub weights; strict
+    # safetensor loading below then verifies that the checkpoint supplies every
+    # parameter, including the frozen VLM.
+    config.load_vlm_weights = False
     if args.action_chunk > config.chunk_size:
         raise ValueError(f"--action-chunk exceeds checkpoint chunk_size={config.chunk_size}")
 
