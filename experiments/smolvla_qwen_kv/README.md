@@ -172,3 +172,51 @@ The launcher first creates `outputs/smolvla_base_qwen_kv_init`: native SmolVLA
 weights come from the pretrained base while only the custom Qwen K/V adapters
 are newly initialized with seed 42. It then starts a new official LeRobot run
 at training step zero.
+
+## Qwen-aware rollouts inside `lerobot-train`
+
+For this custom cached policy, a positive `--env_eval_freq` activates the
+plugin's Qwen-aware callback. Evaluation runs immediately after an official
+checkpoint is saved at a matching step. The prepared fresh launcher uses:
+
+```text
+save_freq     = 1000
+env_eval_freq = 5000
+```
+
+so it evaluates steps 5,000, 10,000, 15,000, and so on. Each callback pauses
+optimization, reuses the in-memory SmolVLA policy, temporarily loads
+`shreethar/stage1_unsloth`, generates to `</think>`/the configured stop,
+extracts layer-7 `[K|V]`, runs closed-loop LIBERO, logs success to WandB, frees
+Qwen, and returns the policy to training mode. Outputs are written below:
+
+```text
+<training-output>/qwen_rollouts/step_005000/
+  episodes.jsonl
+  summary.json
+  wandb_metrics.json
+  videos/<suite>/*.mp4
+```
+
+Default periodic coverage is task 0, two initial states, across every suite in
+the cached dataset. It can be configured without patching LeRobot:
+
+```bash
+export SMOLVLA_QWEN_EVAL_TASK_IDS=0,1
+export SMOLVLA_QWEN_EVAL_EPISODES_PER_TASK=2
+export SMOLVLA_QWEN_EVAL_ACTION_CHUNK=4
+export SMOLVLA_QWEN_EVAL_SAVE_VIDEOS=true
+export SMOLVLA_QWEN_EVAL_QWEN_MODEL=shreethar/stage1_unsloth
+```
+
+Resume the current fresh run and enable the callback with:
+
+```bash
+bash experiments/smolvla_qwen_kv/resume_lerobot_with_qwen_eval.sh
+```
+
+The rollout is fail-open by default: a simulator/Qwen evaluation failure is
+logged but does not discard a valid training checkpoint or stop optimization.
+Set `SMOLVLA_QWEN_EVAL_FAIL_OPEN=false` to make such a failure terminate the
+run. Periodic rollout time is additional wall-clock time and does not count as
+a training step.

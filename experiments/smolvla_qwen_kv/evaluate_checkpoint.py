@@ -219,8 +219,15 @@ def write_summary(results_path: Path, summary_path: Path) -> dict[str, Any]:
     return summary
 
 
-def main() -> None:
-    args = parse_args()
+def run_evaluation(
+    args: argparse.Namespace,
+    *,
+    policy_override: KVSmolVLAPolicy | None = None,
+    preprocessor_override=None,
+    postprocessor_override=None,
+) -> dict[str, Any]:
+    """Evaluate a saved policy or an in-memory policy from the training loop."""
+
     if args.local_files_only:
         # SmolVLA constructs its nested AutoProcessor internally without a
         # local_files_only argument. Offline mode applies the CLI contract to
@@ -247,32 +254,47 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
 
-    config = PreTrainedConfig.from_pretrained(checkpoint, local_files_only=True)
-    if not isinstance(config, KVSmolVLAConfig):
-        raise TypeError(
-            f"Expected a smolvla_qwen_kv checkpoint, got {getattr(config, 'type', None)!r}"
-        )
-    config.device = str(device)
-    # A LeRobot pretrained_model directory is a full policy checkpoint. Build
-    # the architecture without separately loading SmolVLM Hub weights; strict
-    # safetensor loading below then verifies that the checkpoint supplies every
-    # parameter, including the frozen VLM.
-    config.load_vlm_weights = False
+    if policy_override is None:
+        config = PreTrainedConfig.from_pretrained(checkpoint, local_files_only=True)
+        if not isinstance(config, KVSmolVLAConfig):
+            raise TypeError(
+                f"Expected a smolvla_qwen_kv checkpoint, got {getattr(config, 'type', None)!r}"
+            )
+        config.device = str(device)
+        # A LeRobot pretrained_model directory is a full policy checkpoint. Build
+        # the architecture without separately loading SmolVLM Hub weights; strict
+        # safetensor loading below then verifies that the checkpoint supplies every
+        # parameter, including the frozen VLM.
+        config.load_vlm_weights = False
+    else:
+        if preprocessor_override is None or postprocessor_override is None:
+            raise ValueError(
+                "In-memory policy evaluation requires matching preprocessor and postprocessor"
+            )
+        config = policy_override.config
+        if not isinstance(config, KVSmolVLAConfig):
+            raise TypeError(f"Expected KVSmolVLAPolicy config, got {type(config).__name__}")
     if args.action_chunk > config.chunk_size:
         raise ValueError(f"--action-chunk exceeds checkpoint chunk_size={config.chunk_size}")
 
-    print(f"Loading Qwen-KV SmolVLA policy from {checkpoint}")
-    policy = KVSmolVLAPolicy.from_pretrained(
-        checkpoint,
-        config=config,
-        local_files_only=True,
-        strict=True,
-    ).eval()
-    preprocessor, postprocessor = make_pre_post_processors(
-        config,
-        str(checkpoint),
-        preprocessor_overrides={"device_processor": {"device": str(device)}},
-    )
+    if policy_override is None:
+        print(f"Loading Qwen-KV SmolVLA policy from {checkpoint}")
+        policy = KVSmolVLAPolicy.from_pretrained(
+            checkpoint,
+            config=config,
+            local_files_only=True,
+            strict=True,
+        ).eval()
+        preprocessor, postprocessor = make_pre_post_processors(
+            config,
+            str(checkpoint),
+            preprocessor_overrides={"device_processor": {"device": str(device)}},
+        )
+    else:
+        policy = policy_override
+        preprocessor = preprocessor_override
+        postprocessor = postprocessor_override
+        policy.eval()
 
     metadata_by_suite = {suite: load_suite_metadata(cache_root, suite) for suite in args.suites}
     first_metadata = metadata_by_suite[args.suites[0]]
@@ -532,6 +554,13 @@ def main() -> None:
                         results_file.flush()
                     summary = write_summary(results_path, summary_path)
                     print(json.dumps(summary, indent=2), flush=True)
+
+    summary = write_summary(results_path, summary_path)
+    return summary
+
+
+def main() -> None:
+    run_evaluation(parse_args())
 
 
 if __name__ == "__main__":
