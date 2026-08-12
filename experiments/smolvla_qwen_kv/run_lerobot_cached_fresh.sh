@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export ACCELERATE_USE_DEEPSPEED=false
+
+# Build the custom policy once from native lerobot/smolvla_base. This does not
+# load checkpoint-014000 or any prior LIBERO fine-tuning.
+if [[ ! -f outputs/smolvla_base_qwen_kv_init/model.safetensors ]]; then
+  .venv/bin/python -m experiments.smolvla_qwen_kv.create_base_checkpoint \
+    --base lerobot/smolvla_base \
+    --output-dir outputs/smolvla_base_qwen_kv_init \
+    --stats outputs/smolvla_base_qwen_kv_all_suites/cache_stats.pt \
+    --device cpu \
+    --seed 42 \
+    --local-files-only
+fi
+
+exec .venv/bin/lerobot-train \
+  --policy.path=outputs/smolvla_base_qwen_kv_init \
+  --policy.load_vlm_weights=true \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=cached_libero_qwen:all \
+  --dataset.root=cache_features_libero_b0_raw_ortho6d \
+  --dataset.streaming=true \
+  --dataset.eval_split=0 \
+  --output_dir=outputs/lerobot_smolvla_qwen_kv_fresh \
+  --job_name=smolvla-base-qwen-kv-fresh \
+  --steps=100000 \
+  --batch_size=128 \
+  --num_workers=8 \
+  --log_freq=10 \
+  --save_freq=1000 \
+  --env_eval_freq=0 \
+  --eval_steps=0 \
+  --wandb.enable=true \
+  --wandb.project=thinkflow-smolvla-b0-libero
