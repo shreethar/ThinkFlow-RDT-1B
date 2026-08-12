@@ -3,6 +3,7 @@ set -euo pipefail
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export ACCELERATE_USE_DEEPSPEED=false
 
 # This uses LeRobot's official trainer and checkpoint format. checkpoint-014000
 # is a MODEL warm-start: its legacy training_state.pt is not LeRobot's
