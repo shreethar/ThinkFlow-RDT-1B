@@ -524,6 +524,7 @@ class SFTConditionedRDT(nn.Module):
                 self,
                 base_artifact,
                 allow_output_head_mismatch=True,
+                allow_language_position_mismatch=True,
             )
         if cfg.model.finetune_mode == "lora":
             self.runner.model, self.lora_targets = apply_lora(

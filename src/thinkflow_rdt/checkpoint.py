@@ -291,6 +291,7 @@ def load_full_rdt_base(
     *,
     strict: bool = True,
     allow_output_head_mismatch: bool = False,
+    allow_language_position_mismatch: bool = False,
 ) -> dict[str, Any]:
     """Load a merged/full RDT core before wrapping the core with fresh LoRA.
 
@@ -321,6 +322,7 @@ def load_full_rdt_base(
         return {
             "loaded_tensors": len(state_dict),
             "reinitialized_tensors": [],
+            "adapted_tensors": [],
             "shape_mismatches": {},
         }
 
@@ -328,43 +330,75 @@ def load_full_rdt_base(
         "final_layer.ffn_final.fc2.weight",
         "final_layer.ffn_final.fc2.bias",
     }
-    if not allow_output_head_mismatch or set(shape_mismatches) != output_head_keys:
+    language_position_key = "lang_cond_pos_embed"
+    permitted_mismatches: set[str] = set()
+    if allow_output_head_mismatch:
+        permitted_mismatches.update(output_head_keys)
+    if allow_language_position_mismatch:
+        permitted_mismatches.add(language_position_key)
+    if not set(shape_mismatches).issubset(permitted_mismatches):
         # Preserve PyTorch's detailed size-mismatch error for any unsupported
         # architecture difference.
         model.runner.model.load_state_dict(state_dict, strict=strict)
         raise AssertionError("unreachable")
 
-    source_weight = state_dict["final_layer.ffn_final.fc2.weight"]
-    target_weight = target_state["final_layer.ffn_final.fc2.weight"]
-    source_bias = state_dict["final_layer.ffn_final.fc2.bias"]
-    target_bias = target_state["final_layer.ffn_final.fc2.bias"]
-    valid_action_width_change = (
-        source_weight.ndim == target_weight.ndim == 2
-        and source_weight.shape[1] == target_weight.shape[1]
-        and source_bias.ndim == target_bias.ndim == 1
-        and source_weight.shape[0] == source_bias.shape[0]
-        and target_weight.shape[0] == target_bias.shape[0]
-    )
-    if not valid_action_width_change:
-        model.runner.model.load_state_dict(state_dict, strict=strict)
-        raise AssertionError("unreachable")
+    mismatched_output_keys = set(shape_mismatches).intersection(output_head_keys)
+    if mismatched_output_keys:
+        source_weight = state_dict["final_layer.ffn_final.fc2.weight"]
+        target_weight = target_state["final_layer.ffn_final.fc2.weight"]
+        source_bias = state_dict["final_layer.ffn_final.fc2.bias"]
+        target_bias = target_state["final_layer.ffn_final.fc2.bias"]
+        valid_action_width_change = (
+            mismatched_output_keys == output_head_keys
+            and source_weight.ndim == target_weight.ndim == 2
+            and source_weight.shape[1] == target_weight.shape[1]
+            and source_bias.ndim == target_bias.ndim == 1
+            and source_weight.shape[0] == source_bias.shape[0]
+            and target_weight.shape[0] == target_bias.shape[0]
+        )
+        if not valid_action_width_change:
+            model.runner.model.load_state_dict(state_dict, strict=strict)
+            raise AssertionError("unreachable")
+
+    adapted_tensors: list[str] = []
+    if language_position_key in shape_mismatches:
+        source_position = state_dict[language_position_key]
+        target_position = target_state[language_position_key]
+        # The legacy ``qwen_fusion=language`` model reserved one additional
+        # language position for its projected Qwen token.  Cross-attention KV
+        # fusion no longer places that token in the language sequence.  Keep
+        # all 128 shared learned positions and discard only the obsolete 129th.
+        valid_language_width_change = (
+            source_position.ndim == target_position.ndim == 3
+            and source_position.shape[0] == target_position.shape[0]
+            and source_position.shape[2] == target_position.shape[2]
+            and source_position.shape[1] == target_position.shape[1] + 1
+        )
+        if not valid_language_width_change:
+            model.runner.model.load_state_dict(state_dict, strict=strict)
+            raise AssertionError("unreachable")
+        state_dict[language_position_key] = source_position[
+            :, : target_position.shape[1], :
+        ]
+        adapted_tensors.append(language_position_key)
 
     compatible_state = {
         name: tensor
         for name, tensor in state_dict.items()
-        if name not in output_head_keys
+        if name not in mismatched_output_keys
     }
     missing, unexpected = model.runner.model.load_state_dict(
         compatible_state,
         strict=False,
     )
-    if set(missing) != output_head_keys or unexpected:
+    if set(missing) != mismatched_output_keys or unexpected:
         raise RuntimeError(
-            "Full RDT base differs outside the permitted action-output head: "
+            "Full RDT base differs outside the permitted transfer tensors: "
             f"missing={missing}, unexpected={unexpected}"
         )
     return {
         "loaded_tensors": len(compatible_state),
-        "reinitialized_tensors": sorted(output_head_keys),
+        "reinitialized_tensors": sorted(mismatched_output_keys),
+        "adapted_tensors": adapted_tensors,
         "shape_mismatches": shape_mismatches,
     }
