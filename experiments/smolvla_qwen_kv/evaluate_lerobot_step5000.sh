@@ -16,4 +16,6 @@ exec .venv/bin/python -m experiments.smolvla_qwen_kv.evaluate_checkpoint \
   --action-chunk 4 \
   --save-videos \
   --video-resolution 512 \
-  --local-files-only
+  --local-files-only \
+  --qwen-model-id shreethar/stage1_unsloth \
+  --qwen-processor-id shreethar/stage1_unsloth
