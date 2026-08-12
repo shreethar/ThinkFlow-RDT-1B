@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_policy_smolvla_qwen_kv"
+version = "0.1.0"
+description = "LeRobot plugin facade for Qwen-KV-conditioned SmolVLA"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["lerobot_policy_smolvla_qwen_kv"]
