@@ -497,6 +497,20 @@ def standardized_collate_fn(
                 for sample in kept
             ]
         )
+    if all("libero_native_state" in sample for sample in kept):
+        result["libero_native_state"] = torch.stack(
+            [
+                torch.as_tensor(sample["libero_native_state"], dtype=torch.float32)
+                for sample in kept
+            ]
+        )
+    if all("libero_native_actions" in sample for sample in kept):
+        result["libero_native_actions"] = torch.stack(
+            [
+                torch.as_tensor(sample["libero_native_actions"], dtype=torch.float32)
+                for sample in kept
+            ]
+        )
     return result
 
 

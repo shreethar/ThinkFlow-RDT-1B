@@ -8,11 +8,12 @@ set -euo pipefail
 #
 # Common overrides:
 #   DATA_ROOT=dataset/datasets
-#   OUTPUT_ROOT=cache_features_libero_b2_raw_ortho6d
-#   GCS_DEST=gs://my-bucket/libero_b2_raw_ortho6d
+#   OUTPUT_ROOT=cache_features_libero_b2_native
+#   GCS_DEST=gs://my-bucket/libero_b2_native
 #   ALL_SAMPLES_PER_EPISODE=1
 #   MAX_SAMPLES_PER_EPISODE=128  # used only when ALL_SAMPLES_PER_EPISODE=0
 #   OVERWRITE=1
+#   INCLUDE_T5=0  # set to 1 to additionally cache T5 XXL language embeddings
 
 SUITE=${1:?suite is required, e.g. libero_object/libero_spatial/libero_goal/libero_10/libero_90}
 
@@ -26,7 +27,7 @@ esac
 
 CONFIG=${CONFIG:-configs/b2_rdt1b_lora.yaml}
 DATA_ROOT=${DATA_ROOT:-dataset/datasets}
-OUTPUT_ROOT=${OUTPUT_ROOT:-cache_features_libero_b2_raw_ortho6d}
+OUTPUT_ROOT=${OUTPUT_ROOT:-cache_features_libero_b2_native}
 OUT_DIR="${OUTPUT_ROOT}/${SUITE}"
 
 STUDENT_MODEL_ID=${STUDENT_MODEL_ID:-/workspace/model/LatentStudent-ckpt-400-fixed}
@@ -36,6 +37,7 @@ SPATIAL_PARAMETERS_PATH=${SPATIAL_PARAMETERS_PATH:-}
 
 T5_MODEL_ID=${T5_MODEL_ID:-/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v1_1-xxl}
 T5_PRECISION=${T5_PRECISION:-bf16}
+INCLUDE_T5=${INCLUDE_T5:-0}
 BATCH_SIZE=${BATCH_SIZE:-32}
 T5_BATCH_SIZE=${T5_BATCH_SIZE:-32}
 NUM_WORKERS=${NUM_WORKERS:-4}
@@ -58,6 +60,7 @@ ARGS=(
   --split test
   --action-target-mode delta
   --no-normalize-actions
+  --cache-proprioception-schema libero_native
   --gripper-change-scope directional
   --open-to-close-before "$OPEN_TO_CLOSE_BEFORE"
   --open-to-close-after "$OPEN_TO_CLOSE_AFTER"
@@ -68,16 +71,24 @@ ARGS=(
   --latent-student-code-dir "$LATENT_STUDENT_CODE_DIR"
   --spatial-token-count 5
   --layer-index 7
-  --include-t5
-  --t5-model-id "$T5_MODEL_ID"
-  --t5-precision "$T5_PRECISION"
-  --t5-batch-size "$T5_BATCH_SIZE"
+  --image-storage raw_uint8
   --image-history-size "$IMAGE_HISTORY_SIZE"
   --max-images-per-sample "$MAX_IMAGES_PER_SAMPLE"
   --batch-size "$BATCH_SIZE"
   --num-workers "$NUM_WORKERS"
   --pin-memory
 )
+
+if [[ "$INCLUDE_T5" == "1" ]]; then
+  ARGS+=(
+    --include-t5
+    --t5-model-id "$T5_MODEL_ID"
+    --t5-precision "$T5_PRECISION"
+    --t5-batch-size "$T5_BATCH_SIZE"
+  )
+else
+  ARGS+=(--no-include-t5)
+fi
 
 if [[ "$ALL_SAMPLES_PER_EPISODE" == "1" ]]; then
   ARGS+=(--all-samples-per-episode)

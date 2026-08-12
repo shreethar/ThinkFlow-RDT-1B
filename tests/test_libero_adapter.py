@@ -123,6 +123,15 @@ def test_demo_conversion_flips_images_and_preserves_raw_fingers_and_commands() -
     np.testing.assert_array_equal(episode.wrist_images, wrist[:, ::-1])
     assert episode.states.shape == (2, LIBERO_STATE_DIM)
     assert episode.actions.shape == (2, LIBERO_ACTION_DIM)
+    assert episode.native_states.shape == (2, 8)
+    assert episode.native_actions.shape == (2, 7)
+    np.testing.assert_array_equal(episode.native_states[:, :3], 0.0)
+    np.testing.assert_array_equal(episode.native_states[:, 3:6], 0.0)
+    np.testing.assert_allclose(
+        episode.native_states[:, 6:8],
+        [[0.04, -0.04], [0.01, -0.01]],
+    )
+    np.testing.assert_array_equal(episode.native_actions, group["actions"])
     np.testing.assert_allclose(
         episode.states[:, 9:11],
         [[0.04, -0.04], [0.01, -0.01]],

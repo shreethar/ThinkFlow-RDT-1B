@@ -32,6 +32,8 @@ class LiberoEpisode:
     wrist_images: np.ndarray | None
     states: np.ndarray
     actions: np.ndarray
+    native_states: np.ndarray
+    native_actions: np.ndarray
     joint_states: np.ndarray | None = None
 
     @property
@@ -310,6 +312,17 @@ def convert_libero_demo(group, *, episode_id: str) -> LiberoEpisode:
 
     position = _dataset(obs, "ee_pos", "robot0_eef_pos")
     orientation = _dataset(obs, "ee_ori", "robot0_eef_quat")
+    if orientation.shape[-1] == 3:
+        native_orientation = np.asarray(orientation, dtype=np.float32)
+    elif orientation.shape[-1] == 4:
+        native_orientation = Rotation.from_quat(
+            np.asarray(orientation, dtype=np.float64).reshape(-1, 4)
+        ).as_rotvec().reshape(*orientation.shape[:-1], 3).astype(np.float32)
+    else:
+        raise ValueError(
+            "Expected LIBERO end-effector orientation [T,3] or [T,4], got "
+            f"{orientation.shape}"
+        )
     orientation_6d = libero_orientation_to_ortho6d(orientation)
     gripper_states = _dataset(obs, "gripper_states", "robot0_gripper_qpos")
     if gripper_states.ndim != 2 or gripper_states.shape[1] < 2:
@@ -318,6 +331,10 @@ def convert_libero_demo(group, *, episode_id: str) -> LiberoEpisode:
         )
     states = np.concatenate(
         [position[:, :3], orientation_6d, gripper_states[:, :2]],
+        axis=-1,
+    )
+    native_states = np.concatenate(
+        [position[:, :3], native_orientation, gripper_states[:, :2]],
         axis=-1,
     )
 
@@ -342,6 +359,8 @@ def convert_libero_demo(group, *, episode_id: str) -> LiberoEpisode:
         wrist_images=None if wrist is None else wrist[:length],
         states=states[:length].astype(np.float32),
         actions=actions[:length].astype(np.float32),
+        native_states=native_states[:length].astype(np.float32),
+        native_actions=raw_actions[:length].astype(np.float32),
         joint_states=None if joint_states is None else joint_states[:length].astype(np.float32),
     )
 
@@ -390,6 +409,14 @@ def libero_sample_from_episode(
         horizon=horizon,
         action_dim=int(target_sequence.shape[1]),
     )
+    native_actions, native_mask = pad_action_horizon(
+        episode.native_actions,
+        step_index,
+        horizon=horizon,
+        action_dim=7,
+    )
+    if not np.array_equal(native_mask, mask):
+        raise RuntimeError("Native and RDT LIBERO action horizon masks diverged")
     if action_stats is not None and action_target_mode == "delta":
         actions = normalize_action_horizon(actions, mask, action_stats)
     wrist = None if episode.wrist_images is None else Image.fromarray(episode.wrist_images[step_index]).copy()
@@ -409,6 +436,11 @@ def libero_sample_from_episode(
         "actions": actions,
         "actions_mask": mask,
         "action_dim_mask": np.ones((target_sequence.shape[1],), dtype=np.float32),
+        # Keep the original LIBERO tensors available for feature-only caches.
+        # This avoids a lossy 8D->11D->8D or 7D->10D->7D round trip when the
+        # downstream policy consumes LIBERO's native observation/command schema.
+        "libero_native_state": episode.native_states[step_index].copy(),
+        "libero_native_actions": native_actions,
         "ctrl_freq": 20.0,
     }
     if episode.joint_states is not None:

@@ -374,13 +374,24 @@ def build_shard_image_pool(
     *,
     image_history_size: int,
     image_jpeg_quality: int,
-) -> tuple[list[bytes], torch.Tensor]:
+    image_storage: str,
+) -> tuple[list[bytes] | list[torch.Tensor], torch.Tensor]:
     key_to_index: dict[tuple[str, ...], int] = {}
-    image_pool: list[bytes] = []
+    image_pool: list[bytes] | list[torch.Tensor] = []
     sample_image_indices: list[list[int]] = []
-    blank_payload = image_to_lossless_png_bytes(
-        Image.new("RGB", (384, 384), color=(0, 0, 0))
+    blank_image = Image.new("RGB", (384, 384), color=(0, 0, 0))
+    blank_payload = (
+        image_to_lossless_png_bytes(blank_image)
+        if image_storage == "lossless_png"
+        else torch.from_numpy(np.array(blank_image, dtype=np.uint8, copy=True))
     )
+
+    def serialize_image(image: Image.Image) -> bytes | torch.Tensor:
+        if image_storage == "lossless_png":
+            return image_to_lossless_png_bytes(image)
+        if image_storage == "raw_uint8":
+            return torch.from_numpy(np.array(image.convert("RGB"), dtype=np.uint8, copy=True))
+        raise ValueError(f"Unsupported image storage mode: {image_storage}")
 
     for sample_index, (metadata, sample_slots) in enumerate(
         zip(batch["metadata"], batch["siglip_image_slots"])
@@ -415,9 +426,7 @@ def build_shard_image_pool(
                 image_index = len(image_pool)
                 key_to_index[pool_key] = image_index
                 image_pool.append(
-                    image_to_lossless_png_bytes(image)
-                    if valid
-                    else blank_payload
+                    serialize_image(image) if valid else blank_payload
                 )
             slot_indices.append(image_index)
         sample_image_indices.append(slot_indices)
@@ -453,10 +462,37 @@ def save_sample_shard(
     image_jpeg_quality: int,
     cache_image_slots: bool,
     save_padded_features: bool,
+    cache_proprioception_schema: str,
+    image_storage: str,
 ) -> tuple[int, str]:
     batch_size = int(latent_kv.shape[0])
     filename = f"shard_{shard_index:09d}.pt"
     path = split_dir / filename
+
+    if cache_proprioception_schema == "libero_native":
+        if "libero_native_state" not in batch or "libero_native_actions" not in batch:
+            raise ValueError(
+                "--cache-proprioception-schema libero_native requires a LIBERO dataset"
+            )
+        cached_state = batch["libero_native_state"]
+        cached_actions = batch["libero_native_actions"]
+        state_dim_mask = torch.ones_like(cached_state)
+        action_dim_mask = torch.ones(
+            cached_actions.shape[0], cached_actions.shape[-1], dtype=torch.float32
+        )
+        proprioception_schema = "libero_native_state8_action7_v1"
+    else:
+        cached_state = batch["state"]
+        cached_actions = batch["actions"]
+        state_dim_mask = batch["state_dim_mask"]
+        action_dim_mask = batch["action_dim_mask"]
+        proprioception_schema = "rdt_encoded"
+
+    metadata = [dict(item) for item in batch["metadata"]]
+    for item in metadata:
+        item["state_dim"] = int(cached_state.shape[-1])
+        item["action_dim"] = int(cached_actions.shape[-1])
+        item["proprioception_schema"] = proprioception_schema
 
     record: dict[str, Any] = {
         "cache_layout": "sample_shard",
@@ -466,13 +502,14 @@ def save_sample_shard(
         "sample_stop_index": sample_start_index + batch_size,
         "qwen_kv": latent_kv.cpu(),
         "latent_waypoints": waypoints.cpu(),
-        "state": batch["state"].cpu(),
-        "state_dim_mask": batch["state_dim_mask"].cpu(),
-        "actions": batch["actions"].cpu(),
+        "proprioception_schema": proprioception_schema,
+        "state": cached_state.cpu(),
+        "state_dim_mask": state_dim_mask.cpu(),
+        "actions": cached_actions.cpu(),
         "action_time_mask": batch["action_time_mask"].cpu(),
-        "action_dim_mask": batch["action_dim_mask"].cpu(),
+        "action_dim_mask": action_dim_mask.cpu(),
         "ctrl_freq": batch["ctrl_freq"].cpu(),
-        "metadata": list(batch["metadata"]),
+        "metadata": metadata,
         "instructions": [str(instruction) for instruction in batch["instructions"]],
     }
     if "joint_state" in batch:
@@ -497,8 +534,11 @@ def save_sample_shard(
             batch,
             image_history_size=image_history_size,
             image_jpeg_quality=image_jpeg_quality,
+            image_storage=image_storage,
         )
-        record["image_jpegs"] = image_pool
+        image_pool_key = "image_arrays" if image_storage == "raw_uint8" else "image_jpegs"
+        record[image_pool_key] = image_pool
+        record["image_storage"] = image_storage
         record["sample_image_indices"] = sample_image_indices.cpu()
         record["sample_image_mask"] = batch["siglip_slot_mask"].cpu()
         record["image_slot_count"] = int(batch["siglip_slot_mask"].shape[1])
@@ -529,6 +569,10 @@ def save_sample_shard(
                 "has_lang_tokens": lang_tokens is not None,
                 "has_image_slots": cache_image_slots,
                 "has_joint_states": "joint_states" in record,
+                "proprioception_schema": proprioception_schema,
+                "state_dim": int(cached_state.shape[-1]),
+                "action_dim": int(cached_actions.shape[-1]),
+                "image_storage": image_storage if cache_image_slots else None,
             }
         )
         + "\n"
@@ -595,6 +639,8 @@ def precompute_split(
                         "joint_state",
                         "joint_states",
                         "joint_states_mask",
+                        "libero_native_state",
+                        "libero_native_actions",
                     ):
                         if key in batch:
                             batch[key] = batch[key][:keep]
@@ -657,6 +703,8 @@ def precompute_split(
                 image_jpeg_quality=args.image_jpeg_quality,
                 cache_image_slots=args.cache_image_slots,
                 save_padded_features=args.save_padded_features,
+                cache_proprioception_schema=args.cache_proprioception_schema,
+                image_storage=args.image_storage,
             )
             save_seconds = time.perf_counter() - save_start
             manifest.write(manifest_line)
@@ -824,7 +872,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-template", default=QWEN_TRAJECTORY_PROMPT_TEMPLATE)
     parser.add_argument("--device-map", default="auto")
 
-    parser.add_argument("--include-t5", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--include-t5",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Also encode and cache T5 XXL language tokens. Disabled by default; "
+            "instruction strings are always stored."
+        ),
+    )
     parser.add_argument(
         "--t5-model-id",
         default="/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v1_1-xxl",
@@ -846,6 +902,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--save-padded-features", action="store_true")
+    parser.add_argument(
+        "--cache-proprioception-schema",
+        choices=["rdt", "libero_native"],
+        default="rdt",
+        help=(
+            "Store the normal adapter tensors, or exact LIBERO-native 8D state "
+            "and 7D command tensors. libero_native is valid only for LIBERO."
+        ),
+    )
 
     parser.add_argument("--image-history-size", type=int, default=2)
     parser.add_argument("--max-images-per-sample", type=int, default=6)
@@ -857,6 +922,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--keep-no-image", action="store_true")
     parser.add_argument("--cache-image-slots", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--image-storage",
+        choices=["lossless_png", "raw_uint8"],
+        default="lossless_png",
+        help="Store pooled images as lossless PNG bytes or uncompressed uint8 HWC tensors.",
+    )
     return parser.parse_args()
 
 
@@ -888,15 +959,25 @@ def main() -> None:
                 "normalization so RDT targets stay in physical units."
             )
         normalize_actions = False
-
     print(f"Using latent-student extraction device: {device}")
-    print(f"Using transformers device_map for T5: {args.device_map}")
+    if args.include_t5:
+        print(f"Using transformers device_map for T5: {args.device_map}")
+    else:
+        print("T5 language embedding extraction is disabled; storing instruction text only")
 
     configs = build_lazy_configs(
         root=args.root.expanduser().resolve(),
         dataset_ids=args.dataset,
         max_episodes=args.max_episodes,
     )
+    if args.cache_proprioception_schema == "libero_native" and (
+        not configs
+        or any(config.dataset_id not in LIBERO_DATASET_IDS for config in configs)
+    ):
+        raise ValueError(
+            "--cache-proprioception-schema libero_native can only be used when "
+            "all selected datasets are LIBERO suites"
+        )
     if configs and all(config.dataset_id in LIBERO_DATASET_IDS for config in configs):
         if args.action_target_mode != "delta":
             raise ValueError(
@@ -951,8 +1032,17 @@ def main() -> None:
         "stage": args.stage,
         "normalize_actions": normalize_actions,
         "action_target_mode": args.action_target_mode,
-        "state_dim": cfg.model.state_dim,
-        "action_dim": cfg.model.action_dim,
+        "state_dim": (
+            8 if args.cache_proprioception_schema == "libero_native" else cfg.model.state_dim
+        ),
+        "action_dim": (
+            7 if args.cache_proprioception_schema == "libero_native" else cfg.model.action_dim
+        ),
+        "proprioception_schema": (
+            "libero_native_state8_action7_v1"
+            if args.cache_proprioception_schema == "libero_native"
+            else "rdt_encoded"
+        ),
         "state_encoder_layout": cfg.model.state_encoder_layout,
         "action_encoder_layout": cfg.model.action_encoder_layout,
         "gripper_processing": (
@@ -984,8 +1074,9 @@ def main() -> None:
         "cache_image_slots": args.cache_image_slots,
         "image_history_size": args.image_history_size,
         "max_images_per_sample": args.max_images_per_sample,
-        "image_storage_codec": "png",
+        "image_storage_codec": args.image_storage,
         "image_storage_lossless": True,
+        "image_storage_compressed": args.image_storage != "raw_uint8",
         "image_jpeg_quality": None,
         "cache_layout": "sample_shard",
         "batch_size": args.batch_size,

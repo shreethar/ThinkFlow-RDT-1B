@@ -1,8 +1,8 @@
-"""Streaming reader for the existing lossless LIBERO feature shards.
+"""Streaming reader for LIBERO feature shards.
 
 The reader intentionally lives outside ``thinkflow_rdt``. It consumes only the
-on-disk shard contract: 11D state, 10D action chunks, Qwen KV, instructions,
-and pooled lossless image bytes.
+on-disk shard contracts: native 8D/7D or legacy 11D/10D proprioception,
+Qwen KV, instructions, and pooled raw arrays or lossless image bytes.
 """
 
 from __future__ import annotations
@@ -89,12 +89,28 @@ def cached_action_to_libero_action(action_10d: Tensor | np.ndarray) -> Tensor:
 
 
 def add_native_libero_tensors(pack: dict) -> dict:
-    """Vectorize RDT-cache decoding once per loaded shard."""
+    """Expose native tensors, decoding legacy RDT caches once per shard."""
 
     if "_smolvla_state" not in pack:
-        pack["_smolvla_state"] = cached_state_to_libero_state(pack["state"])
+        state = torch.as_tensor(pack["state"], dtype=torch.float32)
+        if state.shape[-1] == 8:
+            pack["_smolvla_state"] = state
+        elif state.shape[-1] == 11:
+            pack["_smolvla_state"] = cached_state_to_libero_state(state)
+        else:
+            raise ValueError(
+                f"Expected cached state dimension 8 or 11, got {state.shape[-1]}"
+            )
     if "_smolvla_actions" not in pack:
-        pack["_smolvla_actions"] = cached_action_to_libero_action(pack["actions"])
+        actions = torch.as_tensor(pack["actions"], dtype=torch.float32)
+        if actions.shape[-1] == 7:
+            pack["_smolvla_actions"] = actions
+        elif actions.shape[-1] == 10:
+            pack["_smolvla_actions"] = cached_action_to_libero_action(actions)
+        else:
+            raise ValueError(
+                f"Expected cached action dimension 7 or 10, got {actions.shape[-1]}"
+            )
     return pack
 
 
@@ -112,6 +128,25 @@ def decode_rgb_image(encoded: bytes) -> Tensor:
     with Image.open(io.BytesIO(encoded)) as image:
         array = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)
     return torch.from_numpy(array).permute(2, 0, 1).float().div_(255.0)
+
+
+def cached_rgb_image(value: bytes | Tensor | np.ndarray) -> Tensor:
+    """Read either an encoded image or an uncompressed uint8 HWC/CHW array."""
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return decode_rgb_image(bytes(value))
+    image = torch.as_tensor(value)
+    if image.ndim != 3:
+        raise ValueError(
+            f"Expected cached RGB image with 3 dimensions, got {tuple(image.shape)}"
+        )
+    if image.shape[-1] == 3:
+        image = image.permute(2, 0, 1)
+    elif image.shape[0] != 3:
+        raise ValueError(f"Expected cached HWC or CHW RGB image, got {tuple(image.shape)}")
+    if image.dtype == torch.uint8:
+        return image.float().div_(255.0)
+    return image.float()
 
 
 def _pad_action_chunk(actions: Tensor, valid: Tensor, chunk_size: int) -> tuple[Tensor, Tensor]:
@@ -171,7 +206,10 @@ def sample_from_pack(
                 f"Required current camera slot {slot} is invalid for sample {sample_index}"
             )
         pool_index = int(indices[slot])
-        images.append(decode_rgb_image(pack["image_jpegs"][pool_index]))
+        image_pool = pack.get("image_arrays", pack.get("image_jpegs"))
+        if image_pool is None:
+            raise KeyError("Shard has neither image_arrays nor image_jpegs")
+        images.append(cached_rgb_image(image_pool[pool_index]))
 
     return {
         OBS_STATE: state,
