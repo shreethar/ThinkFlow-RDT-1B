@@ -264,22 +264,58 @@ class QwenKVSmolVLMWithExpertModel(SmolVLMWithExpertModel):
                     past_key_values = {}
                 # The Qwen token is not put in the static cache: its layer adapter is
                 # applied at every expert CA invocation and remains differentiable.
-                past_key_values[layer_idx] = {
-                    "key_states": key_states,
-                    "value_states": value_states,
-                }
+                if isinstance(past_key_values, dict):
+                    # Compatibility with older LeRobot releases.
+                    past_key_values[layer_idx] = {
+                        "key_states": key_states,
+                        "value_states": value_states,
+                    }
+                elif hasattr(past_key_values, "update"):
+                    # Newer LeRobot uses Transformers DynamicCache, whose stored
+                    # layout is [batch, heads, sequence, head_dim].
+                    past_key_values.update(
+                        key_states.transpose(1, 2),
+                        value_states.transpose(1, 2),
+                        layer_idx,
+                    )
+                else:
+                    raise TypeError(
+                        "Unsupported SmolVLA prefix cache type: "
+                        f"{type(past_key_values).__name__}"
+                    )
         else:
             if not use_cache or past_key_values is None:
                 raise RuntimeError(
                     "SmolVLA cross-attention received no prefix embeddings and no "
                     "prefix K/V cache"
                 )
-            if layer_idx not in past_key_values:
-                raise KeyError(
-                    f"Missing cached prefix K/V for cross-attention layer {layer_idx}"
+            if isinstance(past_key_values, dict):
+                if layer_idx not in past_key_values:
+                    raise KeyError(
+                        f"Missing cached prefix K/V for cross-attention layer {layer_idx}"
+                    )
+                key_states = past_key_values[layer_idx]["key_states"]
+                value_states = past_key_values[layer_idx]["value_states"]
+            elif hasattr(past_key_values, "layers"):
+                if layer_idx >= len(past_key_values.layers):
+                    raise KeyError(
+                        f"Missing DynamicCache layer {layer_idx}; "
+                        f"cache contains {len(past_key_values.layers)} layers"
+                    )
+                cached_layer = past_key_values.layers[layer_idx]
+                cached_keys = getattr(cached_layer, "keys", None)
+                cached_values = getattr(cached_layer, "values", None)
+                if cached_keys is None or cached_values is None:
+                    raise KeyError(
+                        f"DynamicCache layer {layer_idx} has no prefix K/V tensors"
+                    )
+                key_states = cached_keys.transpose(1, 2)
+                value_states = cached_values.transpose(1, 2)
+            else:
+                raise TypeError(
+                    "Unsupported SmolVLA prefix cache type: "
+                    f"{type(past_key_values).__name__}"
                 )
-            key_states = past_key_values[layer_idx]["key_states"]
-            value_states = past_key_values[layer_idx]["value_states"]
 
         expert_layer = model_layers[1][layer_idx]
         if expert_layer is None:
