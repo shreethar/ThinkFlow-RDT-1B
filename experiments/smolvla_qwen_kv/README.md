@@ -160,3 +160,15 @@ This is a model warm-start. The older experiment checkpoint's
 optimizer and scheduler cannot be resumed exactly by `lerobot-train`. New
 checkpoints produced by the integration use LeRobot's official layout and can
 subsequently be resumed with LeRobot's standard `--resume` workflow.
+
+For a completely fresh LIBERO run from `lerobot/smolvla_base`—without loading
+checkpoint-014000—run:
+
+```bash
+bash experiments/smolvla_qwen_kv/run_lerobot_cached_fresh.sh
+```
+
+The launcher first creates `outputs/smolvla_base_qwen_kv_init`: native SmolVLA
+weights come from the pretrained base while only the custom Qwen K/V adapters
+are newly initialized with seed 42. It then starts a new official LeRobot run
+at training step zero.

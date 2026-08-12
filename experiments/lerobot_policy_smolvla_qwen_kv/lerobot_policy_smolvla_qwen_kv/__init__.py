@@ -7,6 +7,7 @@ entrypoints discover it through ``register_third_party_plugins()``.
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 
@@ -23,6 +24,28 @@ from lerobot.processor import converters as _converters
 
 if "qwen_kv" not in _converters._COMPLEMENTARY_KEYS:
     _converters._COMPLEMENTARY_KEYS = (*_converters._COMPLEMENTARY_KEYS, "qwen_kv")
+
+
+def _disable_unused_broken_deepspeed_probe() -> None:
+    """Avoid importing an incompatible optional DeepSpeed during model unwrap.
+
+    Accelerate 1.14 checks whether the *package* is installed inside every
+    ``unwrap_model`` call and imports it even for an ordinary single-GPU run.
+    This environment has DeepSpeed 0.14.2, which cannot import against PyTorch
+    2.10 because it references the removed ``_get_socket_with_port`` symbol.
+    The custom run does not request DeepSpeed, so report it unavailable only to
+    that optional unwrap probe.  An explicitly requested DeepSpeed run still
+    gets the real import/error rather than being silently changed.
+    """
+
+    if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false").lower() == "true":
+        return
+    import accelerate.utils.other as accelerate_other
+
+    accelerate_other.is_deepspeed_available = lambda: False
+
+
+_disable_unused_broken_deepspeed_probe()
 
 
 def _install_cached_dataset_factory() -> None:
