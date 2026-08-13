@@ -145,6 +145,34 @@ def camera_mapping(config: KVSmolVLAConfig) -> dict[str, str] | None:
     return None
 
 
+def resolve_model_reference(value: str) -> str:
+    """Resolve local model paths recorded relative to an extraction workspace.
+
+    Some cache metadata was produced with values such as
+    ``model/model/stage1_unsloth`` even though the remote workspace stores the
+    model at ``/workspace/model/stage1_unsloth``. If no local candidate exists,
+    preserve the value unchanged so normal Hugging Face repository IDs continue
+    to work.
+    """
+
+    raw = Path(value).expanduser()
+    candidates = [raw]
+    if not raw.is_absolute():
+        candidates.extend((Path.cwd() / raw, REPO_ROOT / raw, REPO_ROOT.parent / raw))
+        parts = raw.parts
+        if len(parts) >= 3 and parts[:2] == ("model", "model"):
+            candidates.append(REPO_ROOT.parent / "model" / Path(*parts[2:]))
+        elif parts and parts[0] == "model":
+            candidates.append(REPO_ROOT.parent / raw)
+    for candidate in candidates:
+        if candidate.exists():
+            resolved = str(candidate.resolve())
+            if resolved != value:
+                print(f"Resolved model reference {value!r} -> {resolved!r}")
+            return resolved
+    return value
+
+
 class LiveKVPreprocessor:
     """Add live Qwen K/V before the saved policy processor runs."""
 
@@ -219,8 +247,12 @@ def make_live_extractor(
                 f"Metadata has {spatial_count} spatial tokens; checkpoint expects "
                 f"{config.external_kv_token_count}"
             )
-        student_id = args.qwen_model_id or metadata["student_model_id"]
-        processor_id = args.qwen_processor_id or metadata.get("processor_id", student_id)
+        student_id = resolve_model_reference(
+            args.qwen_model_id or metadata["student_model_id"]
+        )
+        processor_id = resolve_model_reference(
+            args.qwen_processor_id or metadata.get("processor_id", student_id)
+        )
         student_args = argparse.Namespace(
             student_model_id=student_id,
             processor_id=processor_id,
@@ -257,8 +289,10 @@ def make_live_extractor(
 
         return extract
 
-    model_id = args.qwen_model_id or metadata["qwen_model_id"]
-    processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", model_id)
+    model_id = resolve_model_reference(args.qwen_model_id or metadata["qwen_model_id"])
+    processor_id = resolve_model_reference(
+        args.qwen_processor_id or metadata.get("qwen_processor_id", model_id)
+    )
     processor = AutoProcessor.from_pretrained(
         processor_id,
         local_files_only=args.local_files_only,
