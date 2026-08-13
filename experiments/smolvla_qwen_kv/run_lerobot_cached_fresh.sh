@@ -38,8 +38,10 @@ fi
 PYTHON="$SMOLVLA_VENV/bin/python"
 LEROBOT_TRAIN="$SMOLVLA_VENV/bin/lerobot-train"
 
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
+# Respect caller-provided online/offline settings. The bootstrap needs Hub
+# access on a fresh machine, while subsequent runs can opt into offline mode.
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-$HF_HUB_OFFLINE}
 export ACCELERATE_USE_DEEPSPEED=false
 export SMOLVLA_QWEN_EVAL_ENABLE=true
 export SMOLVLA_QWEN_EVAL_LIBERO_ROOT="$LIBERO_ROOT"
@@ -86,6 +88,11 @@ NUM_WORKERS=${NUM_WORKERS:-8}
 SAVE_FREQ=${SAVE_FREQ:-1000}
 ENV_EVAL_FREQ=${ENV_EVAL_FREQ:-5000}
 
+LOCAL_FILES_ARGS=()
+case "${HF_HUB_OFFLINE,,}" in
+  1|true|yes|on) LOCAL_FILES_ARGS+=(--local-files-only) ;;
+esac
+
 # Build the custom policy once from native lerobot/smolvla_base. This does not
 # load checkpoint-014000 or any prior LIBERO fine-tuning.
 if [[ ! -f "$BOOTSTRAP_DIR/model.safetensors" ]]; then
@@ -97,7 +104,7 @@ if [[ ! -f "$BOOTSTRAP_DIR/model.safetensors" ]]; then
     --external-kv-token-count "$QWEN_TOKEN_COUNT" \
     --device cpu \
     --seed 42 \
-    --local-files-only
+    "${LOCAL_FILES_ARGS[@]}"
 fi
 
 exec "$LEROBOT_TRAIN" \
