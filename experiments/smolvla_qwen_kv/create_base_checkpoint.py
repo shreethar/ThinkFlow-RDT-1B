@@ -24,7 +24,12 @@ import torch
 from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
 from .configuration import make_libero_kv_config
+from .cached_libero import list_shards
 from .modeling import KVSmolVLAPolicy
+from .stats import load_or_compute_cache_stats
+
+
+LIBERO_SUITES = ("libero_10", "libero_spatial", "libero_goal", "libero_object")
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +41,13 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs/smolvla_base_qwen_kv_init"),
     )
     parser.add_argument(
+        "--cache-root",
+        type=Path,
+        default=None,
+        help="Compute --stats from these cached suites when the stats file does not exist.",
+    )
+    parser.add_argument("--suites", nargs="+", choices=LIBERO_SUITES, default=list(LIBERO_SUITES))
+    parser.add_argument(
         "--stats",
         type=Path,
         default=Path("outputs/smolvla_base_qwen_kv_all_suites/cache_stats.pt"),
@@ -46,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=50)
     parser.add_argument("--n-action-steps", type=int, default=4)
     parser.add_argument("--external-logit-bias-init", type=float, default=-4.0)
+    parser.add_argument("--external-kv-token-count", type=int, choices=[1, 5], default=1)
     parser.add_argument("--local-files-only", action="store_true")
     return parser.parse_args()
 
@@ -59,9 +72,22 @@ def main() -> None:
             f"Refusing to overwrite non-empty bootstrap directory: {output_dir}"
         )
     if not stats_path.exists():
-        raise FileNotFoundError(
-            f"Missing cache statistics {stats_path}. Run cache statistics/training once, "
-            "or pass --stats to a compatible state8/action7 cache_stats.pt."
+        if args.cache_root is None:
+            raise FileNotFoundError(
+                f"Missing cache statistics {stats_path}. Pass --cache-root to compute "
+                "them from native state8/action7 shards."
+            )
+        cache_root = args.cache_root.expanduser().resolve()
+        shard_paths = [
+            path
+            for suite in args.suites
+            for path in list_shards(cache_root, suite, split="train")
+        ]
+        print(f"Computing native LIBERO statistics from {len(shard_paths)} shards")
+        load_or_compute_cache_stats(
+            stats_path,
+            shard_paths,
+            chunk_size=args.chunk_size,
         )
 
     random.seed(args.seed)
@@ -83,6 +109,7 @@ def main() -> None:
         train_expert_only=True,
         freeze_vision_encoder=True,
         external_kv_logit_bias_init=args.external_logit_bias_init,
+        external_kv_token_count=args.external_kv_token_count,
         local_files_only=args.local_files_only,
     )
     print(f"Loading native SmolVLA weights from {args.base}")
@@ -111,6 +138,7 @@ def main() -> None:
         "state_dim": 8,
         "action_dim": 7,
         "external_kv_width": config.external_kv_width,
+        "external_kv_token_count": config.external_kv_token_count,
         "initialization": {
             "native_smolvla": "pretrained base weights",
             "external_qwen_kv_adapters": "new seeded initialization",

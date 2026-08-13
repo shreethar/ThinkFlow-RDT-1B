@@ -83,5 +83,6 @@ def make_cached_train_eval_datasets(cfg):
         seed=cfg.seed if cfg.seed is not None else 0,
         repeat=True,
         approximate_episodes=approximate_episodes,
+        expected_qwen_tokens=int(cfg.trainable_config.external_kv_token_count),
     )
     return dataset, None

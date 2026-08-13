@@ -127,9 +127,7 @@ def _run_periodic_qwen_rollout(
             )
     task_ids = [int(value) for value in _comma_values("SMOLVLA_QWEN_EVAL_TASK_IDS", "0")]
     max_steps_value = os.environ.get("SMOLVLA_QWEN_EVAL_MAX_STEPS")
-    qwen_model_id = os.environ.get(
-        "SMOLVLA_QWEN_EVAL_QWEN_MODEL", "shreethar/stage1_unsloth"
-    )
+    qwen_model_id = os.environ.get("SMOLVLA_QWEN_EVAL_QWEN_MODEL")
     args = argparse.Namespace(
         checkpoint=checkpoint_dir / "pretrained_model" / "train_config.json",
         cache_root=Path(cfg.dataset.root),
@@ -151,10 +149,25 @@ def _run_periodic_qwen_rollout(
         qwen_device_map=os.environ.get("SMOLVLA_QWEN_EVAL_QWEN_DEVICE_MAP", "cuda"),
         qwen_model_id=qwen_model_id,
         qwen_processor_id=os.environ.get(
-            "SMOLVLA_QWEN_EVAL_QWEN_PROCESSOR", qwen_model_id
+            "SMOLVLA_QWEN_EVAL_QWEN_PROCESSOR"
         ),
         qwen_max_new_tokens=int(
             os.environ.get("SMOLVLA_QWEN_EVAL_QWEN_MAX_NEW_TOKENS", "128")
+        ),
+        latent_student_code_dir=(
+            Path(os.environ["SMOLVLA_QWEN_EVAL_LATENT_STUDENT_CODE_DIR"])
+            if os.environ.get("SMOLVLA_QWEN_EVAL_LATENT_STUDENT_CODE_DIR")
+            else None
+        ),
+        spatial_parameters_path=(
+            Path(os.environ["SMOLVLA_QWEN_EVAL_SPATIAL_PARAMETERS_PATH"])
+            if os.environ.get("SMOLVLA_QWEN_EVAL_SPATIAL_PARAMETERS_PATH")
+            else None
+        ),
+        latent_count=(
+            int(os.environ["SMOLVLA_QWEN_EVAL_LATENT_COUNT"])
+            if os.environ.get("SMOLVLA_QWEN_EVAL_LATENT_COUNT")
+            else None
         ),
         save_videos=_env_bool("SMOLVLA_QWEN_EVAL_SAVE_VIDEOS", True),
         video_resolution=int(os.environ.get("SMOLVLA_QWEN_EVAL_VIDEO_RESOLUTION", "512")),

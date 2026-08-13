@@ -172,6 +172,7 @@ def sample_from_pack(
     *,
     chunk_size: int,
     camera_slots: Sequence[int] = (3, 4),
+    expected_qwen_tokens: int | None = None,
 ) -> dict:
     """Materialize one SmolVLA training example from a loaded cache shard.
 
@@ -184,6 +185,10 @@ def sample_from_pack(
         qwen_kv = qwen_kv.unsqueeze(0)
     if qwen_kv.ndim != 2 or qwen_kv.shape[-1] != 2048:
         raise ValueError(f"Expected cached Qwen KV [T,2048], got {tuple(qwen_kv.shape)}")
+    if expected_qwen_tokens is not None and qwen_kv.shape[0] != expected_qwen_tokens:
+        raise ValueError(
+            f"Expected {expected_qwen_tokens} cached Qwen KV tokens, got {qwen_kv.shape[0]}"
+        )
 
     add_native_libero_tensors(pack)
     state = torch.as_tensor(pack["_smolvla_state"], dtype=torch.float32)[sample_index]
@@ -239,6 +244,7 @@ class CachedLiberoIterableDataset(IterableDataset):
         seed: int = 42,
         repeat: bool = True,
         camera_slots: Sequence[int] = (3, 4),
+        expected_qwen_tokens: int | None = None,
     ) -> None:
         super().__init__()
         self.shard_paths = tuple(Path(path) for path in shard_paths)
@@ -248,6 +254,9 @@ class CachedLiberoIterableDataset(IterableDataset):
         self.seed = int(seed)
         self.repeat = bool(repeat)
         self.camera_slots = tuple(int(slot) for slot in camera_slots)
+        if expected_qwen_tokens is not None and expected_qwen_tokens <= 0:
+            raise ValueError("expected_qwen_tokens must be positive")
+        self.expected_qwen_tokens = expected_qwen_tokens
 
     def __iter__(self) -> Iterator[dict]:
         worker = get_worker_info()
@@ -273,6 +282,7 @@ class CachedLiberoIterableDataset(IterableDataset):
                         sample_index,
                         chunk_size=self.chunk_size,
                         camera_slots=self.camera_slots,
+                        expected_qwen_tokens=self.expected_qwen_tokens,
                     )
                 del pack
             epoch += 1
@@ -357,12 +367,14 @@ class LeRobotCachedLiberoDataset(CachedLiberoIterableDataset):
         seed: int = 42,
         repeat: bool = True,
         approximate_episodes: int = 0,
+        expected_qwen_tokens: int | None = None,
     ) -> None:
         super().__init__(
             shard_paths,
             chunk_size=chunk_size,
             seed=seed,
             repeat=repeat,
+            expected_qwen_tokens=expected_qwen_tokens,
         )
         self.num_frames = int(num_samples)
         self.num_episodes = int(approximate_episodes)

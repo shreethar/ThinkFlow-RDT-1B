@@ -13,7 +13,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 @PreTrainedConfig.register_subclass("smolvla_qwen_kv")
 @dataclass
 class KVSmolVLAConfig(SmolVLAConfig):
-    """SmolVLA configuration extended with one `[K | V]` conditioning tensor.
+    """SmolVLA configuration extended with a `[K | V]` conditioning sequence.
 
     The input tensor is expected to have shape ``[B, T_kv, external_kv_width]``.
     Its last dimension is divided equally into the source key and source value.
@@ -23,6 +23,7 @@ class KVSmolVLAConfig(SmolVLAConfig):
 
     external_kv_key: str = "qwen_kv"
     external_kv_width: int = 2048
+    external_kv_token_count: int = 1
     external_kv_required: bool = True
     external_kv_logit_bias_init: float = -4.0
 
@@ -32,6 +33,8 @@ class KVSmolVLAConfig(SmolVLAConfig):
             raise ValueError(
                 "external_kv_width must be a positive even number containing equal K and V halves"
             )
+        if self.external_kv_token_count <= 0:
+            raise ValueError("external_kv_token_count must be positive")
         if "cross" not in self.attention_mode:
             raise ValueError("Qwen KV injection requires a SmolVLA cross-attention mode")
 
@@ -70,6 +73,7 @@ def make_libero_kv_config(
     train_expert_only: bool = True,
     freeze_vision_encoder: bool = True,
     external_kv_logit_bias_init: float = -4.0,
+    external_kv_token_count: int = 1,
     local_files_only: bool = False,
 ) -> KVSmolVLAConfig:
     """Build a cache-compatible config while retaining pretrained architecture settings.
@@ -112,6 +116,7 @@ def make_libero_kv_config(
         train_expert_only=train_expert_only,
         freeze_vision_encoder=freeze_vision_encoder,
         external_kv_logit_bias_init=external_kv_logit_bias_init,
+        external_kv_token_count=external_kv_token_count,
         # The complete policy checkpoint is loaded immediately after construction.
         # Avoid separately downloading/loading another copy of the VLM weights first.
         load_vlm_weights=False,

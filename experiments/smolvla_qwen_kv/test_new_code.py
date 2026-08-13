@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 from .cached_libero import (
@@ -11,7 +14,7 @@ from .cached_libero import (
     cached_action_to_libero_action,
     cached_state_to_libero_state,
 )
-from .modeling import eager_grouped_query_attention
+from .modeling import KVSmolVLAPolicy, eager_grouped_query_attention
 
 
 def test_grouped_query_attention_shape_and_finiteness() -> None:
@@ -65,6 +68,36 @@ def test_single_replacement_token_would_make_key_irrelevant() -> None:
     first = eager_grouped_query_attention(mask, query, key, value)
     second = eager_grouped_query_attention(mask, query * 100, key * -100, value)
     assert torch.allclose(first, second)
+
+
+def test_policy_accepts_initialized_external_token_count() -> None:
+    policy = SimpleNamespace(
+        config=SimpleNamespace(
+            external_kv_key="qwen_kv",
+            external_kv_required=True,
+            external_kv_width=2048,
+            external_kv_token_count=5,
+        )
+    )
+    external = torch.zeros(2, 5, 2048)
+    result = KVSmolVLAPolicy._external_kv_from_batch(policy, {"qwen_kv": external})
+    assert result is external
+
+
+def test_policy_rejects_cache_from_other_external_token_count() -> None:
+    policy = SimpleNamespace(
+        config=SimpleNamespace(
+            external_kv_key="qwen_kv",
+            external_kv_required=True,
+            external_kv_width=2048,
+            external_kv_token_count=5,
+        )
+    )
+    with pytest.raises(ValueError, match="Expected 5 Qwen KV tokens"):
+        KVSmolVLAPolicy._external_kv_from_batch(
+            policy,
+            {"qwen_kv": torch.zeros(2, 1, 2048)},
+        )
 
 
 def test_action_chunk_padding_and_validity() -> None:

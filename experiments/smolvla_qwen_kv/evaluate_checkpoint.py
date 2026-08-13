@@ -40,7 +40,15 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.utils.import_utils import register_third_party_plugins
 
-from precompute_all_features import extract_qwen_kv, standardized_collate_fn
+from precompute_all_features import (
+    QWEN_TRAJECTORY_PROMPT_TEMPLATE,
+    extract_qwen_kv,
+    standardized_collate_fn,
+)
+from precompute_latent_student_kv import (
+    extract_latent_student_spatial_kv,
+    load_student_and_processor,
+)
 from rollout_libero_rdt import (
     frame_for_video,
     install_robosuite_mujoco_compatibility,
@@ -103,6 +111,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen-model-id", default=None)
     parser.add_argument("--qwen-processor-id", default=None)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
+    parser.add_argument("--latent-student-code-dir", type=Path, default=None)
+    parser.add_argument("--spatial-parameters-path", type=Path, default=None)
+    parser.add_argument("--latent-count", type=int, default=None)
     parser.add_argument("--save-videos", action="store_true")
     parser.add_argument("--video-resolution", type=int, default=512)
     parser.add_argument("--video-fps", type=int, default=20)
@@ -298,14 +309,26 @@ def run_evaluation(
 
     metadata_by_suite = {suite: load_suite_metadata(cache_root, suite) for suite in args.suites}
     first_metadata = metadata_by_suite[args.suites[0]]
+    is_latent_student = config.external_kv_token_count > 1
     provenance_fields = (
-        "qwen_model_id",
-        "qwen_processor_id",
-        "qwen_layer_index",
-        "qwen_stop_at_think",
-        "qwen_enable_thinking",
-        "qwen_trajectory_prompt_template",
-        "qwen_image_source",
+        (
+            "student_model_id",
+            "processor_id",
+            "spatial_token_count",
+            "layer_index",
+            "latent_count",
+            "prompt_template",
+        )
+        if is_latent_student
+        else (
+            "qwen_model_id",
+            "qwen_processor_id",
+            "qwen_layer_index",
+            "qwen_stop_at_think",
+            "qwen_enable_thinking",
+            "qwen_trajectory_prompt_template",
+            "qwen_image_source",
+        )
     )
     for suite, metadata in metadata_by_suite.items():
         mismatched = [
@@ -313,24 +336,53 @@ def run_evaluation(
         ]
         if mismatched:
             raise ValueError(f"Qwen cache provenance differs for {suite}: {mismatched}")
-    qwen_id = args.qwen_model_id or first_metadata["qwen_model_id"]
-    qwen_processor_id = args.qwen_processor_id or first_metadata.get("qwen_processor_id", qwen_id)
-    print(
-        f"Loading Qwen extractor {qwen_id} at layer {first_metadata['qwen_layer_index']} "
-        f"(image_source={first_metadata.get('qwen_image_source')})"
-    )
-    qwen_processor = AutoProcessor.from_pretrained(
-        qwen_processor_id,
-        local_files_only=args.local_files_only,
-    )
-    qwen_processor.tokenizer.padding_side = "left"
-    qwen = AutoModelForImageTextToText.from_pretrained(
-        qwen_id,
-        torch_dtype=torch.bfloat16,
-        device_map=args.qwen_device_map,
-        attn_implementation="sdpa",
-        local_files_only=args.local_files_only,
-    ).eval()
+    if is_latent_student:
+        student_id = args.qwen_model_id or first_metadata["student_model_id"]
+        processor_id = args.qwen_processor_id or first_metadata.get("processor_id", student_id)
+        spatial_token_count = int(first_metadata.get("spatial_token_count", 5))
+        if spatial_token_count != config.external_kv_token_count:
+            raise ValueError(
+                f"Cache metadata has {spatial_token_count} spatial tokens but checkpoint "
+                f"expects {config.external_kv_token_count}"
+            )
+        student_args = argparse.Namespace(
+            student_model_id=student_id,
+            processor_id=processor_id,
+            latent_student_code_dir=args.latent_student_code_dir,
+            spatial_parameters_path=args.spatial_parameters_path,
+            latent_count=(
+                args.latent_count
+                if args.latent_count is not None
+                else int(first_metadata.get("latent_count", 6))
+            ),
+            spatial_token_count=spatial_token_count,
+        )
+        print(
+            f"Loading LatentStudent extractor {student_id} at layer "
+            f"{first_metadata['layer_index']} with {spatial_token_count} spatial tokens"
+        )
+        qwen, qwen_processor = load_student_and_processor(student_args, device)
+    else:
+        qwen_id = args.qwen_model_id or first_metadata["qwen_model_id"]
+        qwen_processor_id = args.qwen_processor_id or first_metadata.get(
+            "qwen_processor_id", qwen_id
+        )
+        print(
+            f"Loading Qwen extractor {qwen_id} at layer {first_metadata['qwen_layer_index']} "
+            f"(image_source={first_metadata.get('qwen_image_source')})"
+        )
+        qwen_processor = AutoProcessor.from_pretrained(
+            qwen_processor_id,
+            local_files_only=args.local_files_only,
+        )
+        qwen_processor.tokenizer.padding_side = "left"
+        qwen = AutoModelForImageTextToText.from_pretrained(
+            qwen_id,
+            torch_dtype=torch.bfloat16,
+            device_map=args.qwen_device_map,
+            attn_implementation="sdpa",
+            local_files_only=args.local_files_only,
+        ).eval()
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -430,18 +482,39 @@ def run_evaluation(
                         )
                         if encoded is None:
                             raise RuntimeError("No rollout samples remained after image collation")
-                        qwen_kv = extract_qwen_kv(
-                            encoded,
-                            qwen_processor,
-                            qwen,
-                            device=device,
-                            layer_index=int(metadata["qwen_layer_index"]),
-                            max_new_tokens=args.qwen_max_new_tokens,
-                            expected_dim=config.external_kv_width,
-                            stop_at_think_end=bool(metadata.get("qwen_stop_at_think", True)),
-                            prompt_template=metadata.get("qwen_trajectory_prompt_template"),
-                            enable_thinking=bool(metadata.get("qwen_enable_thinking", False)),
-                        )
+                        if is_latent_student:
+                            qwen_kv, _ = extract_latent_student_spatial_kv(
+                                encoded,
+                                student=qwen,
+                                processor=qwen_processor,
+                                device=device,
+                                layer_index=int(metadata["layer_index"]),
+                                expected_dim=config.external_kv_width,
+                                spatial_token_count=config.external_kv_token_count,
+                                prompt_template=metadata.get(
+                                    "prompt_template",
+                                    QWEN_TRAJECTORY_PROMPT_TEMPLATE,
+                                ),
+                            )
+                        else:
+                            qwen_kv = extract_qwen_kv(
+                                encoded,
+                                qwen_processor,
+                                qwen,
+                                device=device,
+                                layer_index=int(metadata["qwen_layer_index"]),
+                                max_new_tokens=args.qwen_max_new_tokens,
+                                expected_dim=config.external_kv_width,
+                                stop_at_think_end=bool(
+                                    metadata.get("qwen_stop_at_think", True)
+                                ),
+                                prompt_template=metadata.get(
+                                    "qwen_trajectory_prompt_template"
+                                ),
+                                enable_thinking=bool(
+                                    metadata.get("qwen_enable_thinking", False)
+                                ),
+                            )
 
                         raw_batch = {
                             "observation.state": cached_state_to_libero_state(encoded["state"]),

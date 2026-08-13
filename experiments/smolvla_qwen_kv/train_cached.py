@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--external-logit-bias-init", type=float, default=-4.0)
+    parser.add_argument("--external-kv-token-count", type=int, choices=[1, 5], default=1)
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-name", default=None)
@@ -187,6 +188,7 @@ def main() -> None:
         train_expert_only=not args.train_vlm,
         freeze_vision_encoder=not args.train_vlm,
         external_kv_logit_bias_init=args.external_logit_bias_init,
+        external_kv_token_count=args.external_kv_token_count,
         local_files_only=args.local_files_only,
     )
     policy = KVSmolVLAPolicy.from_pretrained(
@@ -203,6 +205,7 @@ def main() -> None:
         chunk_size=args.chunk_size,
         seed=args.seed,
         repeat=True,
+        expected_qwen_tokens=args.external_kv_token_count,
     )
     loader = DataLoader(
         dataset,

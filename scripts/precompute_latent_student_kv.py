@@ -1068,6 +1068,7 @@ def main() -> None:
         "latent_count": args.latent_count,
         "spatial_token_count": args.spatial_token_count,
         "layer_index": args.layer_index,
+        "prompt_template": args.prompt_template,
         "qwen_kv_dim": cfg.model.qwen_kv_dim,
         "include_t5": args.include_t5,
         "t5_precision": args.t5_precision,

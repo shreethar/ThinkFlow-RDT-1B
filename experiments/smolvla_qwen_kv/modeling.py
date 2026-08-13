@@ -1,6 +1,6 @@
 """Qwen-KV-conditioned SmolVLA without patching the upstream LeRobot package.
 
-The custom token is appended to the VLM-derived source K/V in each Action Expert
+The custom tokens are appended to the VLM-derived source K/V in each Action Expert
 cross-attention layer. It is deliberately not a replacement for the VLM source:
 with only one replacement key, softmax attention would always equal one and the
 query/key interaction would be mathematically inert.
@@ -110,13 +110,17 @@ class QwenKVSmolVLMWithExpertModel(SmolVLMWithExpertModel):
         self,
         *args,
         external_kv_width: int = 2048,
+        external_kv_token_count: int = 1,
         external_kv_logit_bias_init: float = -4.0,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         if external_kv_width <= 0 or external_kv_width % 2:
             raise ValueError("external_kv_width must be positive and even")
+        if external_kv_token_count <= 0:
+            raise ValueError("external_kv_token_count must be positive")
         self.external_kv_width = external_kv_width
+        self.external_kv_token_count = external_kv_token_count
         self.external_half_width = external_kv_width // 2
         self._active_external_kv: Tensor | None = None
 
@@ -187,6 +191,11 @@ class QwenKVSmolVLMWithExpertModel(SmolVLMWithExpertModel):
                 f"Expected external KV [B,T,{self.external_kv_width}] with B={batch_size}, "
                 f"got {tuple(external.shape)}"
             )
+        if external.shape[1] != self.external_kv_token_count:
+            raise ValueError(
+                f"Expected {self.external_kv_token_count} external KV tokens, "
+                f"got {external.shape[1]}"
+            )
 
         key_input, value_input = external.split(self.external_half_width, dim=-1)
         key_projection = self.external_key_projections[str(layer_idx)]
@@ -223,7 +232,6 @@ class QwenKVSmolVLMWithExpertModel(SmolVLMWithExpertModel):
                 f"Unexpected inputs/cache combination: inputs={len(inputs_embeds)}, "
                 f"past_key_values={past_key_values is not None}"
             )
-
         # SmolVLA prefill supplies [prefix_embeds, None]. Flow-matching denoise
         # calls then supply [None, suffix_embeds] and reuse the prefix K/V. Use
         # the actual prefix tensor as the phase signal: ``past_key_values`` is a
@@ -432,6 +440,7 @@ class QwenKVVLAFlowMatching(VLAFlowMatching):
             expert_width_multiplier=config.expert_width_multiplier,
             device=config.device if config.device is not None else "auto",
             external_kv_width=config.external_kv_width,
+            external_kv_token_count=config.external_kv_token_count,
             external_kv_logit_bias_init=config.external_kv_logit_bias_init,
         )
         self.state_proj = nn.Linear(
@@ -494,6 +503,11 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
             raise ValueError(
                 f"Expected {self.config.external_kv_key} [B,T,{self.config.external_kv_width}], "
                 f"got {tuple(external.shape)}"
+            )
+        if external.shape[1] != self.config.external_kv_token_count:
+            raise ValueError(
+                f"Expected {self.config.external_kv_token_count} Qwen KV tokens for this "
+                f"checkpoint, got {external.shape[1]}"
             )
         return external
 
