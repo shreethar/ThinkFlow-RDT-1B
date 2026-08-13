@@ -170,6 +170,9 @@ def _run_periodic_qwen_rollout(
             if os.environ.get("SMOLVLA_QWEN_EVAL_LATENT_COUNT")
             else None
         ),
+        latent_student_attn_implementation=os.environ.get(
+            "SMOLVLA_QWEN_EVAL_LATENT_ATTN_IMPLEMENTATION", "sdpa"
+        ),
         save_videos=_env_bool("SMOLVLA_QWEN_EVAL_SAVE_VIDEOS", True),
         video_resolution=int(os.environ.get("SMOLVLA_QWEN_EVAL_VIDEO_RESOLUTION", "512")),
         video_fps=int(os.environ.get("SMOLVLA_QWEN_EVAL_VIDEO_FPS", "20")),

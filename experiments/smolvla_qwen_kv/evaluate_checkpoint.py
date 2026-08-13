@@ -114,6 +114,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-student-code-dir", type=Path, default=None)
     parser.add_argument("--spatial-parameters-path", type=Path, default=None)
     parser.add_argument("--latent-count", type=int, default=None)
+    parser.add_argument(
+        "--latent-student-attn-implementation",
+        choices=["eager", "sdpa", "flash_attention_2"],
+        default="sdpa",
+        help="Attention backend used only while loading LatentStudent for live rollout.",
+    )
     parser.add_argument("--save-videos", action="store_true")
     parser.add_argument("--video-resolution", type=int, default=512)
     parser.add_argument("--video-fps", type=int, default=20)
@@ -356,6 +362,7 @@ def run_evaluation(
                 else int(first_metadata.get("latent_count", 6))
             ),
             spatial_token_count=spatial_token_count,
+            attn_implementation=args.latent_student_attn_implementation,
         )
         print(
             f"Loading LatentStudent extractor {student_id} at layer "

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import shutil
@@ -14,7 +15,12 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoProcessor, T5EncoderModel, T5Tokenizer
+from transformers import (
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    T5EncoderModel,
+    T5Tokenizer,
+)
 import numpy as np
 
 
@@ -106,6 +112,29 @@ def load_local_spatial_parameters_if_present(student: Any, model_id: str) -> Non
             return
 
 
+@contextmanager
+def override_image_text_attention(implementation: str | None):
+    """Temporarily override nested VLM loading for rollout-only compatibility."""
+
+    if implementation is None:
+        yield
+        return
+    original = AutoModelForImageTextToText.from_pretrained
+
+    def from_pretrained(*model_args: Any, **model_kwargs: Any):
+        # LatentStudent checkpoints can serialize flash_attention_2 in their
+        # base config. Simulation environments need not compile FlashAttention,
+        # so explicitly override that saved preference with SDPA when requested.
+        model_kwargs["attn_implementation"] = implementation
+        return original(*model_args, **model_kwargs)
+
+    AutoModelForImageTextToText.from_pretrained = from_pretrained
+    try:
+        yield
+    finally:
+        AutoModelForImageTextToText.from_pretrained = original
+
+
 def load_student_and_processor(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any]:
     processor_id = args.processor_id or args.student_model_id
     processor = AutoProcessor.from_pretrained(processor_id, trust_remote_code=True)
@@ -114,12 +143,13 @@ def load_student_and_processor(args: argparse.Namespace, device: torch.device) -
     end_think_id = tokenizer_end_think_id(processor.tokenizer)
 
     LatentStudent = import_latent_student(args.latent_student_code_dir)
-    student = LatentStudent.from_pretrained(
-        args.student_model_id,
-        end_think_token_id=end_think_id,
-        M=args.latent_count,
-        K=args.spatial_token_count,
-    )
+    with override_image_text_attention(getattr(args, "attn_implementation", None)):
+        student = LatentStudent.from_pretrained(
+            args.student_model_id,
+            end_think_token_id=end_think_id,
+            M=args.latent_count,
+            K=args.spatial_token_count,
+        )
     if args.spatial_parameters_path is not None:
         load_spatial_parameters(student, args.spatial_parameters_path)
     else:
