@@ -8,7 +8,7 @@ set -euo pipefail
 # Reference: https://huggingface.co/docs/lerobot/main/en/libero#evaluation
 
 VENV=${VENV:-.venv-smolvla}
-POLICY=${POLICY:-lerobot/smolvla_libero}
+POLICY=${POLICY:-HuggingFaceVLA/smolvla_libero}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/original_smolvla_libero_eval}
 SUITES=${SUITES:-libero_spatial,libero_object,libero_goal,libero_10}
 EPISODES=${EPISODES:-10}
