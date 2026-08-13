@@ -21,6 +21,7 @@ if "--local-files-only" in sys.argv:
 
 import numpy as np
 import torch
+from lerobot.configs import PreTrainedConfig
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
@@ -57,7 +58,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--chunk-size", type=int, default=50)
-    parser.add_argument("--n-action-steps", type=int, default=4)
+    parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=None,
+        help=(
+            "Actions executed per re-plan. Defaults to 4 for cache training, or "
+            "preserves the source checkpoint when --preserve-base-processors is set."
+        ),
+    )
     parser.add_argument("--external-logit-bias-init", type=float, default=-4.0)
     parser.add_argument("--external-kv-token-count", type=int, choices=[1, 5], default=1)
     parser.add_argument(
@@ -118,13 +127,34 @@ def main() -> None:
             raise ValueError(f"Incompatible statistics schema in {stats_path}")
         stats = payload["stats"]
 
+    source_config = PreTrainedConfig.from_pretrained(
+        args.base,
+        local_files_only=args.local_files_only,
+    )
+    n_action_steps = (
+        args.n_action_steps
+        if args.n_action_steps is not None
+        else (
+            int(source_config.n_action_steps)
+            if args.preserve_base_processors
+            else 4
+        )
+    )
     config = make_libero_kv_config(
         args.base,
         device=args.device,
         chunk_size=args.chunk_size,
-        n_action_steps=args.n_action_steps,
-        train_expert_only=True,
-        freeze_vision_encoder=True,
+        n_action_steps=n_action_steps,
+        train_expert_only=(
+            bool(source_config.train_expert_only)
+            if args.preserve_base_processors
+            else True
+        ),
+        freeze_vision_encoder=(
+            bool(source_config.freeze_vision_encoder)
+            if args.preserve_base_processors
+            else True
+        ),
         external_kv_logit_bias_init=args.external_logit_bias_init,
         external_kv_token_count=args.external_kv_token_count,
         external_kv_required=not args.external_kv_optional,
@@ -167,8 +197,16 @@ def main() -> None:
         "processor_source": args.base if args.preserve_base_processors else "cache_stats",
         "samples_in_stats": int(payload.get("num_samples", 0)) if payload else 0,
         "policy_type": config.type,
-        "state_dim": 8,
-        "action_dim": 7,
+        "input_features": {
+            key: {"type": value.type.value, "shape": list(value.shape)}
+            for key, value in config.input_features.items()
+        },
+        "output_features": {
+            key: {"type": value.type.value, "shape": list(value.shape)}
+            for key, value in config.output_features.items()
+        },
+        "chunk_size": config.chunk_size,
+        "n_action_steps": config.n_action_steps,
         "external_kv_width": config.external_kv_width,
         "external_kv_token_count": config.external_kv_token_count,
         "external_kv_required": config.external_kv_required,
