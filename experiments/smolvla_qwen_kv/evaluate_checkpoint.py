@@ -49,7 +49,7 @@ from precompute_latent_student_kv import (
     extract_latent_student_spatial_kv,
     load_student_and_processor,
 )
-from rollout_libero_rdt import (
+from .libero_rollout import (
     frame_for_video,
     install_robosuite_mujoco_compatibility,
     rollout_sample,
