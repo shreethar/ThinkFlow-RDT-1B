@@ -3,6 +3,12 @@ set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+if ! ldconfig -p 2>/dev/null | grep -q 'libOpenGL\.so\.0'; then
+  echo "Missing system OpenGL runtime required for headless LIBERO evaluation." >&2
+  echo "As root, run: apt-get update && apt-get install -y libopengl0 libegl1 libgl1" >&2
+  exit 2
+fi
+
 # Keep LeRobot's current Torch/NumPy stack isolated from ThinkFlow-RDT.
 VENV=${VENV:-.venv-smolvla}
 LEROBOT_VERSION=${LEROBOT_VERSION:-0.6.0}

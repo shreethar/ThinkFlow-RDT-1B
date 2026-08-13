@@ -43,6 +43,8 @@ LEROBOT_TRAIN="$SMOLVLA_VENV/bin/lerobot-train"
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-$HF_HUB_OFFLINE}
 export ACCELERATE_USE_DEEPSPEED=false
+export MUJOCO_GL=${MUJOCO_GL:-egl}
+export PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-egl}
 export SMOLVLA_QWEN_EVAL_ENABLE=true
 export SMOLVLA_QWEN_EVAL_LIBERO_ROOT="$LIBERO_ROOT"
 # The local LIBERO repository has a nested libero/libero package, so its
@@ -53,7 +55,23 @@ export SMOLVLA_QWEN_EVAL_EPISODES_PER_TASK=2
 export SMOLVLA_QWEN_EVAL_ACTION_CHUNK=4
 export SMOLVLA_QWEN_EVAL_SAVE_VIDEOS=true
 
-QWEN_TOKEN_COUNT=${QWEN_TOKEN_COUNT:-1}
+if [[ "$SMOLVLA_QWEN_EVAL_ENABLE" == "true" ]] && ! ldconfig -p 2>/dev/null | grep -q 'libOpenGL\.so\.0'; then
+  echo "Missing system library libOpenGL.so.0 required by LIBERO EGL rollout." >&2
+  echo "Install it with: apt-get update && apt-get install -y libopengl0 libegl1 libgl1" >&2
+  exit 2
+fi
+
+MODE=${1:-}
+case "$MODE" in
+  "") QWEN_TOKEN_COUNT=${QWEN_TOKEN_COUNT:-1} ;;
+  b0) QWEN_TOKEN_COUNT=1 ;;
+  b2) QWEN_TOKEN_COUNT=5 ;;
+  *)
+    echo "Usage: $0 [b0|b2]" >&2
+    echo "Alternatively export QWEN_TOKEN_COUNT=1 or 5." >&2
+    exit 2
+    ;;
+esac
 if [[ "$QWEN_TOKEN_COUNT" != "1" && "$QWEN_TOKEN_COUNT" != "5" ]]; then
   echo "QWEN_TOKEN_COUNT must be 1 (B0) or 5 (B2), got: $QWEN_TOKEN_COUNT" >&2
   exit 2
@@ -87,6 +105,13 @@ BATCH_SIZE=${BATCH_SIZE:-128}
 NUM_WORKERS=${NUM_WORKERS:-8}
 SAVE_FREQ=${SAVE_FREQ:-1000}
 ENV_EVAL_FREQ=${ENV_EVAL_FREQ:-5000}
+
+echo "SmolVLA Qwen-KV training configuration:"
+echo "  mode: $([[ "$QWEN_TOKEN_COUNT" == "5" ]] && echo B2 || echo B0)"
+echo "  Qwen KV tokens: $QWEN_TOKEN_COUNT"
+echo "  cache root: $CACHE_ROOT"
+echo "  bootstrap: $BOOTSTRAP_DIR"
+echo "  output: $OUTPUT_DIR"
 
 LOCAL_FILES_ARGS=()
 case "${HF_HUB_OFFLINE,,}" in
