@@ -13,6 +13,7 @@ import gc
 import inspect
 import json
 import logging
+import traceback
 from pathlib import Path
 
 
@@ -280,6 +281,12 @@ def _install_periodic_qwen_rollout_callback() -> None:
             )
         except Exception:
             logging.exception("Qwen-aware LIBERO rollout failed at step %s", step)
+            failure_dir = Path(cfg.output_dir) / "qwen_rollouts" / f"step_{int(step):06d}"
+            failure_dir.mkdir(parents=True, exist_ok=True)
+            (failure_dir / "error.txt").write_text(
+                traceback.format_exc(),
+                encoding="utf-8",
+            )
             if not _env_bool("SMOLVLA_QWEN_EVAL_FAIL_OPEN", True):
                 raise
 
