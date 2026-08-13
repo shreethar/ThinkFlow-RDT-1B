@@ -13,11 +13,11 @@ N_ACTION_STEPS=${N_ACTION_STEPS:-}
 SEED=${SEED:-42}
 DEVICE=${DEVICE:-cuda}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/smolvla_${SUITE}_eval}
-# The published checkpoint was trained with camera1/camera2 feature names,
-# while LeRobot's LIBERO environment exposes image/image2.  The checkpoint
-# config also declares an optional camera3; SmolVLA supports missing camera
-# slots and runs on the two views that are present.
-RENAME_MAP=${RENAME_MAP:-'{"observation.images.image":"observation.images.camera1","observation.images.image2":"observation.images.camera2"}'}
+# Match LeRobot's official smolvla_libero CI contract exactly. The environment
+# emits camera1/camera2 directly, and one masked empty slot preserves the three
+# visual positions used when this checkpoint was trained.
+CAMERA_NAME_MAPPING=${CAMERA_NAME_MAPPING:-'{"agentview_image":"camera1","robot0_eye_in_hand_image":"camera2"}'}
+EMPTY_CAMERAS=${EMPTY_CAMERAS:-1}
 
 LEROBOT_EVAL="$VENV/bin/lerobot-eval"
 if [[ ! -x "$LEROBOT_EVAL" ]]; then
@@ -67,10 +67,11 @@ esac
 ARGS=(
   --policy.path="$POLICY"
   --policy.device="$DEVICE"
-  --rename_map="$RENAME_MAP"
+  --policy.empty_cameras="$EMPTY_CAMERAS"
   --env.type=libero
   --env.task="$SUITE"
   --env.control_mode=relative
+  --env.camera_name_mapping="$CAMERA_NAME_MAPPING"
   --env.init_states=true
   --env.episode_length="$MAX_STEPS"
   --env.max_parallel_tasks=1
@@ -98,7 +99,8 @@ echo "  task IDs: ${TASK_IDS:-all}"
 echo "  episodes: $N_EPISODES per selected task"
 echo "  max steps: $MAX_STEPS"
 echo "  actions/replan: ${N_ACTION_STEPS:-checkpoint default}"
-echo "  camera map: $RENAME_MAP"
+echo "  camera map: $CAMERA_NAME_MAPPING"
+echo "  empty cameras: $EMPTY_CAMERAS"
 echo "  output:   $OUTPUT_DIR"
 
 exec "$LEROBOT_EVAL" "${ARGS[@]}"
