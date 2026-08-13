@@ -74,6 +74,7 @@ def make_libero_kv_config(
     freeze_vision_encoder: bool = True,
     external_kv_logit_bias_init: float = -4.0,
     external_kv_token_count: int = 1,
+    preserve_pretrained_features: bool = False,
     local_files_only: bool = False,
 ) -> KVSmolVLAConfig:
     """Build a cache-compatible config while retaining pretrained architecture settings.
@@ -94,22 +95,25 @@ def make_libero_kv_config(
         raise TypeError(
             f"Expected a SmolVLA checkpoint, got configuration {type(base).__name__}"
         )
-    input_features = {
-        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(state_dim,)),
-        f"{OBS_IMAGES}.image": PolicyFeature(
-            type=FeatureType.VISUAL, shape=(3, image_height, image_width)
-        ),
-        f"{OBS_IMAGES}.image2": PolicyFeature(
-            type=FeatureType.VISUAL, shape=(3, image_height, image_width)
-        ),
-    }
-    output_features = {
-        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,)),
-    }
+    feature_overrides: dict[str, Any] = {}
+    if not preserve_pretrained_features:
+        feature_overrides = {
+            "input_features": {
+                OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(state_dim,)),
+                f"{OBS_IMAGES}.image": PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(3, image_height, image_width)
+                ),
+                f"{OBS_IMAGES}.image2": PolicyFeature(
+                    type=FeatureType.VISUAL, shape=(3, image_height, image_width)
+                ),
+            },
+            "output_features": {
+                ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,)),
+            },
+        }
     return KVSmolVLAConfig.from_smolvla_config(
         base,
-        input_features=input_features,
-        output_features=output_features,
+        **feature_overrides,
         device=device,
         chunk_size=chunk_size,
         n_action_steps=n_action_steps,

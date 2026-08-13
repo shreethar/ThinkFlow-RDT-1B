@@ -122,6 +122,10 @@ def main() -> None:
         freeze_vision_encoder=True,
         external_kv_logit_bias_init=args.external_logit_bias_init,
         external_kv_token_count=args.external_kv_token_count,
+        # The official smolvla_libero processor maps observations to camera1/camera2.
+        # A behavior-preserving conversion must keep those exact feature names;
+        # replacing them with cache-training names image/image2 breaks inference.
+        preserve_pretrained_features=args.preserve_base_processors,
         local_files_only=args.local_files_only,
     )
     print(f"Loading native SmolVLA weights from {args.base}")

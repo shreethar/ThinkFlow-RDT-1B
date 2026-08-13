@@ -10,8 +10,10 @@ cd "$REPO_ROOT"
 
 BASE_MODEL=${BASE_MODEL:-lerobot/smolvla_libero}
 QWEN_TOKEN_COUNT=${QWEN_TOKEN_COUNT:-5}
-CONVERTED_DIR=${CONVERTED_DIR:-outputs/smolvla_libero_qwen_kv_step0_bypass}
-OUTPUT_DIR=${OUTPUT_DIR:-outputs/smolvla_libero_qwen_kv_step0_bypass_eval}
+# Use a new directory so a checkpoint produced by the older, incorrect
+# image/image2 feature conversion is never silently reused.
+CONVERTED_DIR=${CONVERTED_DIR:-outputs/smolvla_libero_qwen_kv_step0_bypass_v2}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/smolvla_libero_qwen_kv_step0_bypass_v2_eval}
 LIBERO_ROOT=${LIBERO_ROOT:-"$REPO_ROOT/../LIBERO"}
 SUITE=${SUITE:-libero_10}
 EPISODES_PER_TASK=${EPISODES_PER_TASK:-20}
