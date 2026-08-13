@@ -24,6 +24,7 @@ uv venv "$VENV" --python 3.12
 UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install \
   --python "$VENV/bin/python" \
   "lerobot[smolvla,libero,evaluation]==$LEROBOT_VERSION" \
+  "peft==0.19.1" \
   "hf-libero==0.1.4" \
   "robosuite==1.4.0" \
   "mujoco>=3.0.0,<3.9.0"
@@ -39,6 +40,7 @@ from importlib.metadata import version
 
 expected = {
     "lerobot": "0.6.0",
+    "peft": "0.19.1",
     "hf-libero": "0.1.4",
     "robosuite": "1.4.0",
 }

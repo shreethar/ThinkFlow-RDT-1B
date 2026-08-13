@@ -94,6 +94,15 @@ else
   export SMOLVLA_QWEN_EVAL_LATENT_STUDENT_CODE_DIR=${SMOLVLA_QWEN_EVAL_LATENT_STUDENT_CODE_DIR:-/workspace/VLA-FYP/train/stage2}
 fi
 
+if [[ "$QWEN_TOKEN_COUNT" == "5" && "$SMOLVLA_QWEN_EVAL_ENABLE" == "true" ]]; then
+  if ! "$PYTHON" -c 'import peft' >/dev/null 2>&1; then
+    echo "B2 live evaluation requires PEFT because LatentStudent imports it." >&2
+    echo "Install it with:" >&2
+    echo "  uv pip install --python $SMOLVLA_VENV/bin/python 'peft==0.19.1'" >&2
+    exit 2
+  fi
+fi
+
 CACHE_ROOT=${CACHE_ROOT:-$DEFAULT_CACHE_ROOT}
 BOOTSTRAP_DIR=${BOOTSTRAP_DIR:-$DEFAULT_BOOTSTRAP_DIR}
 STATS_PATH=${STATS_PATH:-$DEFAULT_STATS_PATH}
