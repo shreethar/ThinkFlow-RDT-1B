@@ -21,6 +21,7 @@ if "--local-files-only" in sys.argv:
 
 import numpy as np
 import torch
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
 from .configuration import make_libero_kv_config
@@ -59,6 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-action-steps", type=int, default=4)
     parser.add_argument("--external-logit-bias-init", type=float, default=-4.0)
     parser.add_argument("--external-kv-token-count", type=int, choices=[1, 5], default=1)
+    parser.add_argument(
+        "--preserve-base-processors",
+        action="store_true",
+        help=(
+            "Load and save the base checkpoint's own pre/post-processors. Use this "
+            "for a behavior-preserving conversion control such as smolvla_libero."
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     return parser.parse_args()
 
@@ -71,7 +80,7 @@ def main() -> None:
         raise FileExistsError(
             f"Refusing to overwrite non-empty bootstrap directory: {output_dir}"
         )
-    if not stats_path.exists():
+    if not args.preserve_base_processors and not stats_path.exists():
         if args.cache_root is None:
             raise FileNotFoundError(
                 f"Missing cache statistics {stats_path}. Pass --cache-root to compute "
@@ -96,10 +105,13 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    payload = torch.load(stats_path, map_location="cpu", weights_only=True)
-    if payload.get("schema") != "libero_native_state8_action7_v1":
-        raise ValueError(f"Incompatible statistics schema in {stats_path}")
-    stats = payload["stats"]
+    payload = None
+    stats = None
+    if not args.preserve_base_processors:
+        payload = torch.load(stats_path, map_location="cpu", weights_only=True)
+        if payload.get("schema") != "libero_native_state8_action7_v1":
+            raise ValueError(f"Incompatible statistics schema in {stats_path}")
+        stats = payload["stats"]
 
     config = make_libero_kv_config(
         args.base,
@@ -120,10 +132,19 @@ def main() -> None:
         local_files_only=args.local_files_only,
         strict=False,
     )
-    preprocessor, postprocessor = make_smolvla_pre_post_processors(
-        config,
-        dataset_stats=stats,
-    )
+    if args.preserve_base_processors:
+        # A conversion control must retain the source checkpoint's normalization.
+        # Recomputing cache statistics here would change policy behavior even when
+        # external Qwen K/V fusion is disabled.
+        preprocessor, postprocessor = make_pre_post_processors(
+            config,
+            args.base,
+        )
+    else:
+        preprocessor, postprocessor = make_smolvla_pre_post_processors(
+            config,
+            dataset_stats=stats,
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     policy.save_pretrained(output_dir)
@@ -132,8 +153,9 @@ def main() -> None:
     bootstrap = {
         "base": args.base,
         "seed": args.seed,
-        "stats": str(stats_path),
-        "samples_in_stats": int(payload.get("num_samples", 0)),
+        "stats": str(stats_path) if payload is not None else None,
+        "processor_source": args.base if args.preserve_base_processors else "cache_stats",
+        "samples_in_stats": int(payload.get("num_samples", 0)) if payload else 0,
         "policy_type": config.type,
         "state_dim": 8,
         "action_dim": 7,

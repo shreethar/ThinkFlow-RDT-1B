@@ -124,6 +124,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-resolution", type=int, default=512)
     parser.add_argument("--video-fps", type=int, default=20)
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument(
+        "--disable-qwen-fusion",
+        action="store_true",
+        help=(
+            "Evaluate the native SmolVLA path without loading, extracting, or "
+            "injecting external Qwen K/V. Intended for step-zero conversion controls."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -278,6 +286,9 @@ def run_evaluation(
                 f"Expected a smolvla_qwen_kv checkpoint, got {getattr(config, 'type', None)!r}"
             )
         config.device = str(device)
+        if args.disable_qwen_fusion:
+            # This is a true bypass: no zero tokens are appended to attention.
+            config.external_kv_required = False
         # A LeRobot pretrained_model directory is a full policy checkpoint. Build
         # the architecture without separately loading SmolVLM Hub weights; strict
         # safetensor loading below then verifies that the checkpoint supplies every
@@ -313,8 +324,12 @@ def run_evaluation(
         postprocessor = postprocessor_override
         policy.eval()
 
-    metadata_by_suite = {suite: load_suite_metadata(cache_root, suite) for suite in args.suites}
-    first_metadata = metadata_by_suite[args.suites[0]]
+    metadata_by_suite = (
+        {}
+        if args.disable_qwen_fusion
+        else {suite: load_suite_metadata(cache_root, suite) for suite in args.suites}
+    )
+    first_metadata = None if args.disable_qwen_fusion else metadata_by_suite[args.suites[0]]
     is_latent_student = config.external_kv_token_count > 1
     provenance_fields = (
         (
@@ -342,7 +357,11 @@ def run_evaluation(
         ]
         if mismatched:
             raise ValueError(f"Qwen cache provenance differs for {suite}: {mismatched}")
-    if is_latent_student:
+    if args.disable_qwen_fusion:
+        qwen = None
+        qwen_processor = None
+        print("External Qwen K/V fusion disabled; evaluating native SmolVLA behavior")
+    elif is_latent_student:
         student_id = args.qwen_model_id or first_metadata["student_model_id"]
         processor_id = args.qwen_processor_id or first_metadata.get("processor_id", student_id)
         spatial_token_count = int(first_metadata.get("spatial_token_count", 5))
@@ -402,7 +421,7 @@ def run_evaluation(
         for suite in args.suites:
             benchmark = get_benchmark(suite)(0)
             max_steps = args.max_steps or DEFAULT_MAX_STEPS[suite]
-            metadata = metadata_by_suite[suite]
+            metadata = metadata_by_suite.get(suite)
             for task_id in task_ids:
                 task = benchmark.get_task(task_id)
                 init_states = torch.load(
@@ -489,7 +508,9 @@ def run_evaluation(
                         )
                         if encoded is None:
                             raise RuntimeError("No rollout samples remained after image collation")
-                        if is_latent_student:
+                        if args.disable_qwen_fusion:
+                            qwen_kv = None
+                        elif is_latent_student:
                             qwen_kv, _ = extract_latent_student_spatial_kv(
                                 encoded,
                                 student=qwen,
@@ -536,7 +557,8 @@ def run_evaluation(
                         policy_batch = preprocessor(raw_batch)
                         # The checkpoint's saved processor predates plugin metadata
                         # registration, so explicitly attach the live tensor too.
-                        policy_batch[config.external_kv_key] = qwen_kv.to(device)
+                        if qwen_kv is not None:
+                            policy_batch[config.external_kv_key] = qwen_kv.to(device)
                         generator = torch.Generator(device=device).manual_seed(
                             args.seed
                             + LIBERO_SUITES.index(suite) * 1_000_000
