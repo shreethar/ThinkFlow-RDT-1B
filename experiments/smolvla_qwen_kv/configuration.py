@@ -74,6 +74,7 @@ def make_libero_kv_config(
     freeze_vision_encoder: bool = True,
     external_kv_logit_bias_init: float = -4.0,
     external_kv_token_count: int = 1,
+    external_kv_required: bool = True,
     preserve_pretrained_features: bool = False,
     local_files_only: bool = False,
 ) -> KVSmolVLAConfig:
@@ -121,6 +122,7 @@ def make_libero_kv_config(
         freeze_vision_encoder=freeze_vision_encoder,
         external_kv_logit_bias_init=external_kv_logit_bias_init,
         external_kv_token_count=external_kv_token_count,
+        external_kv_required=external_kv_required,
         # The complete policy checkpoint is loaded immediately after construction.
         # Avoid separately downloading/loading another copy of the VLM weights first.
         load_vlm_weights=False,

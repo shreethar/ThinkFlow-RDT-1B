@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--external-logit-bias-init", type=float, default=-4.0)
     parser.add_argument("--external-kv-token-count", type=int, choices=[1, 5], default=1)
     parser.add_argument(
+        "--external-kv-optional",
+        action="store_true",
+        help="Save a checkpoint that bypasses external K/V when qwen_kv is absent.",
+    )
+    parser.add_argument(
         "--preserve-base-processors",
         action="store_true",
         help=(
@@ -122,6 +127,7 @@ def main() -> None:
         freeze_vision_encoder=True,
         external_kv_logit_bias_init=args.external_logit_bias_init,
         external_kv_token_count=args.external_kv_token_count,
+        external_kv_required=not args.external_kv_optional,
         # The official smolvla_libero processor maps observations to camera1/camera2.
         # A behavior-preserving conversion must keep those exact feature names;
         # replacing them with cache-training names image/image2 breaks inference.
@@ -165,6 +171,7 @@ def main() -> None:
         "action_dim": 7,
         "external_kv_width": config.external_kv_width,
         "external_kv_token_count": config.external_kv_token_count,
+        "external_kv_required": config.external_kv_required,
         "initialization": {
             "native_smolvla": "pretrained base weights",
             "external_qwen_kv_adapters": "new seeded initialization",

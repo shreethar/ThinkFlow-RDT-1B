@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Official SmolVLA checkpoint fine-tuned on the LeRobot LIBERO dataset.
 VENV=${VENV:-.venv-smolvla}
-POLICY=${POLICY:-lerobot/smolvla_base}
+POLICY=${POLICY:-lerobot/smolvla_libero}
 SUITE=${SUITE:-libero_goal}
 TASK_IDS=${TASK_IDS:-}
 N_EPISODES=${N_EPISODES:-2}

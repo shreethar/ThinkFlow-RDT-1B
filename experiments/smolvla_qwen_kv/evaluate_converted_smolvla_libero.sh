@@ -12,13 +12,13 @@ BASE_MODEL=${BASE_MODEL:-lerobot/smolvla_libero}
 QWEN_TOKEN_COUNT=${QWEN_TOKEN_COUNT:-5}
 # Use a new directory so a checkpoint produced by the older, incorrect
 # image/image2 feature conversion is never silently reused.
-CONVERTED_DIR=${CONVERTED_DIR:-outputs/smolvla_libero_qwen_kv_step0_bypass_v2}
-OUTPUT_DIR=${OUTPUT_DIR:-outputs/smolvla_libero_qwen_kv_step0_bypass_v2_eval}
+CONVERTED_DIR=${CONVERTED_DIR:-outputs/smolvla_libero_qwen_kv_step0_bypass_v3}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/smolvla_libero_qwen_kv_step0_bypass_v3_official_eval}
 LIBERO_ROOT=${LIBERO_ROOT:-"$REPO_ROOT/../LIBERO"}
 SUITE=${SUITE:-libero_10}
 EPISODES_PER_TASK=${EPISODES_PER_TASK:-20}
 ENV_BATCH_SIZE=${ENV_BATCH_SIZE:-2}
-ACTION_CHUNK=${ACTION_CHUNK:-4}
+N_ACTION_STEPS=${N_ACTION_STEPS:-}
 MAX_STEPS=${MAX_STEPS:-1000}
 SAVE_VIDEOS=${SAVE_VIDEOS:-1}
 LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY:-0}
@@ -61,32 +61,27 @@ if [[ ! -f "$CONVERTED_DIR/model.safetensors" ]]; then
     --base "$BASE_MODEL" \
     --output-dir "$CONVERTED_DIR" \
     --external-kv-token-count "$QWEN_TOKEN_COUNT" \
+    --external-kv-optional \
     --preserve-base-processors \
     --device cpu \
     --seed 42 \
     "${LOCAL_ARGS[@]}"
 fi
 
-VIDEO_ARGS=()
-case "${SAVE_VIDEOS,,}" in
-  1|true|yes|on) VIDEO_ARGS+=(--save-videos) ;;
-esac
-
 echo "Evaluating converted smolvla_libero control"
 echo "  converted checkpoint: $CONVERTED_DIR"
 echo "  suite: $SUITE"
 echo "  protocol: 10 tasks x $EPISODES_PER_TASK episodes, max $MAX_STEPS steps"
-echo "  Qwen fusion: disabled"
+echo "  Qwen fusion: disabled because qwen_kv is optional and absent"
+echo "  evaluator: official LeRobot lerobot-eval"
 
-exec "$PYTHON" -m experiments.smolvla_qwen_kv.evaluate_checkpoint \
-  --checkpoint "$CONVERTED_DIR" \
-  --libero-root "$LIBERO_ROOT" \
-  --output-dir "$OUTPUT_DIR" \
-  --suites "$SUITE" \
-  --episodes-per-task "$EPISODES_PER_TASK" \
-  --env-batch-size "$ENV_BATCH_SIZE" \
-  --action-chunk "$ACTION_CHUNK" \
-  --max-steps "$MAX_STEPS" \
-  --disable-qwen-fusion \
-  "${VIDEO_ARGS[@]}" \
-  "${LOCAL_ARGS[@]}"
+exec env \
+  VENV="$SMOLVLA_VENV" \
+  POLICY="$CONVERTED_DIR" \
+  SUITE="$SUITE" \
+  N_EPISODES="$EPISODES_PER_TASK" \
+  BATCH_SIZE="$ENV_BATCH_SIZE" \
+  MAX_STEPS="$MAX_STEPS" \
+  N_ACTION_STEPS="$N_ACTION_STEPS" \
+  OUTPUT_DIR="$OUTPUT_DIR" \
+  bash scripts/run_smolvla_libero_eval.sh
