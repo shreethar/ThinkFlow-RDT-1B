@@ -9,11 +9,43 @@ if [[ ! -d "$LIBERO_ROOT/libero/libero" ]]; then
   exit 2
 fi
 
+# Prefer the isolated SmolVLA environment created by
+# scripts/setup_smolvla_libero_env.sh, while remaining compatible with older
+# workspaces that installed LeRobot into .venv.
+SMOLVLA_VENV=${SMOLVLA_VENV:-}
+if [[ -z "$SMOLVLA_VENV" ]]; then
+  for candidate in "$REPO_ROOT/.venv-smolvla" "$REPO_ROOT/.venv"; do
+    if [[ -x "$candidate/bin/python" ]] && "$candidate/bin/python" -c 'import lerobot' >/dev/null 2>&1; then
+      SMOLVLA_VENV="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "$SMOLVLA_VENV" || ! -x "$SMOLVLA_VENV/bin/python" ]]; then
+  echo "No LeRobot-capable virtual environment found." >&2
+  echo "Run: bash scripts/setup_smolvla_libero_env.sh" >&2
+  echo "Or set SMOLVLA_VENV=/absolute/path/to/a/venv containing lerobot." >&2
+  exit 2
+fi
+if ! "$SMOLVLA_VENV/bin/python" -c 'import lerobot' >/dev/null 2>&1; then
+  echo "LeRobot is not importable from $SMOLVLA_VENV/bin/python" >&2
+  exit 2
+fi
+if [[ ! -x "$SMOLVLA_VENV/bin/lerobot-train" ]]; then
+  echo "Missing $SMOLVLA_VENV/bin/lerobot-train" >&2
+  exit 2
+fi
+PYTHON="$SMOLVLA_VENV/bin/python"
+LEROBOT_TRAIN="$SMOLVLA_VENV/bin/lerobot-train"
+
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export ACCELERATE_USE_DEEPSPEED=false
 export SMOLVLA_QWEN_EVAL_ENABLE=true
 export SMOLVLA_QWEN_EVAL_LIBERO_ROOT="$LIBERO_ROOT"
+# The local LIBERO repository has a nested libero/libero package, so its
+# repository root must be present on sys.path for `import libero.libero`.
+export PYTHONPATH="$LIBERO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export SMOLVLA_QWEN_EVAL_TASK_IDS=0
 export SMOLVLA_QWEN_EVAL_EPISODES_PER_TASK=2
 export SMOLVLA_QWEN_EVAL_ACTION_CHUNK=4
@@ -57,7 +89,7 @@ ENV_EVAL_FREQ=${ENV_EVAL_FREQ:-5000}
 # Build the custom policy once from native lerobot/smolvla_base. This does not
 # load checkpoint-014000 or any prior LIBERO fine-tuning.
 if [[ ! -f "$BOOTSTRAP_DIR/model.safetensors" ]]; then
-  .venv/bin/python -m experiments.smolvla_qwen_kv.create_base_checkpoint \
+  "$PYTHON" -m experiments.smolvla_qwen_kv.create_base_checkpoint \
     --base lerobot/smolvla_base \
     --output-dir "$BOOTSTRAP_DIR" \
     --stats "$STATS_PATH" \
@@ -68,7 +100,7 @@ if [[ ! -f "$BOOTSTRAP_DIR/model.safetensors" ]]; then
     --local-files-only
 fi
 
-exec .venv/bin/lerobot-train \
+exec "$LEROBOT_TRAIN" \
   --policy.path="$BOOTSTRAP_DIR" \
   --policy.load_vlm_weights=true \
   --policy.device=cuda \

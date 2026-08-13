@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
 # Keep LeRobot's current Torch/NumPy stack isolated from ThinkFlow-RDT.
 VENV=${VENV:-.venv-smolvla}
 LEROBOT_VERSION=${LEROBOT_VERSION:-0.6.0}
@@ -19,6 +21,12 @@ UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install \
   "hf-libero==0.1.4" \
   "robosuite==1.4.0" \
   "mujoco>=3.0.0,<3.9.0"
+
+UV_CACHE_DIR="$UV_CACHE_DIR" uv pip install \
+  --python "$VENV/bin/python" \
+  --no-deps \
+  --no-build-isolation \
+  -e "$REPO_ROOT/experiments/lerobot_policy_smolvla_qwen_kv"
 
 "$VENV/bin/python" - <<'PY'
 from importlib.metadata import version
@@ -39,4 +47,4 @@ print("Validated SmolVLA/LIBERO simulator dependencies")
 PY
 
 echo "SmolVLA environment ready: $VENV"
-echo "Run: bash scripts/run_smolvla_libero_eval.sh"
+echo "Run training with: SMOLVLA_VENV=$VENV bash experiments/smolvla_qwen_kv/run_lerobot_cached_fresh.sh"
