@@ -10,6 +10,7 @@ import sys
 import os
 import argparse
 import gc
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -214,14 +215,24 @@ def _install_periodic_qwen_rollout_callback() -> None:
     if getattr(active_save, "_smolvla_qwen_rollout_callback", False):
         return
     native_save = active_save
+    native_save_signature = inspect.signature(native_save)
 
     def save_with_qwen_rollout(*args, **kwargs):
         native_save(*args, **kwargs)
-        cfg = kwargs.get("cfg")
-        step = kwargs.get("step")
-        policy = kwargs.get("policy")
-        checkpoint_dir = kwargs.get("checkpoint_dir")
+        # LeRobot versions differ in whether save_checkpoint is called with
+        # positional or keyword arguments. Bind against the native signature so
+        # periodic rollout evaluation works in both cases.
+        call_arguments = native_save_signature.bind_partial(*args, **kwargs).arguments
+        cfg = call_arguments.get("cfg")
+        step = call_arguments.get("step")
+        policy = call_arguments.get("policy")
+        checkpoint_dir = call_arguments.get("checkpoint_dir")
         if cfg is None or step is None or policy is None or checkpoint_dir is None:
+            logging.warning(
+                "Skipping Qwen-aware rollout because save_checkpoint arguments "
+                "could not be resolved (available: %s)",
+                sorted(call_arguments),
+            )
             return
         frequency = int(getattr(cfg, "env_eval_freq", 0))
         is_custom_policy = getattr(getattr(policy, "config", None), "type", None) == "smolvla_qwen_kv"
@@ -244,8 +255,8 @@ def _install_periodic_qwen_rollout_callback() -> None:
                 step=int(step),
                 cfg=cfg,
                 policy=policy,
-                preprocessor=kwargs.get("preprocessor"),
-                postprocessor=kwargs.get("postprocessor"),
+                preprocessor=call_arguments.get("preprocessor"),
+                postprocessor=call_arguments.get("postprocessor"),
             )
             logging.info(
                 "Qwen-aware rollout step=%s success=%s/%s rate=%.3f",
