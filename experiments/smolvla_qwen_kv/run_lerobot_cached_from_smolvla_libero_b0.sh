@@ -6,7 +6,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # Start from the already LIBERO-finetuned SmolVLA policy. The bootstrap keeps
 # its learned model weights, replaces only the cache-facing feature contract
 # with native state8/action7 statistics, and initializes the new Qwen adapters.
-export BASE_MODEL=${BASE_MODEL:-lerobot/smolvla_libero}
+export BASE_MODEL=${BASE_MODEL:-lerobot/smolvla_base}
 export QWEN_TOKEN_COUNT=1
 export CACHE_ROOT=${CACHE_ROOT:-cache_features_libero_b0_raw_ortho6d}
 export BOOTSTRAP_DIR=${BOOTSTRAP_DIR:-outputs/smolvla_libero_qwen_kv_init_b0}
