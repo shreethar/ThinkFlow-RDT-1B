@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-ids", nargs="+", type=int, default=[0])
     parser.add_argument("--episodes-per-task", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=None,
+        help="Actions executed from each predicted chunk before replanning.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-videos", type=int, default=2)
@@ -407,6 +413,13 @@ def main() -> None:
     config = PreTrainedConfig.from_pretrained(checkpoint, local_files_only=True)
     if not isinstance(config, KVSmolVLAConfig):
         raise TypeError(f"Expected smolvla_qwen_kv, got {type(config).__name__}")
+    if args.n_action_steps is not None:
+        if not 1 <= args.n_action_steps <= config.chunk_size:
+            raise ValueError(
+                f"--n-action-steps must be in [1, {config.chunk_size}], "
+                f"got {args.n_action_steps}"
+            )
+        config.n_action_steps = args.n_action_steps
     config.device = str(device)
     config.load_vlm_weights = False
     policy = KVSmolVLAPolicy.from_pretrained(
@@ -452,6 +465,7 @@ def main() -> None:
         "suites": args.suites,
         "task_ids": args.task_ids,
         "episodes_per_task": args.episodes_per_task,
+        "n_action_steps": config.n_action_steps,
         "seed": args.seed,
         "results": {mode: info["overall"] for mode, info in results.items()},
     }

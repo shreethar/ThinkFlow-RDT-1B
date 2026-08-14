@@ -14,6 +14,7 @@ TASK_IDS=${TASK_IDS:-0}
 EPISODES=${EPISODES:-2}
 BATCH_SIZE=${BATCH_SIZE:-1}
 MAX_VIDEOS=${MAX_VIDEOS:-2}
+N_ACTION_STEPS=${N_ACTION_STEPS:-}
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "Python not found: $PYTHON" >&2
@@ -27,6 +28,11 @@ export PYTHONPATH="$LIBERO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 read -r -a SUITE_ARGS <<< "${SUITES//,/ }"
 read -r -a TASK_ARGS <<< "${TASK_IDS//,/ }"
 
+EXTRA_ARGS=()
+if [[ -n "$N_ACTION_STEPS" ]]; then
+  EXTRA_ARGS+=(--n-action-steps "$N_ACTION_STEPS")
+fi
+
 exec "$PYTHON" -m experiments.smolvla_qwen_kv.evaluate_fusion_ablation \
   --checkpoint "$CHECKPOINT" \
   --cache-root "$CACHE_ROOT" \
@@ -36,4 +42,5 @@ exec "$PYTHON" -m experiments.smolvla_qwen_kv.evaluate_fusion_ablation \
   --episodes-per-task "$EPISODES" \
   --batch-size "$BATCH_SIZE" \
   --max-videos "$MAX_VIDEOS" \
+  "${EXTRA_ARGS[@]}" \
   "$@"
