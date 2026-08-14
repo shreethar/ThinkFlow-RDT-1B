@@ -210,19 +210,45 @@ def adapter_parameter_diagnostics(policy: KVSmolVLAPolicy) -> dict[str, Any]:
         or "external_value_projections" in name
         or "external_logit_biases" in name
     }
-    biases = {
-        name: float(value.item())
+    bias_tensors = {
+        name: value.flatten()
         for name, value in selected.items()
         if "external_logit_biases" in name
+    }
+    # SmolVLA learns one external-KV logit bias per attention head. Preserve
+    # every value so diagnostics can reveal dead or dominant heads, while also
+    # providing compact layer summaries for quick comparison.
+    biases = {
+        name: {
+            "shape": list(value.shape),
+            "values": value.tolist(),
+            "mean": float(value.mean().item()),
+            "std": float(value.std(unbiased=False).item()),
+            "min": float(value.min().item()),
+            "max": float(value.max().item()),
+        }
+        for name, value in bias_tensors.items()
     }
     projection_norms = {
         name: float(value.norm().item())
         for name, value in selected.items()
         if "external_logit_biases" not in name
     }
+    all_biases = (
+        torch.cat(list(bias_tensors.values()))
+        if bias_tensors
+        else torch.empty(0, dtype=torch.float32)
+    )
     return {
         "parameter_count": int(sum(value.numel() for value in selected.values())),
         "logit_biases": biases,
+        "logit_bias_summary": {
+            "count": int(all_biases.numel()),
+            "mean": float(all_biases.mean().item()) if all_biases.numel() else None,
+            "std": float(all_biases.std(unbiased=False).item()) if all_biases.numel() else None,
+            "min": float(all_biases.min().item()) if all_biases.numel() else None,
+            "max": float(all_biases.max().item()) if all_biases.numel() else None,
+        },
         "projection_weight_norms": projection_norms,
     }
 
