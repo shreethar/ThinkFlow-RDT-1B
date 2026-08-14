@@ -50,10 +50,10 @@ export SMOLVLA_QWEN_EVAL_LIBERO_ROOT="$LIBERO_ROOT"
 # The local LIBERO repository has a nested libero/libero package, so its
 # repository root must be present on sys.path for `import libero.libero`.
 export PYTHONPATH="$LIBERO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-export SMOLVLA_QWEN_EVAL_TASK_IDS=0
-export SMOLVLA_QWEN_EVAL_EPISODES_PER_TASK=2
-export SMOLVLA_QWEN_EVAL_ACTION_CHUNK=4
-export SMOLVLA_QWEN_EVAL_SAVE_VIDEOS=true
+export SMOLVLA_QWEN_EVAL_TASK_IDS=${SMOLVLA_QWEN_EVAL_TASK_IDS:-0}
+export SMOLVLA_QWEN_EVAL_EPISODES_PER_TASK=${SMOLVLA_QWEN_EVAL_EPISODES_PER_TASK:-2}
+export SMOLVLA_QWEN_EVAL_ACTION_CHUNK=${SMOLVLA_QWEN_EVAL_ACTION_CHUNK:-4}
+export SMOLVLA_QWEN_EVAL_SAVE_VIDEOS=${SMOLVLA_QWEN_EVAL_SAVE_VIDEOS:-true}
 
 if [[ "$SMOLVLA_QWEN_EVAL_ENABLE" == "true" ]] && ! ldconfig -p 2>/dev/null | grep -q 'libOpenGL\.so\.0'; then
   echo "Missing system library libOpenGL.so.0 required by LIBERO EGL rollout." >&2
@@ -104,6 +104,7 @@ if [[ "$QWEN_TOKEN_COUNT" == "5" && "$SMOLVLA_QWEN_EVAL_ENABLE" == "true" ]]; th
 fi
 
 CACHE_ROOT=${CACHE_ROOT:-$DEFAULT_CACHE_ROOT}
+BASE_MODEL=${BASE_MODEL:-lerobot/smolvla_base}
 BOOTSTRAP_DIR=${BOOTSTRAP_DIR:-$DEFAULT_BOOTSTRAP_DIR}
 STATS_PATH=${STATS_PATH:-$DEFAULT_STATS_PATH}
 OUTPUT_DIR=${OUTPUT_DIR:-$DEFAULT_OUTPUT_DIR}
@@ -114,10 +115,12 @@ BATCH_SIZE=${BATCH_SIZE:-128}
 NUM_WORKERS=${NUM_WORKERS:-8}
 SAVE_FREQ=${SAVE_FREQ:-1000}
 ENV_EVAL_FREQ=${ENV_EVAL_FREQ:-5000}
+N_ACTION_STEPS=${N_ACTION_STEPS:-}
 
 echo "SmolVLA Qwen-KV training configuration:"
 echo "  mode: $([[ "$QWEN_TOKEN_COUNT" == "5" ]] && echo B2 || echo B0)"
 echo "  Qwen KV tokens: $QWEN_TOKEN_COUNT"
+echo "  source model: $BASE_MODEL"
 echo "  cache root: $CACHE_ROOT"
 echo "  bootstrap: $BOOTSTRAP_DIR"
 echo "  output: $OUTPUT_DIR"
@@ -127,17 +130,24 @@ case "${HF_HUB_OFFLINE,,}" in
   1|true|yes|on) LOCAL_FILES_ARGS+=(--local-files-only) ;;
 esac
 
-# Build the custom policy once from native lerobot/smolvla_base. This does not
-# load checkpoint-014000 or any prior LIBERO fine-tuning.
+ACTION_STEP_ARGS=()
+if [[ -n "$N_ACTION_STEPS" ]]; then
+  ACTION_STEP_ARGS+=(--n-action-steps "$N_ACTION_STEPS")
+fi
+
+# Build the custom policy once from the requested native SmolVLA checkpoint.
+# Only the external Qwen K/V adapters are absent from the source checkpoint and
+# therefore newly initialized.
 if [[ ! -f "$BOOTSTRAP_DIR/model.safetensors" ]]; then
   "$PYTHON" -m experiments.smolvla_qwen_kv.create_base_checkpoint \
-    --base lerobot/smolvla_base \
+    --base "$BASE_MODEL" \
     --output-dir "$BOOTSTRAP_DIR" \
     --stats "$STATS_PATH" \
     --cache-root "$CACHE_ROOT" \
     --external-kv-token-count "$QWEN_TOKEN_COUNT" \
     --device cpu \
     --seed 42 \
+    "${ACTION_STEP_ARGS[@]}" \
     "${LOCAL_FILES_ARGS[@]}"
 fi
 
