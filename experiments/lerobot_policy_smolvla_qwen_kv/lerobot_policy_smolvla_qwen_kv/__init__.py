@@ -28,8 +28,12 @@ if str(REPO_ROOT) not in sys.path:
 # pipeline carries it through tokenization, normalization, and device transfer.
 from lerobot.processor import converters as _converters
 
-if "qwen_kv" not in _converters._COMPLEMENTARY_KEYS:
-    _converters._COMPLEMENTARY_KEYS = (*_converters._COMPLEMENTARY_KEYS, "qwen_kv")
+for complementary_key in ("qwen_kv", "qwen_group_id"):
+    if complementary_key not in _converters._COMPLEMENTARY_KEYS:
+        _converters._COMPLEMENTARY_KEYS = (
+            *_converters._COMPLEMENTARY_KEYS,
+            complementary_key,
+        )
 
 
 def _disable_unused_broken_deepspeed_probe() -> None:
@@ -180,6 +184,9 @@ def _run_periodic_qwen_rollout(
             "SMOLVLA_QWEN_EVAL_LOCAL_FILES_ONLY",
             _env_bool("HF_HUB_OFFLINE", False),
         ),
+        # run_evaluation also serves the standalone fusion-disabled control.
+        # Periodic training rollouts always exercise the enabled fusion path.
+        disable_qwen_fusion=False,
     )
     was_training = policy.training
     try:

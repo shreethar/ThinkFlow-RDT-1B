@@ -67,7 +67,9 @@ def parse_args() -> argparse.Namespace:
             "preserves the source checkpoint when --preserve-base-processors is set."
         ),
     )
-    parser.add_argument("--external-logit-bias-init", type=float, default=-4.0)
+    parser.add_argument("--external-logit-bias-init", type=float, default=-1.0)
+    parser.add_argument("--external-kv-ranking-weight", type=float, default=0.1)
+    parser.add_argument("--external-kv-ranking-margin", type=float, default=0.01)
     parser.add_argument("--external-kv-token-count", type=int, choices=[1, 5], default=1)
     parser.add_argument(
         "--external-kv-optional",
@@ -158,6 +160,8 @@ def main() -> None:
         external_kv_logit_bias_init=args.external_logit_bias_init,
         external_kv_token_count=args.external_kv_token_count,
         external_kv_required=not args.external_kv_optional,
+        external_kv_ranking_weight=args.external_kv_ranking_weight,
+        external_kv_ranking_margin=args.external_kv_ranking_margin,
         # The official smolvla_libero processor maps observations to camera1/camera2.
         # A behavior-preserving conversion must keep those exact feature names;
         # replacing them with cache-training names image/image2 breaks inference.
@@ -210,6 +214,9 @@ def main() -> None:
         "external_kv_width": config.external_kv_width,
         "external_kv_token_count": config.external_kv_token_count,
         "external_kv_required": config.external_kv_required,
+        "external_kv_logit_bias_init": config.external_kv_logit_bias_init,
+        "external_kv_ranking_weight": config.external_kv_ranking_weight,
+        "external_kv_ranking_margin": config.external_kv_ranking_margin,
         "initialization": {
             "native_smolvla": "pretrained base weights",
             "external_qwen_kv_adapters": "new seeded initialization",

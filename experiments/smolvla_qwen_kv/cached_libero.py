@@ -8,6 +8,7 @@ Qwen KV, instructions, and pooled raw arrays or lossless image bytes.
 from __future__ import annotations
 
 import io
+import hashlib
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -216,14 +217,21 @@ def sample_from_pack(
             raise KeyError("Shard has neither image_arrays nor image_jpegs")
         images.append(cached_rgb_image(image_pool[pool_index]))
 
+    instruction = str(pack["instructions"][sample_index])
+    # Preserve a stable task identity through LeRobot's processor stack. The
+    # fusion ranking objective uses it to select a genuinely different-task KV
+    # donor instead of merely rotating samples from the same demonstration.
+    group_digest = hashlib.blake2b(instruction.encode("utf-8"), digest_size=8).digest()
+    qwen_group_id = int.from_bytes(group_digest, "little") & ((1 << 63) - 1)
     return {
         OBS_STATE: state,
         f"{OBS_IMAGES}.image": images[0],
         f"{OBS_IMAGES}.image2": images[1],
         ACTION: actions,
         "action_is_pad": ~valid,
-        "task": str(pack["instructions"][sample_index]),
+        "task": instruction,
         "qwen_kv": qwen_kv,
+        "qwen_group_id": qwen_group_id,
     }
 
 

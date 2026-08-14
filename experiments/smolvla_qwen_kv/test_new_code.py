@@ -100,6 +100,30 @@ def test_policy_rejects_cache_from_other_external_token_count() -> None:
         )
 
 
+def test_counterfactual_indices_maximize_task_mismatch() -> None:
+    groups = torch.tensor([1, 1, 2, 2])
+    indices, mismatch = KVSmolVLAPolicy._counterfactual_indices(
+        {"qwen_group_id": groups},
+        batch_size=4,
+        device=torch.device("cpu"),
+    )
+    assert sorted(indices.tolist()) == [0, 1, 2, 3]
+    assert not torch.any(indices == torch.arange(4))
+    assert mismatch == 1.0
+    assert torch.all(groups[indices] != groups)
+
+
+def test_counterfactual_indices_support_legacy_batches() -> None:
+    indices, mismatch = KVSmolVLAPolicy._counterfactual_indices(
+        {},
+        batch_size=4,
+        device=torch.device("cpu"),
+    )
+    assert sorted(indices.tolist()) == [0, 1, 2, 3]
+    assert not torch.any(indices == torch.arange(4))
+    assert mismatch == 0.0
+
+
 def test_action_chunk_padding_and_validity() -> None:
     actions = torch.arange(21, dtype=torch.float32).reshape(3, 7)
     valid = torch.tensor([True, True, False])

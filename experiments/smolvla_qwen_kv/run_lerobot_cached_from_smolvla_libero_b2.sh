@@ -6,19 +6,23 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # B2 is an independent five-token experiment initialized from the same native
 # LIBERO-finetuned policy as B0. Do not resume the one-token B0 checkpoint: that
 # would confound the B0/B2 comparison with additional prior training.
-export BASE_MODEL=${BASE_MODEL:-lerobot/smolvla_base}
+export BASE_MODEL=${BASE_MODEL:-lerobot/smolvla_libero}
 export QWEN_TOKEN_COUNT=5
 export CACHE_ROOT=${CACHE_ROOT:-cache_features_libero_b2_native}
-export BOOTSTRAP_DIR=${BOOTSTRAP_DIR:-outputs/smolvla_libero_qwen_kv_init_b2}
+export BOOTSTRAP_DIR=${BOOTSTRAP_DIR:-outputs/smolvla_libero_qwen_kv_fusion_rank_init_b2}
 export STATS_PATH=${STATS_PATH:-outputs/smolvla_libero_qwen_kv_b2_cache_stats.pt}
-export OUTPUT_DIR=${OUTPUT_DIR:-outputs/lerobot_smolvla_libero_qwen_kv_b2}
-export JOB_NAME=${JOB_NAME:-smolvla-libero-qwen-kv-b2}
+export OUTPUT_DIR=${OUTPUT_DIR:-outputs/lerobot_smolvla_libero_qwen_kv_fusion_rank_b2}
+export JOB_NAME=${JOB_NAME:-smolvla-libero-qwen-kv-fusion-rank-b2}
 export WANDB_PROJECT=${WANDB_PROJECT:-thinkflow-smolvla-libero-b2}
 
 export STEPS=${STEPS:-30000}
+export BATCH_SIZE=${BATCH_SIZE:-64}
 export SAVE_FREQ=${SAVE_FREQ:-10000}
 export ENV_EVAL_FREQ=${ENV_EVAL_FREQ:-10000}
 export N_ACTION_STEPS=${N_ACTION_STEPS:-10}
+export EXTERNAL_LOGIT_BIAS_INIT=${EXTERNAL_LOGIT_BIAS_INIT:--1.0}
+export EXTERNAL_KV_RANKING_WEIGHT=${EXTERNAL_KV_RANKING_WEIGHT:-0.1}
+export EXTERNAL_KV_RANKING_MARGIN=${EXTERNAL_KV_RANKING_MARGIN:-0.01}
 
 # The live rollout reproduces the B2 cache extractor: five layer-7 spatial
 # tokens from LatentStudent, with stage1_unsloth supplying its processor.

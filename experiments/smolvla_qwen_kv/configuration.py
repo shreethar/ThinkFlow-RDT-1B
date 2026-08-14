@@ -26,6 +26,10 @@ class KVSmolVLAConfig(SmolVLAConfig):
     external_kv_token_count: int = 1
     external_kv_required: bool = True
     external_kv_logit_bias_init: float = -4.0
+    # Disabled by default so historical checkpoints retain their exact loss.
+    # New fusion-focused bootstraps explicitly enable the paired ranking term.
+    external_kv_ranking_weight: float = 0.0
+    external_kv_ranking_margin: float = 0.01
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -35,6 +39,10 @@ class KVSmolVLAConfig(SmolVLAConfig):
             )
         if self.external_kv_token_count <= 0:
             raise ValueError("external_kv_token_count must be positive")
+        if self.external_kv_ranking_weight < 0:
+            raise ValueError("external_kv_ranking_weight must be non-negative")
+        if self.external_kv_ranking_margin < 0:
+            raise ValueError("external_kv_ranking_margin must be non-negative")
         if "cross" not in self.attention_mode:
             raise ValueError("Qwen KV injection requires a SmolVLA cross-attention mode")
 
@@ -75,6 +83,8 @@ def make_libero_kv_config(
     external_kv_logit_bias_init: float = -4.0,
     external_kv_token_count: int = 1,
     external_kv_required: bool = True,
+    external_kv_ranking_weight: float = 0.0,
+    external_kv_ranking_margin: float = 0.01,
     preserve_pretrained_features: bool = False,
     local_files_only: bool = False,
 ) -> KVSmolVLAConfig:
@@ -123,6 +133,8 @@ def make_libero_kv_config(
         external_kv_logit_bias_init=external_kv_logit_bias_init,
         external_kv_token_count=external_kv_token_count,
         external_kv_required=external_kv_required,
+        external_kv_ranking_weight=external_kv_ranking_weight,
+        external_kv_ranking_margin=external_kv_ranking_margin,
         # The complete policy checkpoint is loaded immediately after construction.
         # Avoid separately downloading/loading another copy of the VLM weights first.
         load_vlm_weights=False,

@@ -511,6 +511,47 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
             )
         return external
 
+    @staticmethod
+    def _counterfactual_indices(batch: dict[str, Tensor], batch_size: int, device) -> tuple[Tensor, float]:
+        """Choose a cyclic donor assignment with maximum task mismatch.
+
+        Cached batches preserve ``qwen_group_id`` from the instruction. Searching
+        cyclic shifts gives a derangement without an expensive assignment solver.
+        If legacy data lacks the ID, a one-position derangement is still used.
+        """
+
+        if batch_size < 2:
+            return torch.arange(batch_size, device=device), 0.0
+        groups = batch.get("qwen_group_id")
+        if groups is None:
+            return torch.roll(torch.arange(batch_size, device=device), 1), 0.0
+        groups = torch.as_tensor(groups, device=device).reshape(batch_size)
+        base = torch.arange(batch_size, device=device)
+        best_indices = torch.roll(base, 1)
+        best_fraction = float((groups[best_indices] != groups).float().mean().item())
+        for shift in range(2, batch_size):
+            candidate = torch.roll(base, shift)
+            fraction = float((groups[candidate] != groups).float().mean().item())
+            if fraction > best_fraction:
+                best_indices = candidate
+                best_fraction = fraction
+            if best_fraction == 1.0:
+                break
+        return best_indices, best_fraction
+
+    @staticmethod
+    def _capture_rng_state() -> tuple[Tensor, list[Tensor] | None]:
+        cpu_state = torch.random.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        return cpu_state, cuda_state
+
+    @staticmethod
+    def _restore_rng_state(state: tuple[Tensor, list[Tensor] | None]) -> None:
+        cpu_state, cuda_state = state
+        torch.random.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
+
     def forward(
         self,
         batch: dict[str, Tensor],
@@ -519,8 +560,56 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
         reduction: str = "mean",
     ):
         external = self._external_kv_from_batch(batch)
+        ranking_weight = float(self.config.external_kv_ranking_weight)
+        use_ranking = (
+            self.training
+            and ranking_weight > 0.0
+            and reduction == "mean"
+            and external is not None
+            and external.shape[0] > 1
+        )
+        if not use_ranking:
+            with self.model.vlm_with_expert.use_external_kv(external):
+                return super().forward(batch, noise=noise, time=time, reduction=reduction)
+
+        # Replay the exact RNG stream for the counterfactual pass. Consequently
+        # both losses use identical diffusion noise, time, and dropout masks;
+        # only the external Qwen K/V donor changes.
+        rng_before = self._capture_rng_state()
         with self.model.vlm_with_expert.use_external_kv(external):
-            return super().forward(batch, noise=noise, time=time, reduction=reduction)
+            matched_loss, loss_dict = super().forward(
+                batch, noise=noise, time=time, reduction=reduction
+            )
+        rng_after = self._capture_rng_state()
+        donor_indices, task_mismatch = self._counterfactual_indices(
+            batch, external.shape[0], external.device
+        )
+        counterfactual = external.index_select(0, donor_indices)
+        try:
+            self._restore_rng_state(rng_before)
+            with self.model.vlm_with_expert.use_external_kv(counterfactual):
+                counterfactual_loss, _ = super().forward(
+                    batch, noise=noise, time=time, reduction=reduction
+                )
+        finally:
+            # One optimizer step should advance randomness exactly as one native
+            # forward, independent of whether fusion ranking is enabled.
+            self._restore_rng_state(rng_after)
+
+        margin = float(self.config.external_kv_ranking_margin)
+        ranking_loss = nn.functional.relu(margin + matched_loss - counterfactual_loss)
+        total_loss = matched_loss + ranking_weight * ranking_loss
+        loss_dict = dict(loss_dict)
+        loss_dict.update(
+            {
+                "imitation_loss": matched_loss.detach(),
+                "fusion_ranking_loss": ranking_loss.detach(),
+                "fusion_counterfactual_loss": counterfactual_loss.detach(),
+                "fusion_loss_gap": (counterfactual_loss - matched_loss).detach(),
+                "fusion_task_mismatch": matched_loss.new_tensor(task_mismatch),
+            }
+        )
+        return total_loss, loss_dict
 
     def _get_action_chunk(
         self,
