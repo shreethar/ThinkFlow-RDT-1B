@@ -602,11 +602,18 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
         loss_dict = dict(loss_dict)
         loss_dict.update(
             {
-                "imitation_loss": matched_loss.detach(),
-                "fusion_ranking_loss": ranking_loss.detach(),
-                "fusion_counterfactual_loss": counterfactual_loss.detach(),
-                "fusion_loss_gap": (counterfactual_loss - matched_loss).detach(),
-                "fusion_task_mismatch": matched_loss.new_tensor(task_mismatch),
+                # LeRobot's WandB wrapper deliberately accepts Python scalars
+                # rather than tensors. These are logging-only copies; the
+                # differentiable tensors above still form ``total_loss``.
+                "imitation_loss": float(matched_loss.detach().item()),
+                "fusion_ranking_loss": float(ranking_loss.detach().item()),
+                "fusion_counterfactual_loss": float(
+                    counterfactual_loss.detach().item()
+                ),
+                "fusion_loss_gap": float(
+                    (counterfactual_loss - matched_loss).detach().item()
+                ),
+                "fusion_task_mismatch": float(task_mismatch),
             }
         )
         return total_loss, loss_dict
