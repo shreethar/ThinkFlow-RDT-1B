@@ -14,6 +14,9 @@ set -euo pipefail
 #   MAX_SAMPLES_PER_EPISODE=128  # used only when ALL_SAMPLES_PER_EPISODE=0
 #   OVERWRITE=1
 #   INCLUDE_T5=0  # set to 1 to additionally cache T5 XXL language embeddings
+#   ATTN_IMPLEMENTATION=sdpa  # force identical attention kernels across checkpoints
+#   STUDENT_PRECISION=auto    # use bf16 to override an fp32 checkpoint
+#   MAX_BATCHES_PER_SPLIT=20  # short throughput benchmark
 
 SUITE=${1:?suite is required, e.g. libero_object/libero_spatial/libero_goal/libero_10/libero_90}
 
@@ -34,6 +37,9 @@ STUDENT_MODEL_ID=${STUDENT_MODEL_ID:-/workspace/model/LatentStudent-ckpt-400-fix
 PROCESSOR_ID=${PROCESSOR_ID:-/workspace/model/stage1_unsloth}
 LATENT_STUDENT_CODE_DIR=${LATENT_STUDENT_CODE_DIR:-/workspace/VLA-FYP/train/stage2}
 SPATIAL_PARAMETERS_PATH=${SPATIAL_PARAMETERS_PATH:-}
+ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-sdpa}
+STUDENT_PRECISION=${STUDENT_PRECISION:-auto}
+MAX_BATCHES_PER_SPLIT=${MAX_BATCHES_PER_SPLIT:-}
 
 T5_MODEL_ID=${T5_MODEL_ID:-/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v1_1-xxl}
 T5_PRECISION=${T5_PRECISION:-bf16}
@@ -69,6 +75,8 @@ ARGS=(
   --student-model-id "$STUDENT_MODEL_ID"
   --processor-id "$PROCESSOR_ID"
   --latent-student-code-dir "$LATENT_STUDENT_CODE_DIR"
+  --attn-implementation "$ATTN_IMPLEMENTATION"
+  --student-precision "$STUDENT_PRECISION"
   --spatial-token-count 5
   --layer-index 7
   --image-storage raw_uint8
@@ -78,6 +86,10 @@ ARGS=(
   --num-workers "$NUM_WORKERS"
   --pin-memory
 )
+
+if [[ -n "$MAX_BATCHES_PER_SPLIT" ]]; then
+  ARGS+=(--max-batches-per-split "$MAX_BATCHES_PER_SPLIT")
+fi
 
 if [[ "$INCLUDE_T5" == "1" ]]; then
   ARGS+=(

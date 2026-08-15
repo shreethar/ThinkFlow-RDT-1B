@@ -163,7 +163,31 @@ def load_student_and_processor(args: argparse.Namespace, device: torch.device) -
     print(f"Using latent student spatial_tokens shape={spatial_shape}")
     student.eval()
     student.requires_grad_(False)
-    student.to(device)
+    precision = getattr(args, "student_precision", "auto")
+    target_dtype = {
+        "auto": None,
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[precision]
+    if target_dtype is None:
+        student.to(device)
+    else:
+        student.to(device=device, dtype=target_dtype)
+    dtype_counts: dict[str, int] = {}
+    device_counts: dict[str, int] = {}
+    for parameter in student.parameters():
+        dtype_name = str(parameter.dtype).removeprefix("torch.")
+        device_name = str(parameter.device)
+        dtype_counts[dtype_name] = dtype_counts.get(dtype_name, 0) + parameter.numel()
+        device_counts[device_name] = device_counts.get(device_name, 0) + parameter.numel()
+    language_config = getattr(student._language_model, "config", None)
+    print(
+        "LatentStudent runtime: "
+        f"devices={device_counts} dtypes={dtype_counts} "
+        f"attention={getattr(language_config, '_attn_implementation', None)} "
+        f"M={int(student.M)} K={args.spatial_token_count}"
+    )
     return student, processor
 
 
@@ -902,6 +926,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer-index", type=int, default=7)
     parser.add_argument("--prompt-template", default=QWEN_TRAJECTORY_PROMPT_TEMPLATE)
     parser.add_argument("--device-map", default="auto")
+    parser.add_argument(
+        "--attn-implementation",
+        choices=["eager", "sdpa", "flash_attention_2"],
+        default=None,
+        help=(
+            "Override the attention backend serialized in the student checkpoint. "
+            "Use the same value when comparing checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--student-precision",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        default="auto",
+        help=(
+            "Move the loaded LatentStudent to this inference dtype. 'auto' preserves "
+            "the checkpoint dtype."
+        ),
+    )
 
     parser.add_argument(
         "--include-t5",
