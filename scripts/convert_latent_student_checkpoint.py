@@ -6,6 +6,7 @@ import json
 import shutil
 from pathlib import Path
 
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 
@@ -33,17 +34,81 @@ def copy_if_present(src_dir: Path, dst_dir: Path, names: tuple[str, ...]) -> lis
     return copied
 
 
+def fixed_key(key: str) -> str:
+    if key.startswith(VISUAL_PREFIX):
+        return FIXED_VISUAL_PREFIX + key[len(VISUAL_PREFIX) :]
+    return key
+
+
 def convert_safetensors(src_model: Path, dst_model: Path) -> dict[str, int]:
     state = load_file(str(src_model))
     fixed = {}
     renamed = 0
     for key, value in state.items():
-        if key.startswith(VISUAL_PREFIX):
-            key = FIXED_VISUAL_PREFIX + key[len(VISUAL_PREFIX) :]
+        new_key = fixed_key(key)
+        if new_key != key:
             renamed += 1
-        fixed[key] = value
+        if new_key in fixed:
+            raise ValueError(f"Renaming creates duplicate tensor key: {new_key}")
+        fixed[new_key] = value
     save_file(fixed, str(dst_model))
     return {"tensors": len(state), "renamed_visual_tensors": renamed}
+
+
+def convert_model_weights(src: Path, dst: Path) -> dict[str, object]:
+    index_path = src / "model.safetensors.index.json"
+    single_path = src / "model.safetensors"
+
+    if index_path.exists():
+        with index_path.open(encoding="utf-8") as handle:
+            index = json.load(handle)
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict):
+            raise ValueError(f"Invalid or missing weight_map in {index_path}")
+        shard_names = sorted(set(weight_map.values()))
+    elif single_path.exists():
+        shard_names = [single_path.name]
+        index = None
+    else:
+        shard_names = sorted(path.name for path in src.glob("model-*-of-*.safetensors"))
+        index = None
+        if not shard_names:
+            raise FileNotFoundError(
+                f"No model.safetensors, model.safetensors.index.json, or numbered shards in {src}"
+            )
+
+    if len(shard_names) > 1 and index is None:
+        weight_map = {}
+        for shard_name in shard_names:
+            with safe_open(src / shard_name, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if key in weight_map:
+                        raise ValueError(f"Tensor key occurs in multiple shards: {key}")
+                    weight_map[key] = shard_name
+        index = {"metadata": {}, "weight_map": weight_map}
+
+    totals = {"tensors": 0, "renamed_visual_tensors": 0}
+    for shard_name in shard_names:
+        shard = src / shard_name
+        if not shard.exists():
+            raise FileNotFoundError(f"Shard listed by checkpoint is missing: {shard}")
+        counts = convert_safetensors(shard, dst / shard_name)
+        totals["tensors"] += counts["tensors"]
+        totals["renamed_visual_tensors"] += counts["renamed_visual_tensors"]
+
+    if index is not None:
+        new_weight_map = {}
+        for key, shard_name in weight_map.items():
+            new_key = fixed_key(key)
+            if new_key in new_weight_map:
+                raise ValueError(f"Renaming creates duplicate index key: {new_key}")
+            new_weight_map[new_key] = shard_name
+        index["weight_map"] = new_weight_map
+        with (dst / "model.safetensors.index.json").open("w", encoding="utf-8") as handle:
+            json.dump(index, handle, indent=2)
+            handle.write("\n")
+
+    return {**totals, "weight_files": shard_names, "sharded": len(shard_names) > 1}
 
 
 def main() -> None:
@@ -73,18 +138,13 @@ def main() -> None:
     src = args.src.expanduser().resolve()
     dst = args.dst.expanduser().resolve()
     processor_src = args.processor_src.expanduser().resolve()
-    src_model = src / "model.safetensors"
-    dst_model = dst / "model.safetensors"
-
-    if not src_model.exists():
-        raise FileNotFoundError(src_model)
     if not processor_src.exists():
         raise FileNotFoundError(processor_src)
 
     dst.mkdir(parents=True, exist_ok=True)
     copied_model_files = copy_if_present(src, dst, MODEL_FILES)
     copied_processor_files = copy_if_present(processor_src, dst, PROCESSOR_FILES)
-    counts = convert_safetensors(src_model, dst_model)
+    counts = convert_model_weights(src, dst)
 
     copied_extra_files: list[str] = []
     spatial_params = src / "spatial_parameters.pt"
