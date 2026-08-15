@@ -70,6 +70,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--external-logit-bias-init", type=float, default=-1.0)
     parser.add_argument("--external-kv-ranking-weight", type=float, default=0.1)
     parser.add_argument("--external-kv-ranking-margin", type=float, default=0.01)
+    parser.add_argument("--external-kv-adapter-warmup-steps", type=int, default=1000)
+    parser.add_argument("--external-kv-adapter-learning-rate", type=float, default=1.0e-4)
+    parser.add_argument("--action-expert-learning-rate", type=float, default=1.0e-5)
     parser.add_argument("--external-kv-token-count", type=int, choices=[1, 5], default=1)
     parser.add_argument(
         "--external-kv-optional",
@@ -162,6 +165,9 @@ def main() -> None:
         external_kv_required=not args.external_kv_optional,
         external_kv_ranking_weight=args.external_kv_ranking_weight,
         external_kv_ranking_margin=args.external_kv_ranking_margin,
+        external_kv_adapter_warmup_steps=args.external_kv_adapter_warmup_steps,
+        external_kv_adapter_learning_rate=args.external_kv_adapter_learning_rate,
+        action_expert_learning_rate=args.action_expert_learning_rate,
         # The official smolvla_libero processor maps observations to camera1/camera2.
         # A behavior-preserving conversion must keep those exact feature names;
         # replacing them with cache-training names image/image2 breaks inference.
@@ -217,6 +223,9 @@ def main() -> None:
         "external_kv_logit_bias_init": config.external_kv_logit_bias_init,
         "external_kv_ranking_weight": config.external_kv_ranking_weight,
         "external_kv_ranking_margin": config.external_kv_ranking_margin,
+        "external_kv_adapter_warmup_steps": config.external_kv_adapter_warmup_steps,
+        "external_kv_adapter_learning_rate": config.external_kv_adapter_learning_rate,
+        "action_expert_learning_rate": config.action_expert_learning_rate,
         "initialization": {
             "native_smolvla": "pretrained base weights",
             "external_qwen_kv_adapters": "new seeded initialization",

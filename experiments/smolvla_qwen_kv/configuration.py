@@ -30,6 +30,9 @@ class KVSmolVLAConfig(SmolVLAConfig):
     # New fusion-focused bootstraps explicitly enable the paired ranking term.
     external_kv_ranking_weight: float = 0.0
     external_kv_ranking_margin: float = 0.01
+    external_kv_adapter_warmup_steps: int = 0
+    external_kv_adapter_learning_rate: float = 1.0e-4
+    action_expert_learning_rate: float = 1.0e-5
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -43,6 +46,12 @@ class KVSmolVLAConfig(SmolVLAConfig):
             raise ValueError("external_kv_ranking_weight must be non-negative")
         if self.external_kv_ranking_margin < 0:
             raise ValueError("external_kv_ranking_margin must be non-negative")
+        if self.external_kv_adapter_warmup_steps < 0:
+            raise ValueError("external_kv_adapter_warmup_steps must be non-negative")
+        if self.external_kv_adapter_learning_rate <= 0:
+            raise ValueError("external_kv_adapter_learning_rate must be positive")
+        if self.action_expert_learning_rate <= 0:
+            raise ValueError("action_expert_learning_rate must be positive")
         if "cross" not in self.attention_mode:
             raise ValueError("Qwen KV injection requires a SmolVLA cross-attention mode")
 
@@ -85,6 +94,9 @@ def make_libero_kv_config(
     external_kv_required: bool = True,
     external_kv_ranking_weight: float = 0.0,
     external_kv_ranking_margin: float = 0.01,
+    external_kv_adapter_warmup_steps: int = 0,
+    external_kv_adapter_learning_rate: float = 1.0e-4,
+    action_expert_learning_rate: float = 1.0e-5,
     preserve_pretrained_features: bool = False,
     local_files_only: bool = False,
 ) -> KVSmolVLAConfig:
@@ -135,6 +147,9 @@ def make_libero_kv_config(
         external_kv_required=external_kv_required,
         external_kv_ranking_weight=external_kv_ranking_weight,
         external_kv_ranking_margin=external_kv_ranking_margin,
+        external_kv_adapter_warmup_steps=external_kv_adapter_warmup_steps,
+        external_kv_adapter_learning_rate=external_kv_adapter_learning_rate,
+        action_expert_learning_rate=action_expert_learning_rate,
         # The complete policy checkpoint is loaded immediately after construction.
         # Avoid separately downloading/loading another copy of the VLM weights first.
         load_vlm_weights=False,

@@ -18,14 +18,14 @@ BATCH_SIZE=${BATCH_SIZE:-8}
 PREDICTION_SAMPLES=${PREDICTION_SAMPLES:-32}
 
 if [[ "$MODE" == "b0" ]]; then
-  CHECKPOINT=${CHECKPOINT:-outputs/lerobot_smolvla_libero_qwen_kv_fusion_rank_b0/checkpoints/last}
+  CHECKPOINT=${CHECKPOINT:-outputs/lerobot_smolvla_libero_qwen_kv_staged_b0/checkpoints/last}
   CACHE_ROOT=${CACHE_ROOT:-cache_features_libero_b0_raw_ortho6d}
-  REFERENCE_CHECKPOINT=${REFERENCE_CHECKPOINT:-outputs/smolvla_libero_qwen_kv_fusion_rank_init_b0}
+  REFERENCE_CHECKPOINT=${REFERENCE_CHECKPOINT:-outputs/smolvla_libero_qwen_kv_staged_init_b0}
   OUTPUT=${OUTPUT:-outputs/validation_cached_qwen_usage_b0.json}
 else
-  CHECKPOINT=${CHECKPOINT:-outputs/lerobot_smolvla_libero_qwen_kv_fusion_rank_b2/checkpoints/last}
+  CHECKPOINT=${CHECKPOINT:-outputs/lerobot_smolvla_libero_qwen_kv_staged_b2/checkpoints/last}
   CACHE_ROOT=${CACHE_ROOT:-cache_features_libero_b2_native}
-  REFERENCE_CHECKPOINT=${REFERENCE_CHECKPOINT:-outputs/smolvla_libero_qwen_kv_fusion_rank_init_b2}
+  REFERENCE_CHECKPOINT=${REFERENCE_CHECKPOINT:-outputs/smolvla_libero_qwen_kv_staged_init_b2}
   OUTPUT=${OUTPUT:-outputs/validation_cached_qwen_usage_b2.json}
 fi
 

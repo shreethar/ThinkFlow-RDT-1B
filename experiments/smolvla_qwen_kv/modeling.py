@@ -8,6 +8,7 @@ query/key interaction would be mathematically inert.
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from contextlib import contextmanager
 from typing import Iterator, Unpack
@@ -484,6 +485,112 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
         self.init_rtc_processor()
         self.model = QwenKVVLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
+        self.register_buffer(
+            "_fusion_training_step",
+            torch.zeros((), dtype=torch.long),
+            persistent=True,
+        )
+        self._fusion_optimizer_step = 0
+        self._configure_staged_training()
+
+    @staticmethod
+    def _is_external_adapter_parameter(name: str) -> bool:
+        return any(
+            marker in name
+            for marker in (
+                "external_key_projections",
+                "external_value_projections",
+                "external_logit_biases",
+            )
+        )
+
+    def _configure_staged_training(self) -> None:
+        """Partition trainable parameters and suppress expert updates in warmup.
+
+        Expert parameters stay ``requires_grad=True`` so optimizers and DDP
+        register them at construction time. During adapter warmup post-accumulate
+        hooks clear their gradients before ``optimizer.step``; therefore neither
+        weights nor Adam moments advance before the joint phase.
+        """
+
+        adapter_names: list[str] = []
+        joint_names: list[str] = []
+        for name, parameter in self.named_parameters():
+            if name == "_fusion_training_step":
+                continue
+            if self._is_external_adapter_parameter(name):
+                parameter.requires_grad_(True)
+                adapter_names.append(name)
+            elif parameter.requires_grad:
+                joint_names.append(name)
+        if not adapter_names:
+            raise RuntimeError("No trainable external Qwen K/V adapter parameters found")
+        if not joint_names:
+            raise RuntimeError("No trainable Action Expert parameters found")
+        self._fusion_adapter_parameter_names = tuple(adapter_names)
+        self._fusion_joint_parameter_names = tuple(joint_names)
+
+        warmup_steps = int(self.config.external_kv_adapter_warmup_steps)
+        if warmup_steps > 0:
+            named_parameters = dict(self.named_parameters())
+            for name in self._fusion_joint_parameter_names:
+                parameter = named_parameters[name]
+                if not hasattr(parameter, "register_post_accumulate_grad_hook"):
+                    raise RuntimeError(
+                        "Adapter-only warmup requires PyTorch "
+                        "register_post_accumulate_grad_hook support"
+                    )
+                parameter.register_post_accumulate_grad_hook(
+                    self._clear_joint_gradient_during_warmup
+                )
+
+    def _clear_joint_gradient_during_warmup(self, parameter: Tensor) -> None:
+        if self._fusion_optimizer_step < int(self.config.external_kv_adapter_warmup_steps):
+            parameter.grad = None
+
+    def get_optim_params(self) -> list[dict]:
+        """Return separate adapter and Action Expert learning-rate groups."""
+
+        named_parameters = dict(self.named_parameters())
+        adapters = [named_parameters[name] for name in self._fusion_adapter_parameter_names]
+        joint = [named_parameters[name] for name in self._fusion_joint_parameter_names]
+        return [
+            {
+                "name": "qwen_adapters",
+                "params": adapters,
+                "lr": float(self.config.external_kv_adapter_learning_rate),
+            },
+            {
+                "name": "action_expert",
+                "params": joint,
+                "lr": float(self.config.action_expert_learning_rate),
+                # Zero gradients during warmup must imply exactly zero updates;
+                # decoupled AdamW weight decay would otherwise move the expert.
+                "weight_decay": 0.0,
+            },
+        ]
+
+    def update(self) -> None:
+        """Advance the optimizer-step phase after LeRobot completes an update."""
+
+        previous = self._fusion_optimizer_step
+        self._fusion_optimizer_step += 1
+        self._fusion_training_step.fill_(self._fusion_optimizer_step)
+        warmup_steps = int(self.config.external_kv_adapter_warmup_steps)
+        if previous < warmup_steps <= self._fusion_optimizer_step:
+            logging.info(
+                "Qwen adapter warmup complete at step %d; enabling joint Action Expert training",
+                self._fusion_optimizer_step,
+            )
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Load staged-training progress while accepting historical checkpoints."""
+
+        mutable_state = dict(state_dict)
+        mutable_state.setdefault("_fusion_training_step", self._fusion_training_step.clone())
+        result = super().load_state_dict(mutable_state, strict=strict, assign=assign)
+        self._fusion_optimizer_step = int(self._fusion_training_step.item())
+        return result
 
     def reset(self) -> None:
         self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
@@ -600,6 +707,8 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
         ranking_loss = nn.functional.relu(margin + matched_loss - counterfactual_loss)
         total_loss = matched_loss + ranking_weight * ranking_loss
         loss_dict = dict(loss_dict)
+        warmup_steps = int(self.config.external_kv_adapter_warmup_steps)
+        warmup_active = self._fusion_optimizer_step < warmup_steps
         loss_dict.update(
             {
                 # LeRobot's WandB wrapper deliberately accepts Python scalars
@@ -614,6 +723,14 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
                     (counterfactual_loss - matched_loss).detach().item()
                 ),
                 "fusion_task_mismatch": float(task_mismatch),
+                "fusion_training_step": float(self._fusion_optimizer_step),
+                "fusion_adapter_warmup_active": float(warmup_active),
+                "fusion_configured_adapter_lr": float(
+                    self.config.external_kv_adapter_learning_rate
+                ),
+                "fusion_configured_action_expert_lr": float(
+                    self.config.action_expert_learning_rate
+                ),
             }
         )
         return total_loss, loss_dict

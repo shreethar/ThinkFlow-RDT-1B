@@ -124,6 +124,28 @@ def test_counterfactual_indices_support_legacy_batches() -> None:
     assert mismatch == 0.0
 
 
+def test_adapter_warmup_clears_joint_gradient() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    parameter.grad = torch.ones_like(parameter)
+    policy = SimpleNamespace(
+        _fusion_optimizer_step=4,
+        config=SimpleNamespace(external_kv_adapter_warmup_steps=5),
+    )
+    KVSmolVLAPolicy._clear_joint_gradient_during_warmup(policy, parameter)
+    assert parameter.grad is None
+
+
+def test_joint_phase_preserves_expert_gradient() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    parameter.grad = torch.ones_like(parameter)
+    policy = SimpleNamespace(
+        _fusion_optimizer_step=5,
+        config=SimpleNamespace(external_kv_adapter_warmup_steps=5),
+    )
+    KVSmolVLAPolicy._clear_joint_gradient_during_warmup(policy, parameter)
+    assert torch.equal(parameter.grad, torch.ones_like(parameter))
+
+
 def test_action_chunk_padding_and_validity() -> None:
     actions = torch.arange(21, dtype=torch.float32).reshape(3, 7)
     valid = torch.tensor([True, True, False])

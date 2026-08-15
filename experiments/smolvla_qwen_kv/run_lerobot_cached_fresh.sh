@@ -119,6 +119,9 @@ N_ACTION_STEPS=${N_ACTION_STEPS:-}
 EXTERNAL_LOGIT_BIAS_INIT=${EXTERNAL_LOGIT_BIAS_INIT:--1.0}
 EXTERNAL_KV_RANKING_WEIGHT=${EXTERNAL_KV_RANKING_WEIGHT:-0.1}
 EXTERNAL_KV_RANKING_MARGIN=${EXTERNAL_KV_RANKING_MARGIN:-0.01}
+EXTERNAL_KV_ADAPTER_WARMUP_STEPS=${EXTERNAL_KV_ADAPTER_WARMUP_STEPS:-1000}
+EXTERNAL_KV_ADAPTER_LR=${EXTERNAL_KV_ADAPTER_LR:-1.0e-4}
+ACTION_EXPERT_LR=${ACTION_EXPERT_LR:-1.0e-5}
 
 echo "SmolVLA Qwen-KV training configuration:"
 echo "  mode: $([[ "$QWEN_TOKEN_COUNT" == "5" ]] && echo B2 || echo B0)"
@@ -130,6 +133,9 @@ echo "  output: $OUTPUT_DIR"
 echo "  external logit bias init: $EXTERNAL_LOGIT_BIAS_INIT"
 echo "  fusion ranking weight: $EXTERNAL_KV_RANKING_WEIGHT"
 echo "  fusion ranking margin: $EXTERNAL_KV_RANKING_MARGIN"
+echo "  adapter-only warmup steps: $EXTERNAL_KV_ADAPTER_WARMUP_STEPS"
+echo "  Qwen adapter LR: $EXTERNAL_KV_ADAPTER_LR"
+echo "  joint Action Expert LR: $ACTION_EXPERT_LR"
 
 LOCAL_FILES_ARGS=()
 case "${HF_HUB_OFFLINE,,}" in
@@ -154,6 +160,9 @@ if [[ ! -f "$BOOTSTRAP_DIR/model.safetensors" ]]; then
     --external-logit-bias-init "$EXTERNAL_LOGIT_BIAS_INIT" \
     --external-kv-ranking-weight "$EXTERNAL_KV_RANKING_WEIGHT" \
     --external-kv-ranking-margin "$EXTERNAL_KV_RANKING_MARGIN" \
+    --external-kv-adapter-warmup-steps "$EXTERNAL_KV_ADAPTER_WARMUP_STEPS" \
+    --external-kv-adapter-learning-rate "$EXTERNAL_KV_ADAPTER_LR" \
+    --action-expert-learning-rate "$ACTION_EXPERT_LR" \
     --device cpu \
     --seed 42 \
     "${ACTION_STEP_ARGS[@]}" \
