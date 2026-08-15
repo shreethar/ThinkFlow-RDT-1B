@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         default="sdpa",
         help="Attention backend used only while loading LatentStudent for live rollout.",
     )
+    parser.add_argument(
+        "--latent-student-precision",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        default="bf16",
+        help="Inference dtype for LatentStudent during B2 live rollout.",
+    )
     parser.add_argument("--save-videos", action="store_true")
     parser.add_argument("--video-resolution", type=int, default=512)
     parser.add_argument("--video-fps", type=int, default=20)
@@ -275,9 +281,22 @@ def run_evaluation(
     from libero.libero.benchmark import get_benchmark
     from libero.libero.envs import OffScreenRenderEnv, SubprocVectorEnv
 
-    device = torch.device(args.device)
+    requested_device = torch.device(args.device)
+    if policy_override is not None:
+        try:
+            device = next(policy_override.parameters()).device
+        except StopIteration as exc:
+            raise RuntimeError("The in-memory evaluation policy has no parameters") from exc
+        if device != requested_device:
+            print(
+                "Using live training-policy device for evaluation: "
+                f"{device} (serialized/requested device was {requested_device})"
+            )
+    else:
+        device = requested_device
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+    print(f"SmolVLA/Qwen evaluation device: {device}")
 
     if policy_override is None:
         config = PreTrainedConfig.from_pretrained(checkpoint, local_files_only=True)
@@ -382,6 +401,7 @@ def run_evaluation(
             ),
             spatial_token_count=spatial_token_count,
             attn_implementation=args.latent_student_attn_implementation,
+            student_precision=args.latent_student_precision,
         )
         print(
             f"Loading LatentStudent extractor {student_id} at layer "
@@ -555,6 +575,12 @@ def run_evaluation(
                             "task": [task.language] * len(active),
                         }
                         policy_batch = preprocessor(raw_batch)
+                        policy_batch = {
+                            key: value.to(device, non_blocking=True)
+                            if isinstance(value, torch.Tensor)
+                            else value
+                            for key, value in policy_batch.items()
+                        }
                         # The checkpoint's saved processor predates plugin metadata
                         # registration, so explicitly attach the live tensor too.
                         if qwen_kv is not None:

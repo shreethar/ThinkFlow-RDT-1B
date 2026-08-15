@@ -133,6 +133,15 @@ def _run_periodic_qwen_rollout(
     task_ids = [int(value) for value in _comma_values("SMOLVLA_QWEN_EVAL_TASK_IDS", "0")]
     max_steps_value = os.environ.get("SMOLVLA_QWEN_EVAL_MAX_STEPS")
     qwen_model_id = os.environ.get("SMOLVLA_QWEN_EVAL_QWEN_MODEL")
+    try:
+        live_policy_device = next(policy.parameters()).device
+    except StopIteration as exc:
+        raise RuntimeError("Cannot derive rollout device from a parameterless policy") from exc
+    if live_policy_device.type != "cuda" and __import__("torch").cuda.is_available():
+        raise RuntimeError(
+            "Periodic Qwen rollout received a CPU policy while CUDA is available; "
+            "refusing an unintended CPU evaluation"
+        )
     args = argparse.Namespace(
         checkpoint=checkpoint_dir / "pretrained_model" / "train_config.json",
         cache_root=Path(cfg.dataset.root),
@@ -150,8 +159,10 @@ def _run_periodic_qwen_rollout(
         ),
         max_steps=None if max_steps_value is None else int(max_steps_value),
         seed=int(cfg.seed if cfg.seed is not None else 42),
-        device=str(policy.config.device),
-        qwen_device_map=os.environ.get("SMOLVLA_QWEN_EVAL_QWEN_DEVICE_MAP", "cuda"),
+        device=str(live_policy_device),
+        qwen_device_map=os.environ.get(
+            "SMOLVLA_QWEN_EVAL_QWEN_DEVICE_MAP", str(live_policy_device)
+        ),
         qwen_model_id=qwen_model_id,
         qwen_processor_id=os.environ.get(
             "SMOLVLA_QWEN_EVAL_QWEN_PROCESSOR"
@@ -176,6 +187,9 @@ def _run_periodic_qwen_rollout(
         ),
         latent_student_attn_implementation=os.environ.get(
             "SMOLVLA_QWEN_EVAL_LATENT_ATTN_IMPLEMENTATION", "sdpa"
+        ),
+        latent_student_precision=os.environ.get(
+            "SMOLVLA_QWEN_EVAL_LATENT_PRECISION", "bf16"
         ),
         save_videos=_env_bool("SMOLVLA_QWEN_EVAL_SAVE_VIDEOS", True),
         video_resolution=int(os.environ.get("SMOLVLA_QWEN_EVAL_VIDEO_RESOLUTION", "512")),

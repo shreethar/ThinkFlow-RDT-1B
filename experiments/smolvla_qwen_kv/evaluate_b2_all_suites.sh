@@ -35,6 +35,7 @@ VIDEO_RESOLUTION=${VIDEO_RESOLUTION:-512}
 LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY:-1}
 LATENT_STUDENT_CODE_DIR=${LATENT_STUDENT_CODE_DIR:-/workspace/VLA-FYP/train/stage2}
 LATENT_ATTN_IMPLEMENTATION=${LATENT_ATTN_IMPLEMENTATION:-sdpa}
+LATENT_STUDENT_PRECISION=${LATENT_STUDENT_PRECISION:-bf16}
 
 SMOLVLA_VENV=${SMOLVLA_VENV:-}
 if [[ -z "$SMOLVLA_VENV" ]]; then
@@ -130,5 +131,6 @@ exec "$PYTHON" -m experiments.smolvla_qwen_kv.evaluate_checkpoint \
   --max-steps "$MAX_STEPS" \
   --latent-student-code-dir "$LATENT_STUDENT_CODE_DIR" \
   --latent-student-attn-implementation "$LATENT_ATTN_IMPLEMENTATION" \
+  --latent-student-precision "$LATENT_STUDENT_PRECISION" \
   "${VIDEO_ARGS[@]}" \
   "${LOCAL_ARGS[@]}"

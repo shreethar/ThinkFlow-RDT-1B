@@ -181,6 +181,13 @@ def load_student_and_processor(args: argparse.Namespace, device: torch.device) -
         device_name = str(parameter.device)
         dtype_counts[dtype_name] = dtype_counts.get(dtype_name, 0) + parameter.numel()
         device_counts[device_name] = device_counts.get(device_name, 0) + parameter.numel()
+        if parameter.device.type != device.type or (
+            device.index is not None and parameter.device.index != device.index
+        ):
+            raise RuntimeError(
+                "LatentStudent parameter placement does not match requested device: "
+                f"parameter={parameter.device}, requested={device}"
+            )
     language_config = getattr(student._language_model, "config", None)
     print(
         "LatentStudent runtime: "
