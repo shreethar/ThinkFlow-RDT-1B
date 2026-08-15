@@ -105,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         choices=("eager", "sdpa", "flash_attention_2"),
         default="sdpa",
     )
+    parser.add_argument(
+        "--latent-student-precision",
+        choices=("auto", "bf16", "fp16", "fp32"),
+        default="bf16",
+        help="Inference dtype for the B2/B3 LatentStudent extractor.",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     return parser.parse_args()
 
@@ -271,6 +277,7 @@ def make_live_extractor(
             ),
             spatial_token_count=spatial_count,
             attn_implementation=args.latent_student_attn_implementation,
+            student_precision=args.latent_student_precision,
         )
         student, processor = load_student_and_processor(student_args, device)
 
@@ -428,6 +435,14 @@ def main() -> None:
         local_files_only=True,
         strict=True,
     ).eval()
+    policy_device = next(policy.parameters()).device
+    if policy_device.type != device.type or (
+        device.index is not None and policy_device.index != device.index
+    ):
+        raise RuntimeError(
+            f"Policy loaded on {policy_device}, but evaluation requested {device}"
+        )
+    print(f"SmolVLA evaluation device: {policy_device}")
     base_preprocessor, postprocessor = make_pre_post_processors(
         config,
         str(checkpoint),
