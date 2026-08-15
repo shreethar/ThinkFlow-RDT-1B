@@ -112,7 +112,10 @@ JOB_NAME=${JOB_NAME:-$DEFAULT_JOB_NAME}
 WANDB_PROJECT=${WANDB_PROJECT:-$DEFAULT_WANDB_PROJECT}
 STEPS=${STEPS:-100000}
 BATCH_SIZE=${BATCH_SIZE:-128}
-NUM_WORKERS=${NUM_WORKERS:-8}
+# Forking workers after CUDA/Transformers initialization can deadlock before the
+# first batch. Cached shards are already materialized and cheap to read, so use
+# the reliable single-process path by default; callers can opt back into workers.
+NUM_WORKERS=${NUM_WORKERS:-0}
 SAVE_FREQ=${SAVE_FREQ:-1000}
 ENV_EVAL_FREQ=${ENV_EVAL_FREQ:-5000}
 N_ACTION_STEPS=${N_ACTION_STEPS:-}
@@ -130,6 +133,8 @@ echo "  source model: $BASE_MODEL"
 echo "  cache root: $CACHE_ROOT"
 echo "  bootstrap: $BOOTSTRAP_DIR"
 echo "  output: $OUTPUT_DIR"
+echo "  batch size: $BATCH_SIZE"
+echo "  data loader workers: $NUM_WORKERS"
 echo "  external logit bias init: $EXTERNAL_LOGIT_BIAS_INIT"
 echo "  fusion ranking weight: $EXTERNAL_KV_RANKING_WEIGHT"
 echo "  fusion ranking margin: $EXTERNAL_KV_RANKING_MARGIN"

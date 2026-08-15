@@ -491,6 +491,7 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
             persistent=True,
         )
         self._fusion_optimizer_step = 0
+        self._fusion_first_forward_logged = False
         self._configure_staged_training()
 
     @staticmethod
@@ -667,6 +668,13 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
         reduction: str = "mean",
     ):
         external = self._external_kv_from_batch(batch)
+        log_first_forward = self.training and not self._fusion_first_forward_logged
+        if log_first_forward:
+            logging.info(
+                "Staged Qwen training received first batch: qwen=%s device=%s",
+                tuple(external.shape) if external is not None else None,
+                external.device if external is not None else None,
+            )
         ranking_weight = float(self.config.external_kv_ranking_weight)
         use_ranking = (
             self.training
@@ -687,6 +695,8 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
             matched_loss, loss_dict = super().forward(
                 batch, noise=noise, time=time, reduction=reduction
             )
+        if log_first_forward:
+            logging.info("Staged Qwen first matched forward completed")
         rng_after = self._capture_rng_state()
         donor_indices, task_mismatch = self._counterfactual_indices(
             batch, external.shape[0], external.device
@@ -698,6 +708,8 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
                 counterfactual_loss, _ = super().forward(
                     batch, noise=noise, time=time, reduction=reduction
                 )
+            if log_first_forward:
+                logging.info("Staged Qwen first counterfactual forward completed")
         finally:
             # One optimizer step should advance randomness exactly as one native
             # forward, independent of whether fusion ranking is enabled.
@@ -706,6 +718,15 @@ class KVSmolVLAPolicy(SmolVLAPolicy):
         margin = float(self.config.external_kv_ranking_margin)
         ranking_loss = nn.functional.relu(margin + matched_loss - counterfactual_loss)
         total_loss = matched_loss + ranking_weight * ranking_loss
+        if log_first_forward:
+            logging.info(
+                "Staged Qwen first loss ready; trainer will now run backward "
+                "(matched=%.6f counterfactual=%.6f ranking=%.6f)",
+                float(matched_loss.detach().item()),
+                float(counterfactual_loss.detach().item()),
+                float(ranking_loss.detach().item()),
+            )
+            self._fusion_first_forward_logged = True
         loss_dict = dict(loss_dict)
         warmup_steps = int(self.config.external_kv_adapter_warmup_steps)
         warmup_active = self._fusion_optimizer_step < warmup_steps

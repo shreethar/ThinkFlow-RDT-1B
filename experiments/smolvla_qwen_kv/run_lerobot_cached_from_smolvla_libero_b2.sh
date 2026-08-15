@@ -17,6 +17,9 @@ export WANDB_PROJECT=${WANDB_PROJECT:-thinkflow-smolvla-libero-b2}
 
 export STEPS=${STEPS:-30000}
 export BATCH_SIZE=${BATCH_SIZE:-64}
+# Loading torch shards in forked workers after CUDA/Transformers startup can
+# deadlock before the first batch. The cached reader is fast enough in-process.
+export NUM_WORKERS=${NUM_WORKERS:-0}
 export SAVE_FREQ=${SAVE_FREQ:-10000}
 export ENV_EVAL_FREQ=${ENV_EVAL_FREQ:-10000}
 export N_ACTION_STEPS=${N_ACTION_STEPS:-10}
