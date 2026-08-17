@@ -65,3 +65,5 @@ libero-dataset/
 cache_features_libero_b0_raw_ortho6d/
 cache_features_libero_object_task0_10demos/
 cache_features_libero_object_task0_demo0/
+
+__pycache__/
