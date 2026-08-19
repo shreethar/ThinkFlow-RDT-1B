@@ -51,7 +51,9 @@ def gripper_change_window_indices(
     if action_array.ndim != 2 or action_array.shape[0] == 0:
         return []
     if action_array.shape[1] < 1:
-        raise ValueError(f"Expected at least one action dimension, got {action_array.shape}")
+        raise ValueError(
+            f"Expected at least one action dimension, got {action_array.shape}"
+        )
 
     # Every standardized action schema keeps gripper as its final dimension.
     gripper = (action_array[:, -1] >= gripper_threshold).astype(np.int8)
@@ -103,6 +105,59 @@ def directional_gripper_change_window_indices(
     return sorted(selected)
 
 
+def first_directional_gripper_change_window_indices(
+    actions: np.ndarray,
+    *,
+    open_to_close_before: int = DEFAULT_OPEN_TO_CLOSE_BEFORE,
+    open_to_close_after: int = DEFAULT_OPEN_TO_CLOSE_AFTER,
+    close_to_open_before: int = DEFAULT_CLOSE_TO_OPEN_BEFORE,
+    close_to_open_after: int = DEFAULT_CLOSE_TO_OPEN_AFTER,
+    gripper_threshold: float = 0.5,
+) -> list[int]:
+    """Select windows around the first close and first open transition.
+
+    A transition at index ``t`` contributes ``before`` indices ending at
+    ``t - 1`` and ``after`` indices beginning at ``t``.  Therefore a 4/4
+    policy selects exactly eight frames per direction when the transition is
+    far enough from the episode boundary.  Later transitions in the same
+    direction are deliberately ignored.
+    """
+    action_array = np.asarray(actions, dtype=np.float32)
+    if action_array.ndim != 2 or action_array.shape[0] == 0:
+        return []
+    if action_array.shape[1] < 1:
+        raise ValueError(f"Expected at least one action dimension, got {action_array.shape}")
+
+    gripper = (action_array[:, -1] >= gripper_threshold).astype(np.int8)
+    change_steps = np.flatnonzero(gripper[1:] != gripper[:-1]) + 1
+    total_steps = int(action_array.shape[0])
+    found_close = False
+    found_open = False
+    selected: set[int] = set()
+
+    for raw_change_step in change_steps:
+        change_step = int(raw_change_step)
+        previous = int(gripper[change_step - 1])
+        current = int(gripper[change_step])
+        if previous == 0 and current == 1 and not found_close:
+            before = open_to_close_before
+            after = open_to_close_after
+            found_close = True
+        elif previous == 1 and current == 0 and not found_open:
+            before = close_to_open_before
+            after = close_to_open_after
+            found_open = True
+        else:
+            continue
+
+        selected.update(range(max(0, change_step - before), change_step))
+        selected.update(range(change_step, min(total_steps, change_step + after)))
+        if found_close and found_open:
+            break
+
+    return sorted(selected)
+
+
 def build_episode_sample_indices(
     instructions: list[str],
     actions: np.ndarray,
@@ -142,6 +197,15 @@ def build_episode_sample_indices(
     valid_set = set(valid_steps)
     if gripper_change_scope == "directional":
         special_candidates = directional_gripper_change_window_indices(
+            actions,
+            open_to_close_before=open_to_close_before,
+            open_to_close_after=open_to_close_after,
+            close_to_open_before=close_to_open_before,
+            close_to_open_after=close_to_open_after,
+            gripper_threshold=gripper_threshold,
+        )
+    elif gripper_change_scope == "first_directional":
+        special_candidates = first_directional_gripper_change_window_indices(
             actions,
             open_to_close_before=open_to_close_before,
             open_to_close_after=open_to_close_after,

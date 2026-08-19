@@ -5,6 +5,7 @@ import numpy as np
 from thinkflow_rdt.adapters.sample_filtering import (
     build_episode_sample_indices,
     directional_gripper_change_window_indices,
+    first_directional_gripper_change_window_indices,
     gripper_change_window_indices,
 )
 
@@ -104,4 +105,36 @@ def test_episode_sampling_can_use_directional_gripper_windows():
     for special_step in special:
         assert special_step in selected
     assert len(selected) == 32
+    assert selected == sorted(selected)
+
+
+def test_first_directional_sampling_keeps_four_frames_on_each_side_and_fills_uniformly():
+    actions = np.zeros((100, 7), dtype=np.float32)
+    actions[30:60, 6] = 1.0
+    # These later transitions must not create additional priority windows.
+    actions[75:85, 6] = 1.0
+    instructions = ["pick and place"] * len(actions)
+
+    special = first_directional_gripper_change_window_indices(
+        actions,
+        open_to_close_before=4,
+        open_to_close_after=4,
+        close_to_open_before=4,
+        close_to_open_after=4,
+    )
+    selected = build_episode_sample_indices(
+        instructions,
+        actions,
+        max_samples_per_episode=32,
+        gripper_change_scope="first_directional",
+        open_to_close_before=4,
+        open_to_close_after=4,
+        close_to_open_before=4,
+        close_to_open_after=4,
+    )
+
+    assert special == list(range(26, 34)) + list(range(56, 64))
+    assert len(special) == 16
+    assert len(selected) == 32
+    assert set(special).issubset(selected)
     assert selected == sorted(selected)

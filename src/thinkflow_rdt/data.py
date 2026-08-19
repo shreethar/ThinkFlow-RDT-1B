@@ -246,6 +246,15 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         else:
             ctrl_freq = float(ctrl_freq)
 
+        raw_instructions = pack.get("instructions")
+        if isinstance(raw_instructions, (list, tuple)) and sample_index < len(
+            raw_instructions
+        ):
+            instruction = str(raw_instructions[sample_index])
+        else:
+            raw_instruction = pack.get("instruction")
+            instruction = None if raw_instruction is None else str(raw_instruction)
+
         sample = {
             "qwen_kv": qwen_anchor_kv[anchor_index],
             "lang_tokens": pack["lang_tokens"],
@@ -265,6 +274,8 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             "dataset_id": pack.get("dataset_id"),
             "episode_id": pack.get("episode_id"),
             "step_idx": step_idx,
+            "instruction": instruction,
+            "actions_normalized": bool(pack.get("actions_normalized", False)),
             "qwen_cache_scope": pack.get("qwen_cache_scope", "episode_anchors"),
             "qwen_anchor_step_idx": str(pack["qwen_anchor_step_idx"][anchor_index]),
             "qwen_anchor_kind": str(pack["qwen_anchor_kind"][anchor_index]),
@@ -537,6 +548,8 @@ class RDTBatchCollator:
         self,
         state: torch.Tensor,
         actions: torch.Tensor,
+        *,
+        actions_normalized: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # IMPORTANT: cached shards keep the project/data convention in dim 6:
         # gripper_closed, where 1=closed and 0=open. The pretrained RDT action
@@ -546,7 +559,13 @@ class RDTBatchCollator:
         state = state.clone()
         actions = actions.clone()
         state[..., 6] = 1.0 - state[..., 6]
-        actions[..., 6] = 1.0 - actions[..., 6]
+        if actions_normalized:
+            # q01/q99 normalization maps binary gripper_closed 0/1 to -1/+1.
+            # Switching to gripper_open in the same normalized range is a sign
+            # inversion, not ``1 - x`` (which would incorrectly yield 2/0).
+            actions[..., 6] = -actions[..., 6]
+        else:
+            actions[..., 6] = 1.0 - actions[..., 6]
         return state, actions
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -596,7 +615,9 @@ class RDTBatchCollator:
             )
             if self.convert_cached_gripper_closed_to_open:
                 state, actions = self._convert_cached_gripper_to_rdt_open(
-                    state, actions
+                    state,
+                    actions,
+                    actions_normalized=bool(sample.get("actions_normalized", False)),
                 )
             state_dim_mask = torch.as_tensor(
                 sample.get("state_dim_mask", torch.ones(self.state_dim)),
@@ -704,7 +725,9 @@ class RDTOnlineSiglipBatchCollator:
             )
             if self.convert_cached_gripper_closed_to_open:
                 state, actions = self._base._convert_cached_gripper_to_rdt_open(
-                    state, actions
+                    state,
+                    actions,
+                    actions_normalized=bool(sample.get("actions_normalized", False)),
                 )
             state_dim_mask = torch.as_tensor(
                 sample.get("state_dim_mask", torch.ones(self.state_dim)),

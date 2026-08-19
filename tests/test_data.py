@@ -63,6 +63,33 @@ def test_collator_supports_separate_language_and_image_widths():
     assert batch["img_tokens"].shape == (1, 3, 6)
 
 
+def test_collator_flips_normalized_closed_gripper_by_sign() -> None:
+    collator = RDTBatchCollator(
+        max_lang_tokens=1,
+        image_tokens=1,
+        pred_horizon=2,
+        feature_dim=8,
+        state_dim=7,
+        action_dim=7,
+    )
+    actions = torch.zeros(2, 7)
+    actions[:, 6] = torch.tensor([-1.0, 1.0])
+    sample = {
+        "qwen_kv": torch.zeros(1, 8),
+        "lang_tokens": torch.zeros(1, 8),
+        "img_tokens": torch.zeros(1, 8),
+        "state": torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        "actions": actions,
+        "actions_normalized": True,
+        "ctrl_freq": 10.0,
+    }
+
+    batch = collator([sample])
+
+    assert batch["state"][0, 6].item() == 1.0
+    assert batch["actions"][0, :, 6].tolist() == [1.0, -1.0]
+
+
 def test_collator_preserves_unequal_raw_libero_state_and_action_dimensions():
     collator = RDTBatchCollator(
         max_lang_tokens=2,

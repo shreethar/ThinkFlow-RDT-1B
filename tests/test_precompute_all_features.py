@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
 import numpy as np
 from PIL import Image
+import torch
 
 from scripts.precompute_all_features import (
     anchor_kind,
+    episode_pack_relative_path,
     image_bytes_to_image,
+    image_to_jpeg_bytes,
     image_to_lossless_png_bytes,
     iter_episode_sample_groups,
+    save_episode_anchor_pack_job,
     select_episode_qwen_anchors,
 )
 
@@ -39,6 +44,99 @@ def test_cached_png_round_trip_is_pixel_exact() -> None:
 
     assert payload.startswith(b"\x89PNG\r\n\x1a\n")
     np.testing.assert_array_equal(decoded, pixels)
+
+
+def test_cached_jpeg_uses_requested_lossy_codec() -> None:
+    pixels = np.full((32, 48, 3), 127, dtype=np.uint8)
+    payload = image_to_jpeg_bytes(Image.fromarray(pixels, mode="RGB"), quality=90)
+    decoded = image_bytes_to_image(payload)
+
+    assert payload.startswith(b"\xff\xd8\xff")
+    assert decoded.size == (48, 32)
+    assert np.abs(np.asarray(decoded, dtype=np.int16) - pixels).mean() < 2.0
+
+
+def test_episode_pack_directory_buckets_are_one_based() -> None:
+    assert episode_pack_relative_path(0, shards_per_directory=500).as_posix() == (
+        "episodes_000000001_000000500/episode_000000001.pt"
+    )
+    assert episode_pack_relative_path(499, shards_per_directory=500).as_posix() == (
+        "episodes_000000001_000000500/episode_000000500.pt"
+    )
+    assert episode_pack_relative_path(500, shards_per_directory=500).as_posix() == (
+        "episodes_000000501_000001000/episode_000000501.pt"
+    )
+
+
+def test_per_sample_qwen_episode_pack_keeps_one_feature_and_instruction_per_sample(
+    tmp_path,
+) -> None:
+    sample_count = 2
+    slots = [
+        [Image.new("RGB", (16, 16), color=(index * 20, 0, 0))]
+        for index in range(sample_count)
+    ]
+    batch = {
+        "metadata": [
+            {
+                "dataset_id": "bridge",
+                "episode_id": "episode-a",
+                "step_idx": str(index * 4),
+                "image_count": 1,
+            }
+            for index in range(sample_count)
+        ],
+        "instructions": ["pick up the cup"] * sample_count,
+        "siglip_image_slots": slots,
+        "siglip_slot_mask": torch.ones(sample_count, 1, dtype=torch.bool),
+        "state": torch.zeros(sample_count, 7),
+        "state_dim_mask": torch.ones(sample_count, 7),
+        "actions": torch.zeros(sample_count, 64, 7),
+        "action_time_mask": torch.ones(sample_count, 64, dtype=torch.bool),
+        "action_dim_mask": torch.ones(sample_count, 7),
+        "ctrl_freq": torch.full((sample_count,), 10.0),
+    }
+    anchors = [
+        {"step_idx": str(index * 4), "instruction": "pick up the cup"}
+        for index in range(sample_count)
+    ]
+    qwen = torch.arange(sample_count * 8, dtype=torch.bfloat16).reshape(
+        sample_count, 1, 8
+    )
+
+    count, manifest_line, _ = save_episode_anchor_pack_job(
+        split_dir=tmp_path,
+        episode_index=500,
+        start_index=123,
+        batch=batch,
+        anchors=anchors,
+        qwen_kv_by_anchor=qwen,
+        lang_tokens=torch.zeros(1, 3, 4, dtype=torch.bfloat16),
+        lang_mask=torch.ones(1, 3, dtype=torch.bool),
+        save_padded_features=False,
+        image_history_size=1,
+        image_jpeg_quality=90,
+        image_codec="jpeg",
+        qwen_cache_scope="per_sample",
+        episode_shards_per_directory=500,
+        actions_normalized=True,
+    )
+
+    manifest = json.loads(manifest_line)
+    path = tmp_path / manifest["path"]
+    pack = torch.load(path, map_location="cpu", weights_only=True)
+    assert count == sample_count
+    assert manifest["path"] == (
+        "episodes_000000501_000001000/episode_000000501.pt"
+    )
+    assert pack["qwen_cache_scope"] == "per_sample"
+    assert pack["actions_normalized"] is True
+    assert pack["sample_anchor_index"].tolist() == [0, 1]
+    assert torch.equal(pack["qwen_anchor_kv"], qwen)
+    assert pack["instruction"] == "pick up the cup"
+    assert pack["instructions"] == ["pick up the cup", "pick up the cup"]
+    assert pack["qwen_anchor_kind"] == ["per_sample", "per_sample"]
+    assert all(payload.startswith(b"\xff\xd8\xff") for payload in pack["image_jpegs"])
 
 
 def test_anchor_policy_keeps_only_first_step_without_gripper_change() -> None:
