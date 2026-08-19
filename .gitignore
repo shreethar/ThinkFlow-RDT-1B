@@ -1,7 +1,8 @@
 .venv
 .agents
 .codex
-.pytest_cache
+.
+.gradio
 .uv-cache-smolvla
 .venv-smolvla
 dataset/droid_100
