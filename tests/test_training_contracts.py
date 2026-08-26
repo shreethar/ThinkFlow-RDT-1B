@@ -39,7 +39,7 @@ def test_legacy_validation_batch_limit_is_preserved() -> None:
     assert resolve_validation_batch_limit(cfg, accelerator) == 17
 
 
-def test_validation_reports_per_suite_and_per_horizon_metrics() -> None:
+def test_validation_reports_per_suite_without_denoising_horizon_metrics() -> None:
     class FakeModel:
         def eval(self):
             return self
@@ -68,8 +68,6 @@ def test_validation_reports_per_suite_and_per_horizon_metrics() -> None:
                 "sample_rot_valid": torch.ones(2),
                 "sample_gripper_loss": torch.tensor([3.0, 4.0]),
                 "sample_gripper_valid": torch.ones(2),
-                "horizon_loss_sum": torch.tensor([7.0, 14.0]),
-                "horizon_valid_count": torch.tensor([7.0, 7.0]),
             }
 
     class FakeAccelerator:
@@ -102,5 +100,104 @@ def test_validation_reports_per_suite_and_per_horizon_metrics() -> None:
     assert metrics["val/libero_object/loss"] == pytest.approx(3.0)
     assert metrics["val/libero_spatial/examples"] == 1.0
     assert metrics["val/libero_object/examples"] == 1.0
-    assert metrics["val/horizon_mse/step_00"] == pytest.approx(1.0)
-    assert metrics["val/horizon_mse/step_01"] == pytest.approx(2.0)
+    assert not any(key.startswith("val/horizon_mse/") for key in metrics)
+
+
+def test_validation_reports_controlled_qwen_ablation_metrics() -> None:
+    class FakeModel:
+        def eval(self):
+            return self
+
+        def train(self):
+            return self
+
+        def __call__(self, batch, *, sample=False):
+            qwen_value = batch["qwen_kv"][:, 0, 0]
+            prediction = torch.zeros_like(batch["actions"])
+            prediction[..., 30] = qwen_value.unsqueeze(1)
+            if sample:
+                return prediction
+
+            target = batch["actions"]
+            sample_loss = (prediction[..., 30] - target[..., 30]).square().mean(1)
+            sample_mae = (prediction[..., 30] - target[..., 30]).abs().mean(1)
+            sample_valid = torch.ones_like(sample_loss)
+            return {
+                "loss_sum": sample_loss.sum(),
+                "mae_sum": sample_mae.sum(),
+                "valid_count": sample_valid.sum(),
+                "xyz_loss_sum": sample_loss.sum(),
+                "xyz_valid_count": sample_valid.sum(),
+                "rot_loss_sum": torch.zeros(()),
+                "rot_valid_count": sample_valid.sum(),
+                "gripper_loss_sum": torch.zeros(()),
+                "gripper_valid_count": sample_valid.sum(),
+                "sample_imitation_loss": sample_loss,
+                "sample_target_mae": sample_mae,
+                "sample_is_valid": sample_valid,
+                "sample_xyz_loss": sample_loss,
+                "sample_xyz_valid": sample_valid,
+                "sample_rot_loss": torch.zeros_like(sample_loss),
+                "sample_rot_valid": sample_valid,
+                "sample_gripper_loss": torch.zeros_like(sample_loss),
+                "sample_gripper_valid": sample_valid,
+            }
+
+    class FakeAccelerator:
+        device = torch.device("cpu")
+        process_index = 0
+        num_processes = 1
+        is_main_process = True
+
+        @staticmethod
+        def reduce(value, reduction="sum"):
+            assert reduction == "sum"
+            return value
+
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(
+            pred_horizon=2,
+            action_encoder_layout="rdt_native_128",
+            qwen_fusion="fastthinkact_state_kv",
+        ),
+        noise_scheduler=SimpleNamespace(num_train_timesteps=1000),
+        training=SimpleNamespace(
+            validation_samples=None,
+            validation_batches=1,
+            sample_validation_batches=1,
+            validation_seed=123,
+            micro_batch_size=2,
+            qualitative_validation_examples=0,
+            report_to="none",
+        ),
+    )
+    actions = torch.zeros(2, 2, 128)
+    actions[0, :, 30] = 1.0
+    actions[1, :, 30] = 3.0
+    action_dim_mask = torch.zeros(2, 128)
+    action_dim_mask[:, 30] = 1.0
+    action_dim_mask[:, 10] = 1.0
+    batch = {
+        "dataset_id": ["bc_z", "bridge"],
+        "actions": actions,
+        "action_time_mask": torch.ones(2, 2, dtype=torch.bool),
+        "action_dim_mask": action_dim_mask,
+        "qwen_kv": torch.tensor([[[1.0]], [[3.0]]]),
+    }
+
+    metrics = validate(FakeModel(), [batch], FakeAccelerator(), cfg)
+
+    assert metrics["val/sample_mse"] == pytest.approx(0.0)
+    assert metrics["val/qwen_ablation/reference/denoising_loss"] == pytest.approx(0.0)
+    assert metrics["val/qwen_ablation/zero/denoising_loss_delta"] == pytest.approx(5.0)
+    assert metrics["val/qwen_ablation/shuffled/denoising_loss_delta"] == pytest.approx(4.0)
+    assert metrics["val/qwen_ablation/zero/sample_mse"] == pytest.approx(2.5)
+    assert metrics["val/qwen_ablation/shuffled/sample_mse"] == pytest.approx(2.0)
+    assert metrics[
+        "val/qwen_ablation/zero/prediction_delta_rmse_native10"
+    ] > 0.0
+    assert metrics[
+        "val/qwen_ablation/shuffled/sampled_native10/horizon_1/rmse"
+    ] > 0.0
+    assert metrics["val/sampled_native10/gripper_open/accuracy"] == 1.0
+    assert metrics["val/sampled_native10/gripper_open/f1"] == 1.0

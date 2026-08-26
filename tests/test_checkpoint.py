@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -14,8 +16,11 @@ from thinkflow_rdt.checkpoint import (
     FULL_RDT_FILE,
     INTERFACE_FILE,
     METADATA_FILE,
+    TRAINER_STATE_FILE,
+    load_trainer_state,
     load_full_rdt_base,
     load_trainable_artifact,
+    save_trainer_state,
     save_trainable_artifact,
 )
 
@@ -129,6 +134,128 @@ def assert_states_equal(
         assert actual_state.keys() == expected[module_name].keys()
         for key, expected_tensor in expected[module_name].items():
             torch.testing.assert_close(actual_state[key], expected_tensor)
+
+
+def stochastic_optimizer_step(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+) -> float:
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    inputs = torch.randn(8, 3)
+    inputs += random.random() + float(np.random.random())
+    loss = model(inputs).square().mean()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+    return float(loss.detach())
+
+
+def test_trainer_state_resume_matches_uninterrupted_next_update(tmp_path):
+    random.seed(123)
+    np.random.seed(123)
+    torch.manual_seed(123)
+    uninterrupted = nn.Sequential(nn.Linear(3, 5), nn.Dropout(0.25), nn.Linear(5, 2))
+    uninterrupted_optimizer = torch.optim.AdamW(uninterrupted.parameters(), lr=1e-3)
+    uninterrupted_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        uninterrupted_optimizer,
+        lambda step: 0.9**step,
+    )
+
+    stochastic_optimizer_step(
+        uninterrupted,
+        uninterrupted_optimizer,
+        uninterrupted_scheduler,
+    )
+    boundary_model_state = {
+        key: value.detach().clone()
+        for key, value in uninterrupted.state_dict().items()
+    }
+    progress = {
+        "global_step": 1,
+        "epoch": 4,
+        "batches_consumed_in_epoch": 17,
+    }
+    contract = {"world_size": 1, "effective_global_batch": 32}
+    save_trainer_state(
+        tmp_path,
+        optimizer=uninterrupted_optimizer,
+        scheduler=uninterrupted_scheduler,
+        scaler=None,
+        progress=progress,
+        resume_contract=contract,
+        process_index=0,
+        num_processes=1,
+        is_main_process=True,
+    )
+    assert (tmp_path / TRAINER_STATE_FILE).is_file()
+
+    expected_loss = stochastic_optimizer_step(
+        uninterrupted,
+        uninterrupted_optimizer,
+        uninterrupted_scheduler,
+    )
+    expected_model_state = {
+        key: value.detach().clone()
+        for key, value in uninterrupted.state_dict().items()
+    }
+
+    resumed = nn.Sequential(nn.Linear(3, 5), nn.Dropout(0.25), nn.Linear(5, 2))
+    resumed.load_state_dict(boundary_model_state)
+    resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=1e-3)
+    resumed_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        resumed_optimizer,
+        lambda step: 0.9**step,
+    )
+    restored_progress = load_trainer_state(
+        tmp_path,
+        optimizer=resumed_optimizer,
+        scheduler=resumed_scheduler,
+        scaler=None,
+        process_index=0,
+        num_processes=1,
+        expected_contract=contract,
+    )
+    resumed_loss = stochastic_optimizer_step(
+        resumed,
+        resumed_optimizer,
+        resumed_scheduler,
+    )
+
+    assert restored_progress == progress
+    assert resumed_loss == expected_loss
+    assert resumed_scheduler.state_dict() == uninterrupted_scheduler.state_dict()
+    for name, expected in expected_model_state.items():
+        torch.testing.assert_close(resumed.state_dict()[name], expected, rtol=0, atol=0)
+
+
+def test_exact_resume_rejects_changed_contract(tmp_path):
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+    save_trainer_state(
+        tmp_path,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=None,
+        progress={"global_step": 1},
+        resume_contract={"micro_batch_size": 8},
+        process_index=0,
+        num_processes=1,
+        is_main_process=True,
+    )
+
+    with pytest.raises(ValueError, match="micro_batch_size"):
+        load_trainer_state(
+            tmp_path,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=None,
+            process_index=0,
+            num_processes=1,
+            expected_contract={"micro_batch_size": 16},
+        )
 
 
 def test_full_rdt_artifact_round_trip_includes_qwen_and_interfaces(tmp_path):

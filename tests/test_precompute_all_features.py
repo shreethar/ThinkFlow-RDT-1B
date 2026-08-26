@@ -7,6 +7,7 @@ import torch
 
 from scripts.precompute_all_features import (
     anchor_kind,
+    episode_sample_count_is_allowed,
     episode_pack_relative_path,
     image_bytes_to_image,
     image_to_jpeg_bytes,
@@ -65,6 +66,28 @@ def test_episode_pack_directory_buckets_are_one_based() -> None:
     )
     assert episode_pack_relative_path(500, shards_per_directory=500).as_posix() == (
         "episodes_000000501_000001000/episode_000000501.pt"
+    )
+
+
+def test_exact_episode_policy_allows_only_configured_short_dataset() -> None:
+    kuka = [make_sample(step, dataset_id="kuka") for step in range(24)]
+    bridge = [make_sample(step, dataset_id="bridge") for step in range(24)]
+    full_bridge = [make_sample(step, dataset_id="bridge") for step in range(32)]
+
+    assert episode_sample_count_is_allowed(
+        kuka,
+        required_samples=32,
+        allow_short_dataset_ids={"kuka"},
+    )
+    assert not episode_sample_count_is_allowed(
+        bridge,
+        required_samples=32,
+        allow_short_dataset_ids={"kuka"},
+    )
+    assert episode_sample_count_is_allowed(
+        full_bridge,
+        required_samples=32,
+        allow_short_dataset_ids={"kuka"},
     )
 
 

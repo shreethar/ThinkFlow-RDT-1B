@@ -121,6 +121,64 @@ def test_collator_preserves_unequal_raw_libero_state_and_action_dimensions():
     assert batch["action_dim_mask"].shape == (1, 10)
 
 
+def test_collator_builds_native_128d_targets_with_exact_ten_dim_mask(
+    tmp_path,
+) -> None:
+    stats_path = tmp_path / "audit.json"
+    stats_path.write_text(
+        json.dumps(
+            {
+                "action_normalization": {
+                    "q01": [-1.0] * 6 + [0.0],
+                    "q99": [1.0] * 7,
+                }
+            }
+        )
+    )
+    collator = RDTBatchCollator(
+        max_lang_tokens=1,
+        image_tokens=1,
+        pred_horizon=2,
+        feature_dim=8,
+        state_dim=128,
+        action_dim=128,
+        cache_state_dim=7,
+        cache_action_dim=7,
+        native_rdt_128=True,
+        convert_cached_gripper_closed_to_open=False,
+        action_stats_paths={"dummy": str(stats_path)},
+    )
+    sample = {
+        "qwen_kv": torch.zeros(1, 8),
+        "lang_tokens": torch.zeros(1, 8),
+        "img_tokens": torch.zeros(1, 8),
+        "state": torch.tensor([1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0]),
+        "actions": torch.tensor(
+            [
+                [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, -1.0],
+                [0.2, 0.3, 0.4, 0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
+        "actions_normalized": True,
+        "dataset_id": "dummy",
+        "ctrl_freq": 10.0,
+    }
+
+    batch = collator([sample])
+
+    expected_indices = [10, *range(30, 39)]
+    assert batch["state"].shape == (1, 128)
+    assert batch["actions"].shape == (1, 2, 128)
+    assert torch.nonzero(batch["state_dim_mask"][0]).flatten().tolist() == expected_indices
+    assert torch.nonzero(batch["action_dim_mask"][0]).flatten().tolist() == expected_indices
+    torch.testing.assert_close(
+        batch["actions"][0, 0, 33:39],
+        torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+    )
+    assert batch["actions"][0, 0, 10].item() == 1.0
+    assert batch["actions"][0, 1, 10].item() == -1.0
+
+
 def test_cached_feature_dataset_reads_episode_pack(tmp_path):
     pack_path = tmp_path / "episode_000000000.pt"
     manifest_path = tmp_path / "manifest.jsonl"

@@ -128,7 +128,7 @@ def test_full_kv_model_uses_128d_frozen_state_interface():
     model_config = replace(
         base.model,
         finetune_mode="full",
-        qwen_fusion="self_attention_kv",
+        qwen_fusion="fastthinkact_state_kv",
         rdt_state_dim=128,
         state_encoder_layout="rdt_eef",
         freeze_state_adaptor=True,
@@ -174,6 +174,62 @@ def test_full_kv_model_uses_128d_frozen_state_interface():
         not parameter.requires_grad and parameter.grad is None
         for parameter in model.runner.state_adaptor.parameters()
     )
+    assert metrics["loss"].isfinite()
+
+
+def test_native_128d_output_is_supervised_only_on_ten_eef_slots():
+    base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
+    model_config = replace(
+        base.model,
+        action_dim=128,
+        state_dim=128,
+        cache_action_dim=7,
+        cache_state_dim=7,
+        finetune_mode="full",
+        qwen_fusion="self_attention_kv",
+        rdt_state_dim=128,
+        state_encoder_layout="rdt_native_128",
+        action_encoder_layout="rdt_native_128",
+        freeze_state_adaptor=True,
+        freeze_condition_adaptors=True,
+        convert_cached_gripper_closed_to_open=False,
+        allow_random_frozen_state_adaptor=True,
+    )
+    cfg = replace(base, model=model_config)
+    cfg.validate()
+    model = SFTConditionedRDT(cfg, load_pretrained=False)
+    torch.nn.init.normal_(
+        model.runner.model.final_layer.ffn_final.fc2.weight,
+        std=0.02,
+    )
+    batch_size = 2
+    active = torch.zeros(128)
+    active[[10, *range(30, 39)]] = 1.0
+    batch = {
+        "lang_tokens": torch.randn(batch_size, 12, 64),
+        "lang_mask": torch.ones(batch_size, 12, dtype=torch.bool),
+        "img_tokens": torch.randn(batch_size, 16, 64),
+        "img_mask": torch.ones(batch_size, 16, dtype=torch.bool),
+        "qwen_kv": torch.randn(batch_size, 1, 64),
+        "state": torch.randn(batch_size, 128) * active,
+        "state_dim_mask": active.expand(batch_size, -1),
+        "actions": torch.randn(batch_size, 16, 128) * active,
+        "action_time_mask": torch.ones(batch_size, 16, dtype=torch.bool),
+        "action_dim_mask": active.expand(batch_size, -1),
+        "ctrl_freq": torch.full((batch_size,), 10.0),
+    }
+
+    metrics = model(batch)
+    metrics["loss"].backward()
+
+    assert model.runner.model.final_layer.ffn_final.fc2.out_features == 128
+    assert model.action_adaptor is None
+    assert model.runner.state_adaptor[0].in_features == 256
+    inactive = active == 0
+    final_gradient = model.runner.model.final_layer.ffn_final.fc2.weight.grad
+    assert final_gradient is not None
+    assert torch.count_nonzero(final_gradient[inactive]).item() == 0
+    assert torch.count_nonzero(final_gradient[active.bool()]).item() > 0
     assert metrics["loss"].isfinite()
 
 
