@@ -3,7 +3,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from thinkflow_rdt.train import resolve_validation_batch_limit, validate
+from thinkflow_rdt.train import (
+    _binary_transition_events,
+    _match_binary_transition_events,
+    resolve_validation_batch_limit,
+    validate,
+)
 
 
 def _config(*, validation_samples: int | None, validation_batches: int = 17):
@@ -37,6 +42,29 @@ def test_legacy_validation_batch_limit_is_preserved() -> None:
     cfg = _config(validation_samples=None, validation_batches=17)
     accelerator = SimpleNamespace(num_processes=8)
     assert resolve_validation_batch_limit(cfg, accelerator) == 17
+
+
+def test_native_gripper_transition_matching_includes_step_zero_and_timing() -> None:
+    target = _binary_transition_events(
+        torch.tensor([False, False, True, True, False]),
+        initial_value=True,
+    )
+    predicted = _binary_transition_events(
+        torch.tensor([False, False, False, True, True]),
+        initial_value=True,
+    )
+
+    assert target == [(0, False), (2, True), (4, False)]
+    assert predicted == [(0, False), (3, True)]
+    metrics = _match_binary_transition_events(target, predicted)
+    assert metrics["all"]["target"] == 3.0
+    assert metrics["all"]["predicted"] == 2.0
+    assert metrics["all"]["matched"] == 2.0
+    assert metrics["all"]["exact"] == 1.0
+    assert metrics["all"]["within_1"] == 2.0
+    assert metrics["all"]["absolute_error_sum"] == 1.0
+    assert metrics["open"]["signed_error_sum"] == 1.0
+    assert metrics["close"]["matched"] == 1.0
 
 
 def test_validation_reports_per_suite_without_denoising_horizon_metrics() -> None:
