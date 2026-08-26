@@ -207,6 +207,14 @@ def build_config(args: argparse.Namespace):
                 cfg.training.learning_rate_interfaces,
             )
         ),
+        learning_rate=(
+            None
+            if optional_override(args.learning_rate, cfg.training.learning_rate)
+            is None
+            else float(
+                optional_override(args.learning_rate, cfg.training.learning_rate)
+            )
+        ),
         warmup_steps=int(optional_override(args.warmup_steps, cfg.training.warmup_steps)),
         log_every=int(optional_override(args.log_every, cfg.training.log_every)),
         validate_every=int(
@@ -215,6 +223,9 @@ def build_config(args: argparse.Namespace):
         save_every=int(optional_override(args.save_every, cfg.training.save_every)),
         validation_batches=int(
             optional_override(args.validation_batches, cfg.training.validation_batches)
+        ),
+        validation_samples=optional_override(
+            args.validation_samples, cfg.training.validation_samples
         ),
         sample_validation_batches=int(
             optional_override(
@@ -235,6 +246,24 @@ def build_config(args: argparse.Namespace):
         wandb_run_name=optional_override(
             args.wandb_run_name, cfg.training.wandb_run_name
         ),
+        skip_nonfinite_updates=bool(
+            optional_override(
+                args.skip_nonfinite_updates,
+                cfg.training.skip_nonfinite_updates,
+            )
+        ),
+        log_gradient_stats=bool(
+            optional_override(
+                args.log_gradient_stats,
+                cfg.training.log_gradient_stats,
+            )
+        ),
+        qualitative_validation_examples=int(
+            optional_override(
+                args.qualitative_validation_examples,
+                cfg.training.qualitative_validation_examples,
+            )
+        ),
     )
     model_cfg = cfg.model
     if args.no_gradient_checkpointing:
@@ -250,6 +279,7 @@ def build_config(args: argparse.Namespace):
         data=data_cfg,
         training=training_cfg,
     )
+    cfg.validate()
 
     print("Resolved cached-feature manifests:")
     print(f"  train manifests: {len(train_manifests)} sources, {train_lines} manifest rows")
@@ -335,6 +365,14 @@ def parse_args() -> argparse.Namespace:
         help="Initialize LoRA and trained interfaces from a prior checkpoint directory.",
     )
     parser.add_argument(
+        "--resume-from",
+        type=Path,
+        help=(
+            "Bit-exact resume from a checkpoint containing model, optimizer, "
+            "scheduler, scaler, RNG, epoch, and batch-cursor state."
+        ),
+    )
+    parser.add_argument(
         "--base-artifact",
         type=Path,
         help=(
@@ -357,16 +395,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--learning-rate-lora", type=float, default=None)
     parser.add_argument("--learning-rate-interfaces", type=float, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--warmup-steps", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--validate-every", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=None)
     parser.add_argument("--validation-batches", type=int, default=None)
+    parser.add_argument("--validation-samples", type=int, default=None)
     parser.add_argument("--sample-validation-batches", type=int, default=None)
     parser.add_argument("--mixed-precision", default=None)
     parser.add_argument("--report-to", default=None)
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument(
+        "--skip-nonfinite-updates",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--log-gradient-stats",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--qualitative-validation-examples", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
@@ -424,6 +475,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.init_artifact is not None and args.resume_from is not None:
+        raise ValueError("--init-artifact and --resume-from are mutually exclusive")
     cfg = build_config(args)
     horizon_loss_weights = parse_horizon_loss_schedule(
         args.horizon_loss_schedule,
@@ -436,6 +489,7 @@ def main() -> None:
         online_siglip_fallback_model_id=args.siglip_fallback_model_id,
         base_artifact=args.base_artifact,
         init_artifact=args.init_artifact,
+        resume_from=args.resume_from,
         horizon_loss_weights=horizon_loss_weights,
         mask_noisy_gripper_input=args.mask_noisy_gripper_input,
         gripper_bce_weight=args.gripper_bce_weight,
