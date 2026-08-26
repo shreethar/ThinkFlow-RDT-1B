@@ -10,6 +10,45 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 
+RDT_GRIPPER_INDEX = 10
+RDT_XYZ_SLICE = slice(30, 33)
+RDT_ORTHO6D_SLICE = slice(33, 39)
+
+
+def euler_xyz_to_ortho6d(euler: torch.Tensor) -> torch.Tensor:
+    """Convert XYZ Euler angles to first-two-columns orthogonal 6-D."""
+    roll, pitch, yaw = euler.unbind(dim=-1)
+    cr, sr = roll.cos(), roll.sin()
+    cp, sp = pitch.cos(), pitch.sin()
+    cy, sy = yaw.cos(), yaw.sin()
+    first_column = torch.stack([cy * cp, sy * cp, -sp], dim=-1)
+    second_column = torch.stack(
+        [cy * sp * sr - sy * cr, sy * sp * sr + cy * cr, cp * sr],
+        dim=-1,
+    )
+    return torch.cat([first_column, second_column], dim=-1)
+
+
+def _load_action_stats_paths(
+    paths: dict[str, str] | None,
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    result: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for dataset_id, value in (paths or {}).items():
+        path = Path(value).expanduser().resolve()
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        block = payload.get("action_normalization", payload)
+        q01 = torch.as_tensor(block["q01"], dtype=torch.float32)
+        q99 = torch.as_tensor(block["q99"], dtype=torch.float32)
+        if q01.shape != (7,) or q99.shape != (7,):
+            raise ValueError(
+                f"Expected seven-dimensional action stats in {path}, got "
+                f"{tuple(q01.shape)} and {tuple(q99.shape)}"
+            )
+        result[str(dataset_id)] = (q01, q99)
+    return result
+
+
 REQUIRED_KEYS = {
     "qwen_kv",
     "lang_tokens",
@@ -479,12 +518,26 @@ class RDTBatchCollator:
     img_token_dim: int | None = None
     qwen_kv_dim: int | None = None
     convert_cached_gripper_closed_to_open: bool = True
+    cache_state_dim: int | None = None
+    cache_action_dim: int | None = None
+    native_rdt_128: bool = False
+    action_stats_paths: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.lang_token_dim is None:
             self.lang_token_dim = self.feature_dim
         if self.img_token_dim is None:
             self.img_token_dim = self.feature_dim
+        if self.cache_state_dim is None:
+            self.cache_state_dim = self.state_dim
+        if self.cache_action_dim is None:
+            self.cache_action_dim = self.action_dim
+        self._action_stats = _load_action_stats_paths(self.action_stats_paths)
+        if self.native_rdt_128:
+            if self.state_dim != 128 or self.action_dim != 128:
+                raise ValueError("native_rdt_128 requires state_dim=action_dim=128")
+            if self.cache_state_dim != 7 or self.cache_action_dim != 7:
+                raise ValueError("native_rdt_128 requires cached 7-D state/actions")
 
     def _pad_sequence(
         self,
@@ -511,14 +564,15 @@ class RDTBatchCollator:
         provided_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         actions = torch.as_tensor(actions, dtype=torch.float32)
-        if actions.ndim != 2 or actions.shape[1] != self.action_dim:
+        if actions.ndim != 2 or actions.shape[1] != self.cache_action_dim:
             raise ValueError(
-                f"Expected actions [T, {self.action_dim}], got {tuple(actions.shape)}"
+                f"Expected cached actions [T, {self.cache_action_dim}], got "
+                f"{tuple(actions.shape)}"
             )
         actions = actions[: self.pred_horizon]
         valid = actions.shape[0]
         output = torch.zeros(
-            self.pred_horizon, self.action_dim, dtype=actions.dtype
+            self.pred_horizon, self.cache_action_dim, dtype=actions.dtype
         )
         output[:valid] = actions
         mask = torch.zeros(self.pred_horizon, dtype=torch.bool)
@@ -528,6 +582,71 @@ class RDTBatchCollator:
             supplied = supplied[: self.pred_horizon]
             mask[: supplied.shape[0]] &= supplied
         return output, mask
+
+    def _to_native_rdt_state(
+        self,
+        state: torch.Tensor,
+        state_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        values = state.new_zeros(128)
+        mask = state_mask.new_zeros(128)
+        values[RDT_XYZ_SLICE] = state[:3] * state_mask[:3]
+        mask[RDT_XYZ_SLICE] = state_mask[:3]
+        rotation_valid = state_mask[3:6].amin()
+        rotation = euler_xyz_to_ortho6d(state[3:6])
+        values[RDT_ORTHO6D_SLICE] = rotation * rotation_valid
+        mask[RDT_ORTHO6D_SLICE] = rotation_valid
+        # Cached proprioception is gripper_closed in [0,1]; native RDT uses
+        # gripper_open in the same range.
+        values[RDT_GRIPPER_INDEX] = (1.0 - state[6]) * state_mask[6]
+        mask[RDT_GRIPPER_INDEX] = state_mask[6]
+        return values, mask
+
+    def _to_native_rdt_actions(
+        self,
+        actions: torch.Tensor,
+        action_mask: torch.Tensor,
+        *,
+        dataset_id: str,
+        actions_normalized: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        values = actions.new_zeros(actions.shape[0], 128)
+        mask = action_mask.new_zeros(128)
+
+        # Keep the already normalized XYZ commands. Euler angles must first be
+        # restored to radians; applying trigonometry to standardized values is
+        # not a valid rotation conversion.
+        values[:, RDT_XYZ_SLICE] = actions[:, :3] * action_mask[:3]
+        mask[RDT_XYZ_SLICE] = action_mask[:3]
+        rotation_euler = actions[:, 3:6]
+        if actions_normalized:
+            stats = self._action_stats.get(dataset_id)
+            if stats is None:
+                raise KeyError(
+                    "Native 128-D conversion needs q01/q99 action stats for "
+                    f"dataset {dataset_id!r}; configure data.action_stats_paths"
+                )
+            q01, q99 = stats
+            rotation_euler = (
+                (rotation_euler.clamp(-1.0, 1.0) + 1.0)
+                * 0.5
+                * (q99[3:6] - q01[3:6])
+                + q01[3:6]
+            )
+        rotation_valid = action_mask[3:6].amin()
+        rotation = euler_xyz_to_ortho6d(rotation_euler)
+        values[:, RDT_ORTHO6D_SLICE] = rotation * rotation_valid
+        mask[RDT_ORTHO6D_SLICE] = rotation_valid
+
+        if actions_normalized:
+            # q01/q99 maps cached gripper_closed to [-1,+1]. Native RDT's
+            # gripper_open convention is the exact sign inverse.
+            gripper_open = -actions[:, 6]
+        else:
+            gripper_open = 1.0 - actions[:, 6]
+        values[:, RDT_GRIPPER_INDEX] = gripper_open * action_mask[6]
+        mask[RDT_GRIPPER_INDEX] = action_mask[6]
+        return values, mask
 
     def _prepare_qwen_kv(self, value: Any) -> torch.Tensor:
         qwen_kv = torch.as_tensor(value)
@@ -583,6 +702,9 @@ class RDTBatchCollator:
             "ctrl_freq": [],
         }
         dataset_ids: list[str] = []
+        instructions: list[str] = []
+        episode_ids: list[str] = []
+        step_indices: list[str] = []
 
         for sample in samples:
             lang, default_lang_mask = self._pad_sequence(
@@ -604,33 +726,45 @@ class RDTBatchCollator:
                 default_img_mask[: supplied.shape[0]] &= supplied
 
             state = torch.as_tensor(sample["state"], dtype=torch.float32).flatten()
-            if state.numel() != self.state_dim:
+            if state.numel() != self.cache_state_dim:
                 raise ValueError(
-                    f"Expected state dim {self.state_dim}, got {state.numel()} "
+                    f"Expected cached state dim {self.cache_state_dim}, got "
+                    f"{state.numel()} "
                     f"in {sample.get('_path', '<memory>')}"
                 )
 
             actions, action_time_mask = self._pad_actions(
                 sample["actions"], sample.get("action_time_mask")
             )
-            if self.convert_cached_gripper_closed_to_open:
+            if self.convert_cached_gripper_closed_to_open and not self.native_rdt_128:
                 state, actions = self._convert_cached_gripper_to_rdt_open(
                     state,
                     actions,
                     actions_normalized=bool(sample.get("actions_normalized", False)),
                 )
             state_dim_mask = torch.as_tensor(
-                sample.get("state_dim_mask", torch.ones(self.state_dim)),
+                sample.get("state_dim_mask", torch.ones(self.cache_state_dim)),
                 dtype=torch.float32,
             ).flatten()
-            if state_dim_mask.numel() != self.state_dim:
+            if state_dim_mask.numel() != self.cache_state_dim:
                 raise ValueError("state_dim_mask has the wrong width")
             action_dim_mask = torch.as_tensor(
-                sample.get("action_dim_mask", torch.ones(self.action_dim)),
+                sample.get("action_dim_mask", torch.ones(self.cache_action_dim)),
                 dtype=torch.float32,
             ).flatten()
-            if action_dim_mask.numel() != self.action_dim:
+            if action_dim_mask.numel() != self.cache_action_dim:
                 raise ValueError("action_dim_mask has the wrong width")
+            dataset_id = str(sample.get("dataset_id") or "unknown")
+            if self.native_rdt_128:
+                state, state_dim_mask = self._to_native_rdt_state(
+                    state, state_dim_mask
+                )
+                actions, action_dim_mask = self._to_native_rdt_actions(
+                    actions,
+                    action_dim_mask,
+                    dataset_id=dataset_id,
+                    actions_normalized=bool(sample.get("actions_normalized", False)),
+                )
 
             batch["qwen_kv"].append(qwen_kv)
             batch["lang_tokens"].append(lang)
@@ -648,12 +782,18 @@ class RDTBatchCollator:
             batch["ctrl_freq"].append(
                 torch.tensor(float(sample["ctrl_freq"]), dtype=torch.float32)
             )
-            dataset_ids.append(str(sample.get("dataset_id") or "unknown"))
+            dataset_ids.append(dataset_id)
+            instructions.append(str(sample.get("instruction") or ""))
+            episode_ids.append(str(sample.get("episode_id") or ""))
+            step_indices.append(str(sample.get("step_idx") or ""))
 
         output: dict[str, Any] = {
             key: torch.stack(values, dim=0) for key, values in batch.items()
         }
         output["dataset_id"] = dataset_ids
+        output["instruction"] = instructions
+        output["episode_id"] = episode_ids
+        output["step_idx"] = step_indices
         return output
 
 
@@ -667,6 +807,10 @@ class RDTOnlineSiglipBatchCollator:
     lang_token_dim: int | None = None
     qwen_kv_dim: int | None = None
     convert_cached_gripper_closed_to_open: bool = True
+    cache_state_dim: int | None = None
+    cache_action_dim: int | None = None
+    native_rdt_128: bool = False
+    action_stats_paths: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.lang_token_dim is None:
@@ -684,6 +828,10 @@ class RDTOnlineSiglipBatchCollator:
             convert_cached_gripper_closed_to_open=(
                 self.convert_cached_gripper_closed_to_open
             ),
+            cache_state_dim=self.cache_state_dim,
+            cache_action_dim=self.cache_action_dim,
+            native_rdt_128=self.native_rdt_128,
+            action_stats_paths=self.action_stats_paths,
         )
 
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -701,6 +849,9 @@ class RDTOnlineSiglipBatchCollator:
         }
         image_slot_jpegs: list[list[bytes]] = []
         dataset_ids: list[str] = []
+        instructions: list[str] = []
+        episode_ids: list[str] = []
+        step_indices: list[str] = []
 
         for sample in samples:
             lang, default_lang_mask = self._base._pad_sequence(
@@ -714,33 +865,49 @@ class RDTOnlineSiglipBatchCollator:
             qwen_kv = self._base._prepare_qwen_kv(sample["qwen_kv"])
 
             state = torch.as_tensor(sample["state"], dtype=torch.float32).flatten()
-            if state.numel() != self.state_dim:
+            if state.numel() != self._base.cache_state_dim:
                 raise ValueError(
-                    f"Expected state dim {self.state_dim}, got {state.numel()} "
+                    f"Expected cached state dim {self._base.cache_state_dim}, got "
+                    f"{state.numel()} "
                     f"in {sample.get('_path', '<memory>')}"
                 )
 
             actions, action_time_mask = self._base._pad_actions(
                 sample["actions"], sample.get("action_time_mask")
             )
-            if self.convert_cached_gripper_closed_to_open:
+            if self.convert_cached_gripper_closed_to_open and not self.native_rdt_128:
                 state, actions = self._base._convert_cached_gripper_to_rdt_open(
                     state,
                     actions,
                     actions_normalized=bool(sample.get("actions_normalized", False)),
                 )
             state_dim_mask = torch.as_tensor(
-                sample.get("state_dim_mask", torch.ones(self.state_dim)),
+                sample.get(
+                    "state_dim_mask", torch.ones(self._base.cache_state_dim)
+                ),
                 dtype=torch.float32,
             ).flatten()
-            if state_dim_mask.numel() != self.state_dim:
+            if state_dim_mask.numel() != self._base.cache_state_dim:
                 raise ValueError("state_dim_mask has the wrong width")
             action_dim_mask = torch.as_tensor(
-                sample.get("action_dim_mask", torch.ones(self.action_dim)),
+                sample.get(
+                    "action_dim_mask", torch.ones(self._base.cache_action_dim)
+                ),
                 dtype=torch.float32,
             ).flatten()
-            if action_dim_mask.numel() != self.action_dim:
+            if action_dim_mask.numel() != self._base.cache_action_dim:
                 raise ValueError("action_dim_mask has the wrong width")
+            dataset_id = str(sample.get("dataset_id") or "unknown")
+            if self.native_rdt_128:
+                state, state_dim_mask = self._base._to_native_rdt_state(
+                    state, state_dim_mask
+                )
+                actions, action_dim_mask = self._base._to_native_rdt_actions(
+                    actions,
+                    action_dim_mask,
+                    dataset_id=dataset_id,
+                    actions_normalized=bool(sample.get("actions_normalized", False)),
+                )
 
             slot_mask = torch.as_tensor(sample["image_slot_mask"], dtype=torch.bool).flatten()
             image_slots = list(sample["image_slot_jpegs"])
@@ -762,11 +929,17 @@ class RDTOnlineSiglipBatchCollator:
             )
             tensor_batch["image_slot_mask"].append(slot_mask)
             image_slot_jpegs.append(image_slots)
-            dataset_ids.append(str(sample.get("dataset_id") or "unknown"))
+            dataset_ids.append(dataset_id)
+            instructions.append(str(sample.get("instruction") or ""))
+            episode_ids.append(str(sample.get("episode_id") or ""))
+            step_indices.append(str(sample.get("step_idx") or ""))
 
         batch: dict[str, Any] = {
             key: torch.stack(values, dim=0) for key, values in tensor_batch.items()
         }
         batch["image_slot_jpegs"] = image_slot_jpegs
         batch["dataset_id"] = dataset_ids
+        batch["instruction"] = instructions
+        batch["episode_id"] = episode_ids
+        batch["step_idx"] = step_indices
         return batch

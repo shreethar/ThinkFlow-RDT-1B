@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from peft import PeftModel
 from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
@@ -13,12 +15,158 @@ INTERFACE_FILE = "interfaces.pt"
 METADATA_FILE = "metadata.json"
 ADAPTER_DIR = "rdt_lora"
 FULL_RDT_FILE = "rdt_full.pt"
+TRAINER_STATE_FILE = "trainer_state.pt"
+TRAINER_STATE_VERSION = 1
 
 _FORMAT_KEY = "_rdt_artifact_format"
 _LORA_FORMAT = "lora"
 _FULL_FORMAT = "full"
 _LORA_MODES = {"lora", "peft", "adapter"}
 _FULL_MODES = {"full", "full_rdt", "full-rdt", "full_finetune", "full_finetuning"}
+
+
+def _atomic_torch_save(value: Any, path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    torch.save(value, temporary)
+    temporary.replace(path)
+
+
+def _atomic_json_save(value: Any, path: Path) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2)
+    temporary.replace(path)
+
+
+def trainer_rng_file(process_index: int) -> str:
+    return f"rng_state_rank_{int(process_index):05d}.pt"
+
+
+def capture_rng_state() -> dict[str, Any]:
+    """Capture process-local RNG streams that can affect training."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+    }
+
+
+def restore_rng_state(state: dict[str, Any]) -> None:
+    """Restore a state produced by :func:`capture_rng_state`."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "Checkpoint contains CUDA RNG state but CUDA is unavailable"
+            )
+        if len(cuda_state) != torch.cuda.device_count():
+            raise RuntimeError(
+                "CUDA device count differs from the exact-resume checkpoint: "
+                f"saved {len(cuda_state)}, current {torch.cuda.device_count()}"
+            )
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def save_trainer_state(
+    output_dir: str | Path,
+    *,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: Any | None,
+    progress: dict[str, Any],
+    resume_contract: dict[str, Any],
+    process_index: int,
+    num_processes: int,
+    is_main_process: bool,
+) -> None:
+    """Save optimizer/scheduler progress and this rank's RNG streams."""
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    if is_main_process:
+        _atomic_torch_save(
+            {
+                "version": TRAINER_STATE_VERSION,
+                "num_processes": int(num_processes),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict() if scaler is not None else None,
+                "progress": progress,
+                "resume_contract": resume_contract,
+            },
+            output / TRAINER_STATE_FILE,
+        )
+    _atomic_torch_save(
+        capture_rng_state(),
+        output / trainer_rng_file(process_index),
+    )
+
+
+def load_trainer_state(
+    artifact_dir: str | Path,
+    *,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    scaler: Any | None,
+    process_index: int,
+    num_processes: int,
+    expected_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Restore an exact optimizer-step boundary and return loop progress."""
+    artifact = Path(artifact_dir)
+    trainer_path = artifact / TRAINER_STATE_FILE
+    if not trainer_path.exists():
+        raise FileNotFoundError(
+            f"{trainer_path} is missing. This is a model-only checkpoint; use "
+            "--init-artifact for a weights-only restart, or resume from a new "
+            "checkpoint containing trainer state."
+        )
+    state = torch.load(trainer_path, map_location="cpu", weights_only=False)
+    version = int(state.get("version", 0))
+    if version != TRAINER_STATE_VERSION:
+        raise ValueError(
+            f"Unsupported trainer-state version {version}; expected "
+            f"{TRAINER_STATE_VERSION}"
+        )
+    saved_processes = int(state["num_processes"])
+    if saved_processes != int(num_processes):
+        raise ValueError(
+            "Exact resume requires the same distributed world size: "
+            f"saved {saved_processes}, current {num_processes}"
+        )
+    saved_contract = state.get("resume_contract", {})
+    if saved_contract != expected_contract:
+        differing = sorted(
+            key
+            for key in set(saved_contract) | set(expected_contract)
+            if saved_contract.get(key) != expected_contract.get(key)
+        )
+        raise ValueError(
+            "Exact-resume contract differs for: " + ", ".join(differing)
+        )
+
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    saved_scaler = state.get("scaler")
+    if (saved_scaler is None) != (scaler is None):
+        raise ValueError(
+            "Mixed-precision scaler configuration differs from the checkpoint"
+        )
+    if scaler is not None:
+        scaler.load_state_dict(saved_scaler)
+
+    rng_path = artifact / trainer_rng_file(process_index)
+    if not rng_path.exists():
+        raise FileNotFoundError(rng_path)
+    restore_rng_state(
+        torch.load(rng_path, map_location="cpu", weights_only=False)
+    )
+    return dict(state["progress"])
 
 
 def _configured_artifact_format(model) -> str | None:
@@ -154,7 +302,8 @@ def _load_interfaces(model, interfaces: dict[str, Any], *, trainable: bool) -> N
                 dtype=model.unified_cross_extra_pos_embed.dtype,
             )
         )
-        model.unified_cross_extra_pos_embed.requires_grad = trainable
+        if not trainable:
+            model.unified_cross_extra_pos_embed.requires_grad = False
 
 
 def save_trainable_artifact(
@@ -194,14 +343,13 @@ def save_trainable_artifact(
             if model_state_dict is None
             else _component_state(model_state_dict, "runner.model.")
         )
-        torch.save(rdt_state, output / FULL_RDT_FILE)
+        _atomic_torch_save(rdt_state, output / FULL_RDT_FILE)
 
-    torch.save(
+    _atomic_torch_save(
         _interface_state(model, artifact_format, model_state_dict),
         output / INTERFACE_FILE,
     )
-    with (output / METADATA_FILE).open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
+    _atomic_json_save(metadata, output / METADATA_FILE)
 
 
 def load_trainable_artifact(model, artifact_dir: str | Path, trainable: bool) -> None:

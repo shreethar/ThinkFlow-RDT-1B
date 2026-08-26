@@ -34,6 +34,9 @@ class ModelConfig:
     # Qwen injection. This is useful for pretrained-only rollout baselines.
     # ``self_attention_kv`` projects the flattened Qwen K/V pair to one native
     # RDT K/V pair and appends it inside every RDT self-attention block.
+    # ``fastthinkact_state_kv`` is the explicit experiment name for that same
+    # native-RDT mapping: action queries attend state-derived and Qwen K/V in
+    # the state/action stream, with no second projection of the Qwen pair.
     # ``cross_attention_kv`` projects cached Qwen K/V directly to native RDT K/V
     # and appends them after each cross-attention block's condition projection.
     # ``language`` is retained for backward compatibility with older artifacts.
@@ -59,10 +62,23 @@ class ModelConfig:
     # ``compatible`` copies every shape-compatible runner tensor, including the
     # original RDT condition/state adaptors; the new 7-D output row stays fresh.
     pretrained_copy_mode: str = "selected"
+    # Widths stored in the cache can differ from the native RDT model widths.
+    # In ``rdt_native_128`` mode the collator converts cached 7-D EEF vectors
+    # to native 128-D value tensors before the model sees them.
+    cache_state_dim: int | None = None
+    cache_action_dim: int | None = None
 
     @property
     def resolved_rdt_state_dim(self) -> int:
         return self.state_dim if self.rdt_state_dim is None else self.rdt_state_dim
+
+    @property
+    def resolved_cache_state_dim(self) -> int:
+        return self.state_dim if self.cache_state_dim is None else self.cache_state_dim
+
+    @property
+    def resolved_cache_action_dim(self) -> int:
+        return self.action_dim if self.cache_action_dim is None else self.cache_action_dim
 
 @dataclass(frozen=True)
 class LoraConfigData:
@@ -95,6 +111,9 @@ class DataConfig:
     episode_aware_shuffle: bool = False
     shuffle_validation: bool = False
     stratified_validation: bool = False
+    # Per-dataset q01/q99 files used to undo cached 7-D action normalization
+    # before converting Euler rotation deltas to orthogonal 6-D.
+    action_stats_paths: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +143,10 @@ class TrainingConfig:
     # Exact number of examples evaluated globally across all ranks. When null,
     # ``validation_batches`` retains its legacy per-rank meaning.
     validation_samples: int | None = None
+    skip_nonfinite_updates: bool = True
+    max_consecutive_nonfinite_updates: int = 10
+    log_gradient_stats: bool = True
+    qualitative_validation_examples: int = 2
 
 
 @dataclass(frozen=True)
@@ -158,12 +181,14 @@ class ExperimentConfig:
             "none",
             "language",
             "self_attention_kv",
+            "fastthinkact_state_kv",
             "cross_attention_kv",
             "unified_cross_attention",
         }:
             raise ValueError(
                 "model.qwen_fusion must be 'none', 'language', "
-                "'self_attention_kv', 'cross_attention_kv', or "
+                "'self_attention_kv', 'fastthinkact_state_kv', "
+                "'cross_attention_kv', or "
                 "'unified_cross_attention'"
             )
         if self.model.pretrained_copy_mode not in {"selected", "compatible"}:
@@ -174,19 +199,21 @@ class ExperimentConfig:
             "raw",
             "rdt_eef",
             "libero_ortho6d",
+            "rdt_native_128",
         }:
             raise ValueError(
                 "model.state_encoder_layout must be 'raw', 'rdt_eef', or "
-                "'libero_ortho6d'"
+                "'libero_ortho6d', or 'rdt_native_128'"
             )
         if self.model.action_encoder_layout not in {
             "raw",
             "rdt_eef",
             "libero_ortho6d",
+            "rdt_native_128",
         }:
             raise ValueError(
                 "model.action_encoder_layout must be 'raw', 'rdt_eef', or "
-                "'libero_ortho6d'"
+                "'libero_ortho6d', or 'rdt_native_128'"
             )
         if (
             self.model.action_encoder_layout == "rdt_eef"
@@ -220,6 +247,24 @@ class ExperimentConfig:
                     "libero_ortho6d preserves raw gripper values; set "
                     "convert_cached_gripper_closed_to_open=false"
                 )
+        elif self.model.state_encoder_layout == "rdt_native_128":
+            if self.model.action_encoder_layout != "rdt_native_128":
+                raise ValueError(
+                    "rdt_native_128 state layout requires the matching action layout"
+                )
+            if self.model.state_dim != 128 or self.model.action_dim != 128:
+                raise ValueError(
+                    "rdt_native_128 requires model state_dim=action_dim=128"
+                )
+            if self.model.resolved_rdt_state_dim != 128:
+                raise ValueError("rdt_native_128 requires rdt_state_dim=128")
+            if (
+                self.model.resolved_cache_state_dim != 7
+                or self.model.resolved_cache_action_dim != 7
+            ):
+                raise ValueError(
+                    "rdt_native_128 currently requires cached 7-D state/actions"
+                )
         elif self.model.resolved_rdt_state_dim != self.model.state_dim:
             raise ValueError(
                 "raw state layout requires rdt_state_dim to equal state_dim"
@@ -243,6 +288,14 @@ class ExperimentConfig:
         if self.data.stratified_validation and self.data.shuffle_validation:
             raise ValueError(
                 "data.stratified_validation and shuffle_validation are mutually exclusive"
+            )
+        if self.training.max_consecutive_nonfinite_updates <= 0:
+            raise ValueError(
+                "training.max_consecutive_nonfinite_updates must be positive"
+            )
+        if self.training.qualitative_validation_examples < 0:
+            raise ValueError(
+                "training.qualitative_validation_examples must be non-negative"
             )
 
 

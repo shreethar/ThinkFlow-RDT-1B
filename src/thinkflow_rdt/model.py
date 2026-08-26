@@ -429,15 +429,18 @@ class SFTConditionedRDT(nn.Module):
         # clean-x0 decoding without changing their denoising input distribution.
         self.decode_clean_x0_gripper = False
         self.use_native_state_encoder = (
-            cfg.model.state_encoder_layout in {"rdt_eef", "libero_ortho6d"}
+            cfg.model.state_encoder_layout
+            in {"rdt_eef", "libero_ortho6d", "rdt_native_128"}
         )
         self.use_native_action_encoder = (
-            cfg.model.action_encoder_layout in {"rdt_eef", "libero_ortho6d"}
+            cfg.model.action_encoder_layout
+            in {"rdt_eef", "libero_ortho6d", "rdt_native_128"}
         )
 
         projector_width = cfg.model.hidden_size
         if cfg.model.qwen_fusion in {
             "self_attention_kv",
+            "fastthinkact_state_kv",
             "cross_attention_kv",
         }:
             projector_width *= 2
@@ -691,6 +694,9 @@ class SFTConditionedRDT(nn.Module):
         if not self.use_native_state_encoder:
             return torch.cat([values * raw_mask, raw_mask], dim=-1)
 
+        if self.cfg.model.state_encoder_layout == "rdt_native_128":
+            return torch.cat([values * raw_mask, raw_mask], dim=-1)
+
         unified_values = values.new_zeros(*values.shape[:-1], self.rdt_state_dim)
         unified_masks = raw_mask.new_zeros(*raw_mask.shape[:-1], self.rdt_state_dim)
 
@@ -727,6 +733,8 @@ class SFTConditionedRDT(nn.Module):
     ) -> torch.Tensor:
         """Build action-token inputs for delta actions or absolute targets."""
         if self.cfg.model.action_encoder_layout == "rdt_eef":
+            return self._state_encoder_input(values, raw_mask)
+        if self.cfg.model.action_encoder_layout == "rdt_native_128":
             return self._state_encoder_input(values, raw_mask)
         if values.shape != raw_mask.shape:
             raise ValueError(
@@ -794,7 +802,10 @@ class SFTConditionedRDT(nn.Module):
                 device=projected_qwen.device,
             )
             lang_mask = torch.cat([qwen_mask, lang_mask], dim=1)
-        elif self.cfg.model.qwen_fusion == "self_attention_kv":
+        elif self.cfg.model.qwen_fusion in {
+            "self_attention_kv",
+            "fastthinkact_state_kv",
+        }:
             projected_qwen = self.qwen_adaptor(batch["qwen_kv"])
             external_kv = projected_qwen
         elif self.cfg.model.qwen_fusion == "cross_attention_kv":
@@ -882,7 +893,9 @@ class SFTConditionedRDT(nn.Module):
             actions, noise, timesteps
         )
 
-        if self.cfg.model.action_encoder_layout == "libero_ortho6d":
+        if self.cfg.model.action_encoder_layout == "rdt_native_128":
+            gripper_input_index = 10
+        elif self.cfg.model.action_encoder_layout == "libero_ortho6d":
             gripper_input_index = 9
         else:
             gripper_input_index = 6
@@ -944,10 +957,18 @@ class SFTConditionedRDT(nn.Module):
                 f"Got {self.runner.prediction_type!r}."
             )
         target = actions
-        if self.cfg.model.action_encoder_layout == "libero_ortho6d":
+        if self.cfg.model.action_encoder_layout == "rdt_native_128":
+            xyz_start, xyz_stop = 30, 33
+            rotation_start, rotation_stop = 33, 39
+            gripper_start, gripper_stop = 10, 11
+        elif self.cfg.model.action_encoder_layout == "libero_ortho6d":
+            xyz_start, xyz_stop = 0, 3
+            rotation_start = 3
             rotation_stop = 9
             gripper_start, gripper_stop = 9, 10
         else:
+            xyz_start, xyz_stop = 0, 3
+            rotation_start = 3
             rotation_stop = 6
             gripper_start, gripper_stop = 6, 7
 
@@ -1051,8 +1072,12 @@ class SFTConditionedRDT(nn.Module):
             )
             return component_loss, component_is_valid
 
-        sample_xyz_loss, sample_xyz_valid = component_losses(0, 3)
-        sample_rot_loss, sample_rot_valid = component_losses(3, rotation_stop)
+        sample_xyz_loss, sample_xyz_valid = component_losses(
+            xyz_start, xyz_stop
+        )
+        sample_rot_loss, sample_rot_valid = component_losses(
+            rotation_start, rotation_stop
+        )
         sample_gripper_loss, sample_gripper_valid = component_losses(
             gripper_start,
             gripper_stop,
@@ -1117,11 +1142,16 @@ class SFTConditionedRDT(nn.Module):
             raise ValueError(
                 "rotation_geodesic_weight must be one finite non-negative scalar"
             )
-        if self.cfg.model.action_encoder_layout == "libero_ortho6d":
+        if self.cfg.model.action_encoder_layout in {
+            "libero_ortho6d",
+            "rdt_native_128",
+        }:
             predicted_rotation = self._ortho6d_to_rotation_matrix(
-                prediction[..., 3:9]
+                prediction[..., rotation_start:rotation_stop]
             )
-            target_rotation = self._ortho6d_to_rotation_matrix(target[..., 3:9])
+            target_rotation = self._ortho6d_to_rotation_matrix(
+                target[..., rotation_start:rotation_stop]
+            )
             relative_rotation = predicted_rotation.transpose(-1, -2) @ target_rotation
             cosine = (
                 relative_rotation.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - 1.0
@@ -1129,7 +1159,9 @@ class SFTConditionedRDT(nn.Module):
             # 1-cos(theta) is the stable small-angle form of an SO(3)
             # geodesic penalty and avoids acos gradients near identity.
             rotation_geodesic_elements = 1.0 - cosine.clamp(-1.0, 1.0)
-            rotation_objective_valid = objective_valid[..., 3:9].amin(dim=-1).float()
+            rotation_objective_valid = objective_valid[
+                ..., rotation_start:rotation_stop
+            ].amin(dim=-1).float()
             sample_rotation_geodesic_count = rotation_objective_valid.sum(dim=1)
             sample_rotation_geodesic_loss = (
                 (rotation_geodesic_elements * rotation_objective_valid).sum(dim=1)
@@ -1144,7 +1176,7 @@ class SFTConditionedRDT(nn.Module):
             rotation_geodesic_loss = prediction.new_tensor(0.0)
             if bool((rotation_geodesic_weight > 0).any()):
                 raise ValueError(
-                    "rotation geodesic loss requires action_encoder_layout=libero_ortho6d"
+                    "rotation geodesic loss requires an orthogonal-6D action layout"
                 )
         total_loss = (
             imitation_loss
@@ -1234,11 +1266,12 @@ class SFTConditionedRDT(nn.Module):
             scheduler.set_timesteps(self.runner.num_inference_timesteps)
 
         expanded_dim_mask = action_dim_mask.expand(-1, noisy.shape[1], -1)
-        gripper_input_index = (
-            9
-            if self.cfg.model.action_encoder_layout == "libero_ortho6d"
-            else 6
-        )
+        if self.cfg.model.action_encoder_layout == "rdt_native_128":
+            gripper_input_index = 10
+        elif self.cfg.model.action_encoder_layout == "libero_ortho6d":
+            gripper_input_index = 9
+        else:
+            gripper_input_index = 6
         final_clean_prediction = None
         for timestep in scheduler.timesteps:
             timestep = timestep.to(states.device)

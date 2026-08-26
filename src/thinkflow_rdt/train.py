@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import random
 import io
@@ -19,7 +20,12 @@ from transformers import get_scheduler
 from transformers import SiglipImageProcessor, SiglipVisionModel
 
 from .adapters.libero import rdt_action_to_libero
-from .checkpoint import load_trainable_artifact, save_trainable_artifact
+from .checkpoint import (
+    load_trainer_state,
+    load_trainable_artifact,
+    save_trainer_state,
+    save_trainable_artifact,
+)
 from .config import ExperimentConfig
 from .data import (
     ONLINE_SIGLIP_REQUIRED_KEYS,
@@ -39,6 +45,8 @@ LIBERO_SUITE_IDS = (
     "libero_10",
     "libero_90",
 )
+OXE_DATASET_IDS = ("bc_z", "bridge", "droid", "fractal", "kuka")
+VALIDATION_DATASET_IDS = LIBERO_SUITE_IDS + OXE_DATASET_IDS
 
 LIBERO_RAW_ACTION_NAMES = (
     "dx",
@@ -49,6 +57,147 @@ LIBERO_RAW_ACTION_NAMES = (
     "dRz",
     "gripper",
 )
+NATIVE_EEF_ACTION_NAMES = (
+    "dx",
+    "dy",
+    "dz",
+    "rot6d_0",
+    "rot6d_1",
+    "rot6d_2",
+    "rot6d_3",
+    "rot6d_4",
+    "rot6d_5",
+    "gripper_open",
+)
+
+
+def native_rdt_action_to_10d(values: torch.Tensor) -> torch.Tensor:
+    """Extract supervised EEF dimensions from a native 128-D RDT vector."""
+    if values.shape[-1] != 128:
+        raise ValueError(f"Expected native RDT width 128, got {values.shape[-1]}")
+    return torch.cat(
+        (values[..., 30:33], values[..., 33:39], values[..., 10:11]),
+        dim=-1,
+    )
+
+
+def _binary_transition_events(
+    values: torch.Tensor,
+    *,
+    initial_value: bool,
+) -> list[tuple[int, bool]]:
+    """Return ``(step, new_value)`` events, including step-zero changes."""
+    labels = values.to(dtype=torch.bool).flatten().tolist()
+    events: list[tuple[int, bool]] = []
+    previous = bool(initial_value)
+    for step, value in enumerate(labels):
+        current = bool(value)
+        if current != previous:
+            events.append((step, current))
+        previous = current
+    return events
+
+
+def _match_binary_transition_events(
+    target_events: list[tuple[int, bool]],
+    predicted_events: list[tuple[int, bool]],
+) -> dict[str, dict[str, float]]:
+    """Greedily match nearest same-direction binary transition events.
+
+    Statistics are returned for all transitions and separately for transitions
+    to ``True`` and ``False``. A transition can be matched at any timing;
+    exact/within-one/within-two counts make timing quality explicit.
+    """
+    result: dict[str, dict[str, float]] = {}
+    for name, direction in (("all", None), ("open", True), ("close", False)):
+        targets = [
+            event for event in target_events if direction is None or event[1] is direction
+        ]
+        predictions = [
+            event
+            for event in predicted_events
+            if direction is None or event[1] is direction
+        ]
+        unused = set(range(len(predictions)))
+        errors: list[int] = []
+        for target_step, target_direction in targets:
+            candidates = [
+                index
+                for index in unused
+                if predictions[index][1] == target_direction
+            ]
+            if not candidates:
+                continue
+            matched_index = min(
+                candidates,
+                key=lambda index: (
+                    abs(predictions[index][0] - target_step),
+                    predictions[index][0],
+                ),
+            )
+            unused.remove(matched_index)
+            errors.append(predictions[matched_index][0] - target_step)
+        result[name] = {
+            "target": float(len(targets)),
+            "predicted": float(len(predictions)),
+            "matched": float(len(errors)),
+            "exact": float(sum(error == 0 for error in errors)),
+            "within_1": float(sum(abs(error) <= 1 for error in errors)),
+            "within_2": float(sum(abs(error) <= 2 for error in errors)),
+            "signed_error_sum": float(sum(errors)),
+            "absolute_error_sum": float(sum(abs(error) for error in errors)),
+        }
+    return result
+
+
+def _validation_observation_grid(payloads: list[bytes]) -> Image.Image | None:
+    images = [decode_cached_image(payload) for payload in payloads[:3]]
+    if not images:
+        return None
+    height = max(image.height for image in images)
+    resized = []
+    for image in images:
+        if image.height != height:
+            width = max(1, round(image.width * height / image.height))
+            image = image.resize((width, height))
+        resized.append(image)
+    grid = Image.new("RGB", (sum(image.width for image in resized), height))
+    offset = 0
+    for image in resized:
+        grid.paste(image, (offset, 0))
+        offset += image.width
+    return grid
+
+
+def _trajectory_comparison_figure(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    time_mask: torch.Tensor,
+):
+    import matplotlib.pyplot as plt
+
+    prediction_10d = native_rdt_action_to_10d(prediction).float().cpu()
+    target_10d = native_rdt_action_to_10d(target).float().cpu()
+    valid_steps = int(time_mask.bool().sum().item())
+    valid_steps = max(1, min(valid_steps, prediction_10d.shape[0]))
+    figure, axes = plt.subplots(5, 2, figsize=(12, 12), sharex=True)
+    for dimension, axis in enumerate(axes.flatten()):
+        axis.plot(
+            target_10d[:valid_steps, dimension].numpy(),
+            label="ground truth",
+            linewidth=2,
+        )
+        axis.plot(
+            prediction_10d[:valid_steps, dimension].numpy(),
+            label="diffusion sample",
+            linewidth=1.5,
+        )
+        axis.set_title(NATIVE_EEF_ACTION_NAMES[dimension])
+        axis.grid(alpha=0.25)
+    axes.flatten()[0].legend(loc="best")
+    figure.supxlabel("future horizon step")
+    figure.tight_layout()
+    return figure
 
 
 def infer_gripper_release_mask(
@@ -140,6 +289,12 @@ def create_dataloader(
             convert_cached_gripper_closed_to_open=(
                 cfg.model.convert_cached_gripper_closed_to_open
             ),
+            cache_state_dim=cfg.model.resolved_cache_state_dim,
+            cache_action_dim=cfg.model.resolved_cache_action_dim,
+            native_rdt_128=(
+                cfg.model.state_encoder_layout == "rdt_native_128"
+            ),
+            action_stats_paths=cfg.data.action_stats_paths,
         )
     else:
         dataset = CachedFeatureDataset(
@@ -159,6 +314,12 @@ def create_dataloader(
             convert_cached_gripper_closed_to_open=(
                 cfg.model.convert_cached_gripper_closed_to_open
             ),
+            cache_state_dim=cfg.model.resolved_cache_state_dim,
+            cache_action_dim=cfg.model.resolved_cache_action_dim,
+            native_rdt_128=(
+                cfg.model.state_encoder_layout == "rdt_native_128"
+            ),
+            action_stats_paths=cfg.data.action_stats_paths,
         )
     persistent = cfg.data.persistent_workers and cfg.data.num_workers > 0
     sampler = None
@@ -430,6 +591,51 @@ def create_optimizer(model: SFTConditionedRDT, cfg: ExperimentConfig):
     return optimizer
 
 
+def gradient_statistics(
+    optimizer: torch.optim.Optimizer,
+    accelerator: Accelerator,
+) -> tuple[dict[str, float], bool]:
+    """Return distributed pre-clipping gradient norms and finiteness stats."""
+    result: dict[str, float] = {}
+    any_nonfinite = False
+    for index, group in enumerate(optimizer.param_groups):
+        sum_squares = torch.zeros(
+            (), device=accelerator.device, dtype=torch.float64
+        )
+        max_abs = torch.zeros_like(sum_squares)
+        nonfinite_elements = torch.zeros_like(sum_squares)
+        tensor_count = torch.zeros_like(sum_squares)
+        for parameter in group["params"]:
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            values = gradient.detach().float()
+            finite = torch.isfinite(values)
+            nonfinite_elements += (~finite).sum(dtype=torch.float64)
+            safe_values = torch.where(finite, values, torch.zeros_like(values))
+            sum_squares += safe_values.double().square().sum()
+            if safe_values.numel() > 0:
+                max_abs = torch.maximum(
+                    max_abs, safe_values.abs().max().double()
+                )
+            tensor_count += 1
+        sum_squares = accelerator.reduce(sum_squares, reduction="sum")
+        max_abs = accelerator.reduce(max_abs, reduction="max")
+        nonfinite_elements = accelerator.reduce(
+            nonfinite_elements, reduction="sum"
+        )
+        tensor_count = accelerator.reduce(tensor_count, reduction="sum")
+        name = str(group.get("name", index))
+        result[f"train/grad_norm_{name}"] = float(sum_squares.sqrt().cpu())
+        result[f"train/grad_max_abs_{name}"] = float(max_abs.cpu())
+        result[f"train/grad_nonfinite_elements_{name}"] = float(
+            nonfinite_elements.cpu()
+        )
+        result[f"train/grad_tensors_{name}"] = float(tensor_count.cpu())
+        any_nonfinite = any_nonfinite or bool(nonfinite_elements.item() > 0)
+    return result, any_nonfinite
+
+
 def resolve_gradient_accumulation_steps(cfg: ExperimentConfig) -> tuple[int, int]:
     """Return (accumulation steps, effective global batch size)."""
     world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
@@ -506,9 +712,83 @@ def model_state_dict_for_save(
     return unwrapped.state_dict()
 
 
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def build_resume_contract(
+    cfg: ExperimentConfig,
+    accelerator: Accelerator,
+    train_loader: DataLoader,
+    *,
+    accumulation_steps: int,
+    effective_global_batch: int,
+    training_objective: dict[str, object],
+    online_siglip_model_id: str | None,
+) -> dict[str, object]:
+    """Describe inputs that must stay fixed for a bit-exact continuation."""
+    action_stats_hashes = {
+        dataset_id: file_sha256(path)
+        for dataset_id, path in sorted(
+            (cfg.data.action_stats_paths or {}).items()
+        )
+    }
+    return {
+        "seed": cfg.seed,
+        "world_size": accelerator.num_processes,
+        "micro_batch_size": cfg.training.micro_batch_size,
+        "gradient_accumulation_steps": accumulation_steps,
+        "effective_global_batch": effective_global_batch,
+        "train_batches_per_epoch": len(train_loader),
+        "train_manifest_sha256": file_sha256(cfg.data.train_manifest),
+        "action_stats_sha256": action_stats_hashes,
+        "model": asdict(cfg.model),
+        "noise_scheduler": asdict(cfg.noise_scheduler),
+        "optimizer": {
+            "learning_rate": cfg.training.learning_rate,
+            "learning_rate_lora": cfg.training.learning_rate_lora,
+            "learning_rate_interfaces": (
+                cfg.training.learning_rate_interfaces
+            ),
+            "weight_decay_interfaces": (
+                cfg.training.weight_decay_interfaces
+            ),
+            "warmup_steps": cfg.training.warmup_steps,
+            "max_grad_norm": cfg.training.max_grad_norm,
+            "mixed_precision": cfg.training.mixed_precision,
+        },
+        "data": {
+            "episode_aware_shuffle": cfg.data.episode_aware_shuffle,
+            "excluded_dataset_ids": list(cfg.data.excluded_dataset_ids),
+            "num_workers": cfg.data.num_workers,
+        },
+        "training_objective": training_objective,
+        "online_siglip_model_id": online_siglip_model_id,
+    }
+
+
+def normalized_data_position(
+    epoch: int,
+    batches_consumed_in_epoch: int,
+    batches_per_epoch: int,
+) -> tuple[int, int]:
+    if batches_consumed_in_epoch < batches_per_epoch:
+        return epoch, batches_consumed_in_epoch
+    if batches_consumed_in_epoch == batches_per_epoch:
+        return epoch + 1, 0
+    raise ValueError(
+        "Consumed batch cursor exceeds dataloader length: "
+        f"{batches_consumed_in_epoch} > {batches_per_epoch}"
+    )
+
+
 def log_metrics(
     accelerator: Accelerator,
-    values: dict[str, float | int],
+    values: dict[str, object],
     *,
     step: int,
     report_to: str,
@@ -557,8 +837,11 @@ def validate(
     gripper_bce_weight: float = 0.0,
     gripper_bce_logit_scale: float = 1.0,
     rotation_geodesic_weight: float = 0.0,
-) -> dict[str, float]:
+) -> dict[str, object]:
     model.eval()
+    action_encoder_layout = getattr(
+        cfg.model, "action_encoder_layout", "raw"
+    )
     validation_batch_limit = resolve_validation_batch_limit(cfg, accelerator)
     loss_sum = torch.zeros((), device=accelerator.device, dtype=torch.float64)
     mae_sum = torch.zeros_like(loss_sum)
@@ -574,7 +857,9 @@ def validate(
     sample_error_sum = torch.zeros_like(loss_sum)
     sample_valid_count = torch.zeros_like(loss_sum)
     sampled_horizons = tuple(
-        horizon for horizon in (1, 4, 8, 64) if horizon <= cfg.model.pred_horizon
+        horizon
+        for horizon in (1, 4, 8, 10, 64)
+        if horizon <= cfg.model.pred_horizon
     )
     sampled_command_squared_error = torch.zeros(
         len(sampled_horizons), device=accelerator.device, dtype=torch.float64
@@ -584,6 +869,58 @@ def validate(
     sampled_command_count = torch.zeros_like(sampled_command_squared_error)
     sampled_motion_count = torch.zeros_like(sampled_command_squared_error)
     sampled_gripper_count = torch.zeros_like(sampled_command_squared_error)
+    sampled_native10_squared_error = torch.zeros_like(
+        sampled_command_squared_error
+    )
+    sampled_native10_count = torch.zeros_like(sampled_command_squared_error)
+    # TP, FP, FN, TN for the native RDT gripper_open class (value >= 0).
+    sampled_native_gripper_confusion = torch.zeros(
+        4, device=accelerator.device, dtype=torch.float64
+    )
+    sampled_native_gripper_confusion_by_horizon = torch.zeros(
+        len(sampled_horizons),
+        4,
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    # For each horizon and transition group (all/open/close): target events,
+    # predicted events, matched events, exact, within one, within two, signed
+    # error sum, and absolute error sum. Transitions include state -> action[0].
+    sampled_native_gripper_transitions = torch.zeros(
+        len(sampled_horizons),
+        3,
+        8,
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    qwen_ablation_names = ("zero", "shuffled")
+    qwen_reference_loss_sum = torch.zeros_like(loss_sum)
+    qwen_reference_valid_count = torch.zeros_like(loss_sum)
+    qwen_ablation_loss_sum = torch.zeros(
+        len(qwen_ablation_names),
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    qwen_ablation_valid_count = torch.zeros_like(qwen_ablation_loss_sum)
+    qwen_ablation_sample_error_sum = torch.zeros_like(qwen_ablation_loss_sum)
+    qwen_ablation_sample_valid_count = torch.zeros_like(
+        qwen_ablation_loss_sum
+    )
+    qwen_ablation_native10_squared_error = torch.zeros(
+        len(qwen_ablation_names),
+        len(sampled_horizons),
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    qwen_ablation_native10_count = torch.zeros_like(
+        qwen_ablation_native10_squared_error
+    )
+    qwen_ablation_prediction_delta_squared_error = torch.zeros_like(
+        qwen_ablation_loss_sum
+    )
+    qwen_ablation_prediction_delta_count = torch.zeros_like(
+        qwen_ablation_loss_sum
+    )
     # Per decoded dimension: sum(pred), sum(target), sum(pred^2),
     # sum(target^2), sum(pred*target), count.
     sampled_dimension_stats = torch.zeros(
@@ -615,11 +952,12 @@ def validate(
     # Columns: loss, MAE, examples, XYZ loss/count, rotation loss/count,
     # gripper loss/count.
     suite_stats = torch.zeros(
-        len(LIBERO_SUITE_IDS),
+        len(VALIDATION_DATASET_IDS),
         9,
         device=accelerator.device,
         dtype=torch.float64,
     )
+    qualitative_rows: list[list[object]] = []
     devices = (
         [
             accelerator.device.index
@@ -649,14 +987,56 @@ def validate(
                     cfg=cfg,
                     device=accelerator.device,
                 )
-            attach_training_objective(
-                batch,
-                horizon_loss_weights=horizon_loss_weights,
-                gripper_bce_weight=gripper_bce_weight,
-                gripper_bce_logit_scale=gripper_bce_logit_scale,
-                rotation_geodesic_weight=rotation_geodesic_weight,
+            if "actions" in batch:
+                attach_training_objective(
+                    batch,
+                    horizon_loss_weights=horizon_loss_weights,
+                    gripper_bce_weight=gripper_bce_weight,
+                    gripper_bce_logit_scale=gripper_bce_logit_scale,
+                    rotation_geodesic_weight=rotation_geodesic_weight,
+                )
+            run_qwen_ablation = (
+                index < cfg.training.sample_validation_batches
+                and getattr(cfg.model, "qwen_fusion", "none") != "none"
+                and isinstance(batch.get("qwen_kv"), torch.Tensor)
+                and isinstance(batch.get("actions"), torch.Tensor)
             )
+            qwen_ablation_batches: list[dict[str, object]] = []
+            if run_qwen_ablation:
+                # Pin the one-step denoising inputs so the reference, zeroed,
+                # and shuffled conditions differ only in their Qwen KV.
+                batch = dict(batch)
+                actions = batch["actions"]
+                assert isinstance(actions, torch.Tensor)
+                batch["diffusion_noise"] = torch.randn_like(actions)
+                batch["diffusion_timesteps"] = torch.randint(
+                    0,
+                    cfg.noise_scheduler.num_train_timesteps,
+                    (actions.shape[0],),
+                    device=actions.device,
+                    dtype=torch.long,
+                )
+                qwen_kv = batch["qwen_kv"]
+                assert isinstance(qwen_kv, torch.Tensor)
+                zero_batch = dict(batch)
+                zero_batch["qwen_kv"] = torch.zeros_like(qwen_kv)
+                shuffled_batch = dict(batch)
+                shuffled_batch["qwen_kv"] = qwen_kv.roll(1, dims=0)
+                qwen_ablation_batches = [zero_batch, shuffled_batch]
             metrics = model(batch)
+            if run_qwen_ablation:
+                qwen_reference_loss_sum += metrics["loss_sum"].double()
+                qwen_reference_valid_count += metrics["valid_count"].double()
+                for ablation_index, ablation_batch in enumerate(
+                    qwen_ablation_batches
+                ):
+                    ablation_metrics = model(ablation_batch)
+                    qwen_ablation_loss_sum[ablation_index] += (
+                        ablation_metrics["loss_sum"].double()
+                    )
+                    qwen_ablation_valid_count[ablation_index] += (
+                        ablation_metrics["valid_count"].double()
+                    )
             dataset_ids = list(batch.get("dataset_id", []))
             if len(dataset_ids) != int(metrics["sample_is_valid"].shape[0]):
                 raise ValueError(
@@ -664,7 +1044,7 @@ def validate(
                     f"got {len(dataset_ids)} ids for "
                     f"{metrics['sample_is_valid'].shape[0]} examples"
                 )
-            for suite_index, suite_id in enumerate(LIBERO_SUITE_IDS):
+            for suite_index, suite_id in enumerate(VALIDATION_DATASET_IDS):
                 selected = torch.as_tensor(
                     [dataset_id == suite_id for dataset_id in dataset_ids],
                     device=accelerator.device,
@@ -725,14 +1105,20 @@ def validate(
             )
             gripper_bce_sum += accelerator.reduce(
                 (
-                    metrics["sample_gripper_bce_loss"].double()
+                    metrics.get(
+                        "sample_gripper_bce_loss",
+                        torch.zeros_like(metrics["sample_is_valid"]),
+                    ).double()
                     * metrics["sample_is_valid"].double()
                 ).sum(),
                 reduction="sum",
             )
             rotation_geodesic_sum += accelerator.reduce(
                 (
-                    metrics["sample_rotation_geodesic_loss"].double()
+                    metrics.get(
+                        "sample_rotation_geodesic_loss",
+                        torch.zeros_like(metrics["sample_is_valid"]),
+                    ).double()
                     * metrics["sample_is_valid"].double()
                 ).sum(),
                 reduction="sum",
@@ -740,7 +1126,25 @@ def validate(
             if index < cfg.training.sample_validation_batches:
                 # Route sampling through DDP/FSDP so parameter-gathering hooks
                 # run just as they do for the training forward.
+                cpu_rng_state = torch.random.get_rng_state()
+                cuda_rng_state = (
+                    torch.cuda.get_rng_state(accelerator.device)
+                    if accelerator.device.type == "cuda"
+                    else None
+                )
                 prediction = model(batch, sample=True)
+                qwen_ablation_predictions: list[torch.Tensor] = []
+                if run_qwen_ablation:
+                    for ablation_batch in qwen_ablation_batches:
+                        torch.random.set_rng_state(cpu_rng_state)
+                        if cuda_rng_state is not None:
+                            torch.cuda.set_rng_state(
+                                cuda_rng_state,
+                                device=accelerator.device,
+                            )
+                        qwen_ablation_predictions.append(
+                            model(ablation_batch, sample=True)
+                        )
                 target = batch["actions"].to(
                     device=prediction.device,
                     dtype=prediction.dtype,
@@ -757,7 +1161,7 @@ def validate(
                     prediction.dtype
                 )
                 diff = prediction - target
-                if cfg.model.action_encoder_layout == "rdt_eef":
+                if action_encoder_layout == "rdt_eef":
                     diff = torch.cat(
                         [
                             diff[..., :3],
@@ -780,7 +1184,238 @@ def validate(
                 sample_valid_count += accelerator.reduce(
                     per_sample_valid.sum().double(), reduction="sum"
                 )
-                if cfg.model.action_encoder_layout == "libero_ortho6d":
+                for ablation_index, ablation_prediction in enumerate(
+                    qwen_ablation_predictions
+                ):
+                    ablation_diff = ablation_prediction - target
+                    if action_encoder_layout == "rdt_eef":
+                        ablation_diff = torch.cat(
+                            [
+                                ablation_diff[..., :3],
+                                torch.atan2(
+                                    torch.sin(ablation_diff[..., 3:6]),
+                                    torch.cos(ablation_diff[..., 3:6]),
+                                ),
+                                ablation_diff[..., 6:],
+                            ],
+                            dim=-1,
+                        )
+                    ablation_per_sample_error = (
+                        (ablation_diff.pow(2) * valid).sum(dim=(1, 2))
+                        / per_sample_count.clamp_min(1.0)
+                    )
+                    qwen_ablation_sample_error_sum[ablation_index] += (
+                        ablation_per_sample_error * per_sample_valid
+                    ).sum().double()
+                    qwen_ablation_sample_valid_count[ablation_index] += (
+                        per_sample_valid.sum().double()
+                    )
+                if action_encoder_layout == "rdt_native_128":
+                    prediction_10d = native_rdt_action_to_10d(prediction)
+                    target_10d = native_rdt_action_to_10d(target)
+                    raw_time_mask = batch["action_time_mask"].to(
+                        accelerator.device, dtype=torch.bool
+                    )
+                    gripper_valid = raw_time_mask & batch[
+                        "action_dim_mask"
+                    ][:, 10].to(accelerator.device, dtype=torch.bool).unsqueeze(1)
+                    predicted_open = prediction[..., 10] >= 0.0
+                    target_open = target[..., 10] >= 0.0
+                    sampled_native_gripper_confusion += torch.stack(
+                        (
+                            (
+                                predicted_open
+                                & target_open
+                                & gripper_valid
+                            ).sum().double(),
+                            (
+                                predicted_open
+                                & ~target_open
+                                & gripper_valid
+                            ).sum().double(),
+                            (
+                                ~predicted_open
+                                & target_open
+                                & gripper_valid
+                            ).sum().double(),
+                            (
+                                ~predicted_open
+                                & ~target_open
+                                & gripper_valid
+                            ).sum().double(),
+                        )
+                    )
+                    for horizon_slot, horizon in enumerate(sampled_horizons):
+                        horizon_valid = raw_time_mask[:, :horizon]
+                        horizon_gripper_valid = gripper_valid[:, :horizon]
+                        horizon_predicted_open = predicted_open[:, :horizon]
+                        horizon_target_open = target_open[:, :horizon]
+                        sampled_native_gripper_confusion_by_horizon[
+                            horizon_slot
+                        ] += torch.stack(
+                            (
+                                (
+                                    horizon_predicted_open
+                                    & horizon_target_open
+                                    & horizon_gripper_valid
+                                ).sum().double(),
+                                (
+                                    horizon_predicted_open
+                                    & ~horizon_target_open
+                                    & horizon_gripper_valid
+                                ).sum().double(),
+                                (
+                                    ~horizon_predicted_open
+                                    & horizon_target_open
+                                    & horizon_gripper_valid
+                                ).sum().double(),
+                                (
+                                    ~horizon_predicted_open
+                                    & ~horizon_target_open
+                                    & horizon_gripper_valid
+                                ).sum().double(),
+                            )
+                        )
+                        state_values = batch.get("state")
+                        if state_values is not None:
+                            state_open = state_values[:, 10].to(
+                                accelerator.device
+                            ) >= 0.5
+                            group_names = ("all", "open", "close")
+                            stat_names = (
+                                "target",
+                                "predicted",
+                                "matched",
+                                "exact",
+                                "within_1",
+                                "within_2",
+                                "signed_error_sum",
+                                "absolute_error_sum",
+                            )
+                            for row in range(predicted_open.shape[0]):
+                                valid_steps = int(
+                                    horizon_gripper_valid[row].sum().item()
+                                )
+                                if valid_steps <= 0:
+                                    continue
+                                target_events = _binary_transition_events(
+                                    horizon_target_open[row, :valid_steps],
+                                    initial_value=bool(state_open[row].item()),
+                                )
+                                predicted_events = _binary_transition_events(
+                                    horizon_predicted_open[row, :valid_steps],
+                                    initial_value=bool(state_open[row].item()),
+                                )
+                                transition_stats = _match_binary_transition_events(
+                                    target_events,
+                                    predicted_events,
+                                )
+                                for group_index, group_name in enumerate(group_names):
+                                    sampled_native_gripper_transitions[
+                                        horizon_slot, group_index
+                                    ] += torch.tensor(
+                                        [
+                                            transition_stats[group_name][stat_name]
+                                            for stat_name in stat_names
+                                        ],
+                                        device=accelerator.device,
+                                        dtype=torch.float64,
+                                    )
+                        difference_10d = (
+                            prediction_10d[:, :horizon]
+                            - target_10d[:, :horizon]
+                        )
+                        sampled_native10_squared_error[horizon_slot] += (
+                            difference_10d.square()
+                            * horizon_valid.unsqueeze(-1).to(
+                                difference_10d.dtype
+                            )
+                        ).sum().double()
+                        sampled_native10_count[horizon_slot] += (
+                            horizon_valid.sum().double() * 10
+                        )
+
+                    for ablation_index, ablation_prediction in enumerate(
+                        qwen_ablation_predictions
+                    ):
+                        ablation_prediction_10d = native_rdt_action_to_10d(
+                            ablation_prediction
+                        )
+                        prediction_delta = (
+                            ablation_prediction_10d - prediction_10d
+                        )
+                        qwen_ablation_prediction_delta_squared_error[
+                            ablation_index
+                        ] += (
+                            prediction_delta.square()
+                            * raw_time_mask.unsqueeze(-1).to(
+                                prediction_delta.dtype
+                            )
+                        ).sum().double()
+                        qwen_ablation_prediction_delta_count[
+                            ablation_index
+                        ] += raw_time_mask.sum().double() * 10
+                        for horizon_slot, horizon in enumerate(
+                            sampled_horizons
+                        ):
+                            horizon_valid = raw_time_mask[:, :horizon]
+                            ablation_difference_10d = (
+                                ablation_prediction_10d[:, :horizon]
+                                - target_10d[:, :horizon]
+                            )
+                            qwen_ablation_native10_squared_error[
+                                ablation_index, horizon_slot
+                            ] += (
+                                ablation_difference_10d.square()
+                                * horizon_valid.unsqueeze(-1).to(
+                                    ablation_difference_10d.dtype
+                                )
+                            ).sum().double()
+                            qwen_ablation_native10_count[
+                                ablation_index, horizon_slot
+                            ] += horizon_valid.sum().double() * 10
+
+                    if (
+                        accelerator.is_main_process
+                        and cfg.training.report_to.lower() == "wandb"
+                        and len(qualitative_rows)
+                        < cfg.training.qualitative_validation_examples
+                    ):
+                        import matplotlib.pyplot as plt
+                        import wandb
+
+                        remaining = (
+                            cfg.training.qualitative_validation_examples
+                            - len(qualitative_rows)
+                        )
+                        for row in range(min(prediction.shape[0], remaining)):
+                            payloads = list(batch.get("image_slot_jpegs", [[]])[row])
+                            observation = _validation_observation_grid(payloads)
+                            figure = _trajectory_comparison_figure(
+                                prediction[row],
+                                target[row],
+                                batch["action_time_mask"][row],
+                            )
+                            state_10d = native_rdt_action_to_10d(
+                                batch["state"][row]
+                            ).float().cpu().tolist()
+                            qualitative_rows.append(
+                                [
+                                    dataset_ids[row],
+                                    list(batch.get("episode_id", [""]))[row],
+                                    list(batch.get("step_idx", [""]))[row],
+                                    list(batch.get("instruction", [""]))[row],
+                                    json.dumps(state_10d),
+                                    (
+                                        wandb.Image(observation)
+                                        if observation is not None
+                                        else None
+                                    ),
+                                    wandb.Image(figure),
+                                ]
+                            )
+                            plt.close(figure)
+                if action_encoder_layout == "libero_ortho6d":
                     prediction_raw = torch.from_numpy(
                         rdt_action_to_libero(prediction.float().cpu().numpy())
                     ).to(accelerator.device, dtype=torch.float64)
@@ -969,6 +1604,51 @@ def validate(
     sampled_gripper_count = accelerator.reduce(
         sampled_gripper_count, reduction="sum"
     )
+    sampled_native10_squared_error = accelerator.reduce(
+        sampled_native10_squared_error, reduction="sum"
+    )
+    sampled_native10_count = accelerator.reduce(
+        sampled_native10_count, reduction="sum"
+    )
+    sampled_native_gripper_confusion = accelerator.reduce(
+        sampled_native_gripper_confusion, reduction="sum"
+    )
+    sampled_native_gripper_confusion_by_horizon = accelerator.reduce(
+        sampled_native_gripper_confusion_by_horizon, reduction="sum"
+    )
+    sampled_native_gripper_transitions = accelerator.reduce(
+        sampled_native_gripper_transitions, reduction="sum"
+    )
+    qwen_reference_loss_sum = accelerator.reduce(
+        qwen_reference_loss_sum, reduction="sum"
+    )
+    qwen_reference_valid_count = accelerator.reduce(
+        qwen_reference_valid_count, reduction="sum"
+    )
+    qwen_ablation_loss_sum = accelerator.reduce(
+        qwen_ablation_loss_sum, reduction="sum"
+    )
+    qwen_ablation_valid_count = accelerator.reduce(
+        qwen_ablation_valid_count, reduction="sum"
+    )
+    qwen_ablation_sample_error_sum = accelerator.reduce(
+        qwen_ablation_sample_error_sum, reduction="sum"
+    )
+    qwen_ablation_sample_valid_count = accelerator.reduce(
+        qwen_ablation_sample_valid_count, reduction="sum"
+    )
+    qwen_ablation_native10_squared_error = accelerator.reduce(
+        qwen_ablation_native10_squared_error, reduction="sum"
+    )
+    qwen_ablation_native10_count = accelerator.reduce(
+        qwen_ablation_native10_count, reduction="sum"
+    )
+    qwen_ablation_prediction_delta_squared_error = accelerator.reduce(
+        qwen_ablation_prediction_delta_squared_error, reduction="sum"
+    )
+    qwen_ablation_prediction_delta_count = accelerator.reduce(
+        qwen_ablation_prediction_delta_count, reduction="sum"
+    )
     sampled_dimension_stats = accelerator.reduce(
         sampled_dimension_stats, reduction="sum"
     )
@@ -1038,7 +1718,223 @@ def validate(
             else math.nan
         ),
     }
-    if cfg.model.action_encoder_layout == "libero_ortho6d":
+    if qwen_reference_valid_count.item() > 0:
+        reference_denoising_loss = qwen_reference_loss_sum / (
+            qwen_reference_valid_count.clamp_min(1.0)
+        )
+        result["val/qwen_ablation/reference/denoising_loss"] = float(
+            reference_denoising_loss.cpu()
+        )
+        for ablation_index, ablation_name in enumerate(qwen_ablation_names):
+            ablation_loss = qwen_ablation_loss_sum[ablation_index] / (
+                qwen_ablation_valid_count[ablation_index].clamp_min(1.0)
+            )
+            ablation_sample_mse = qwen_ablation_sample_error_sum[
+                ablation_index
+            ] / qwen_ablation_sample_valid_count[ablation_index].clamp_min(1.0)
+            prefix = f"val/qwen_ablation/{ablation_name}"
+            result[f"{prefix}/denoising_loss"] = float(ablation_loss.cpu())
+            result[f"{prefix}/denoising_loss_delta"] = float(
+                (ablation_loss - reference_denoising_loss).cpu()
+            )
+            result[f"{prefix}/sample_mse"] = float(
+                ablation_sample_mse.cpu()
+            )
+            result[f"{prefix}/sample_mse_delta"] = float(
+                (ablation_sample_mse - result["val/sample_mse"])
+            )
+            result[f"{prefix}/prediction_delta_rmse_native10"] = float(
+                torch.sqrt(
+                    qwen_ablation_prediction_delta_squared_error[
+                        ablation_index
+                    ]
+                    / qwen_ablation_prediction_delta_count[
+                        ablation_index
+                    ].clamp_min(1.0)
+                ).cpu()
+            )
+    if action_encoder_layout == "rdt_native_128":
+        tp, fp, fn, tn = sampled_native_gripper_confusion
+        gripper_total = sampled_native_gripper_confusion.sum()
+        precision_denominator = tp + fp
+        recall_denominator = tp + fn
+        precision = (
+            tp / precision_denominator
+            if precision_denominator.item() > 0
+            else tp.new_zeros(())
+        )
+        recall = (
+            tp / recall_denominator
+            if recall_denominator.item() > 0
+            else tp.new_zeros(())
+        )
+        f1_denominator = precision + recall
+        f1 = (
+            2.0 * precision * recall / f1_denominator
+            if f1_denominator.item() > 0
+            else tp.new_zeros(())
+        )
+        gripper_prefix = "val/sampled_native10/gripper_open"
+        result[f"{gripper_prefix}/accuracy"] = (
+            float(((tp + tn) / gripper_total).cpu())
+            if gripper_total.item() > 0
+            else math.nan
+        )
+        result[f"{gripper_prefix}/precision"] = float(precision.cpu())
+        result[f"{gripper_prefix}/recall"] = float(recall.cpu())
+        result[f"{gripper_prefix}/f1"] = float(f1.cpu())
+        result[f"{gripper_prefix}/tp"] = float(tp.cpu())
+        result[f"{gripper_prefix}/fp"] = float(fp.cpu())
+        result[f"{gripper_prefix}/fn"] = float(fn.cpu())
+        result[f"{gripper_prefix}/tn"] = float(tn.cpu())
+        result[f"{gripper_prefix}/valid_commands"] = float(
+            gripper_total.cpu()
+        )
+        for slot, horizon in enumerate(sampled_horizons):
+            horizon_prefix = f"val/sampled_native10/horizon_{horizon}"
+            result[f"{horizon_prefix}/rmse"] = (
+                float(
+                    torch.sqrt(
+                        sampled_native10_squared_error[slot]
+                        / sampled_native10_count[slot].clamp_min(1.0)
+                    ).cpu()
+                )
+                if sampled_native10_count[slot].item() > 0
+                else math.nan
+            )
+            horizon_tp, horizon_fp, horizon_fn, horizon_tn = (
+                sampled_native_gripper_confusion_by_horizon[slot]
+            )
+            horizon_total = horizon_tp + horizon_fp + horizon_fn + horizon_tn
+            horizon_precision = horizon_tp / (horizon_tp + horizon_fp).clamp_min(1.0)
+            horizon_recall = horizon_tp / (horizon_tp + horizon_fn).clamp_min(1.0)
+            horizon_f1 = (
+                2.0
+                * horizon_precision
+                * horizon_recall
+                / (horizon_precision + horizon_recall).clamp_min(1e-12)
+            )
+            horizon_gripper_prefix = f"{horizon_prefix}/gripper_open"
+            result[f"{horizon_gripper_prefix}/accuracy"] = (
+                float(((horizon_tp + horizon_tn) / horizon_total).cpu())
+                if horizon_total.item() > 0
+                else math.nan
+            )
+            result[f"{horizon_gripper_prefix}/precision"] = float(
+                horizon_precision.cpu()
+            )
+            result[f"{horizon_gripper_prefix}/recall"] = float(
+                horizon_recall.cpu()
+            )
+            result[f"{horizon_gripper_prefix}/f1"] = float(horizon_f1.cpu())
+            result[f"{horizon_gripper_prefix}/tp"] = float(horizon_tp.cpu())
+            result[f"{horizon_gripper_prefix}/fp"] = float(horizon_fp.cpu())
+            result[f"{horizon_gripper_prefix}/fn"] = float(horizon_fn.cpu())
+            result[f"{horizon_gripper_prefix}/tn"] = float(horizon_tn.cpu())
+            result[f"{horizon_gripper_prefix}/valid_commands"] = float(
+                horizon_total.cpu()
+            )
+            for group_index, group_name in enumerate(("all", "open", "close")):
+                (
+                    target_events,
+                    predicted_events,
+                    matched_events,
+                    exact_events,
+                    within_1_events,
+                    within_2_events,
+                    signed_error_sum,
+                    absolute_error_sum,
+                ) = sampled_native_gripper_transitions[slot, group_index]
+                transition_prefix = (
+                    f"{horizon_prefix}/gripper_transition/{group_name}"
+                )
+                result[f"{transition_prefix}/target_events"] = float(
+                    target_events.cpu()
+                )
+                result[f"{transition_prefix}/predicted_events"] = float(
+                    predicted_events.cpu()
+                )
+                result[f"{transition_prefix}/matched_events"] = float(
+                    matched_events.cpu()
+                )
+                result[f"{transition_prefix}/missed_events"] = float(
+                    (target_events - matched_events).cpu()
+                )
+                result[f"{transition_prefix}/spurious_events"] = float(
+                    (predicted_events - matched_events).cpu()
+                )
+                result[f"{transition_prefix}/event_precision"] = (
+                    float((matched_events / predicted_events).cpu())
+                    if predicted_events.item() > 0
+                    else math.nan
+                )
+                result[f"{transition_prefix}/event_recall"] = (
+                    float((matched_events / target_events).cpu())
+                    if target_events.item() > 0
+                    else math.nan
+                )
+                result[f"{transition_prefix}/exact_recall"] = (
+                    float((exact_events / target_events).cpu())
+                    if target_events.item() > 0
+                    else math.nan
+                )
+                result[f"{transition_prefix}/within_1_step_recall"] = (
+                    float((within_1_events / target_events).cpu())
+                    if target_events.item() > 0
+                    else math.nan
+                )
+                result[f"{transition_prefix}/within_2_steps_recall"] = (
+                    float((within_2_events / target_events).cpu())
+                    if target_events.item() > 0
+                    else math.nan
+                )
+                result[f"{transition_prefix}/mean_signed_error_steps"] = (
+                    float((signed_error_sum / matched_events).cpu())
+                    if matched_events.item() > 0
+                    else math.nan
+                )
+                result[f"{transition_prefix}/mae_steps"] = (
+                    float((absolute_error_sum / matched_events).cpu())
+                    if matched_events.item() > 0
+                    else math.nan
+                )
+            for ablation_index, ablation_name in enumerate(
+                qwen_ablation_names
+            ):
+                count = qwen_ablation_native10_count[
+                    ablation_index, slot
+                ]
+                if count.item() <= 0:
+                    continue
+                result[
+                    "val/qwen_ablation/"
+                    f"{ablation_name}/sampled_native10/horizon_{horizon}/rmse"
+                ] = float(
+                    torch.sqrt(
+                        qwen_ablation_native10_squared_error[
+                            ablation_index, slot
+                        ]
+                        / count
+                    ).cpu()
+                )
+        if qualitative_rows and accelerator.is_main_process:
+            import wandb
+
+            result["val/qualitative_trajectories"] = wandb.Table(
+                # W&B 0.21+ validates this as an actual list rather than any
+                # generic sequence; a tuple raises AssertionError.
+                columns=[
+                    "dataset",
+                    "episode_id",
+                    "step_idx",
+                    "instruction",
+                    "native_state_10d",
+                    "observation_images",
+                    "target_vs_diffusion_sample",
+                ],
+                data=qualitative_rows,
+            )
+    if action_encoder_layout == "libero_ortho6d":
         for slot, horizon in enumerate(sampled_horizons):
             prefix = f"val/sampled_command/horizon_{horizon}"
             result[f"{prefix}/command_rmse_7d"] = (
@@ -1195,7 +2091,7 @@ def validate(
             if detected.item() > 0
             else math.nan
         )
-    for suite_index, suite_id in enumerate(LIBERO_SUITE_IDS):
+    for suite_index, suite_id in enumerate(VALIDATION_DATASET_IDS):
         stats = suite_stats[suite_index]
         example_count = stats[2]
         if example_count.item() <= 0:
@@ -1225,12 +2121,23 @@ def train(
     online_siglip_fallback_model_id: str | None = "google/siglip-so400m-patch14-384",
     base_artifact: str | Path | None = None,
     init_artifact: str | Path | None = None,
+    resume_from: str | Path | None = None,
     horizon_loss_weights: list[float] | None = None,
     mask_noisy_gripper_input: bool | None = None,
     gripper_bce_weight: float = 0.0,
     gripper_bce_logit_scale: float = 1.0,
     rotation_geodesic_weight: float = 0.0,
 ) -> None:
+    if init_artifact is not None and resume_from is not None:
+        raise ValueError(
+            "init_artifact and resume_from are mutually exclusive: use "
+            "init_artifact for weights only or resume_from for exact trainer state"
+        )
+    if resume_from is not None and not cfg.data.episode_aware_shuffle:
+        raise ValueError(
+            "Bit-exact mid-epoch resume requires data.episode_aware_shuffle=true "
+            "so the shuffled order is reproducible from seed + epoch"
+        )
     seed_everything(cfg.seed)
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1328,8 +2235,9 @@ def train(
         load_pretrained=load_pretrained,
         base_artifact=base_artifact,
     )
-    if init_artifact is not None:
-        load_trainable_artifact(model, init_artifact, trainable=True)
+    artifact_to_load = resume_from if resume_from is not None else init_artifact
+    if artifact_to_load is not None:
+        load_trainable_artifact(model, artifact_to_load, trainable=True)
     if mask_noisy_gripper_input is not None:
         model.mask_noisy_gripper_input = bool(mask_noisy_gripper_input)
     resolved_mask_noisy_gripper_input = bool(model.mask_noisy_gripper_input)
@@ -1362,6 +2270,21 @@ def train(
             print("First LoRA targets:")
             for target in model.lora_targets[:14]:
                 print("  ", target)
+        if report_to.lower() == "wandb":
+            run = accelerator.get_tracker("wandb", unwrap=True)
+            run.summary["model/trainable_parameters"] = model_report["trainable"]
+            run.summary["model/total_parameters"] = model_report["total"]
+            run.summary["model/trainable_percentage"] = model_report["percentage"]
+            run.summary["model/output_dimension"] = cfg.model.action_dim
+            run.summary["model/supervised_action_dimensions"] = (
+                10
+                if cfg.model.action_encoder_layout == "rdt_native_128"
+                else cfg.model.action_dim
+            )
+            run.summary["model/qwen_fusion"] = cfg.model.qwen_fusion
+            run.summary["model/pretrained_copy_report"] = model_report.get(
+                "pretrained"
+            )
 
     optimizer = create_optimizer(model, cfg)
     scheduler = get_scheduler(
@@ -1395,6 +2318,16 @@ def train(
     accumulation_steps = prepared_accumulation
     effective_global_batch = prepared_global_batch
 
+    resume_contract = build_resume_contract(
+        cfg,
+        accelerator,
+        train_loader,
+        accumulation_steps=accumulation_steps,
+        effective_global_batch=effective_global_batch,
+        training_objective=training_objective,
+        online_siglip_model_id=online_siglip_model_id,
+    )
+
     global_step = 0
     running_loss = 0.0
     running_imitation_loss = 0.0
@@ -1418,15 +2351,125 @@ def train(
     pending_gripper_loss_sum = 0.0
     pending_gripper_valid_count = 0.0
     pending_microbatches = 0
+    bad_accumulation_window = False
+    skipped_nonfinite_updates = 0
+    consecutive_nonfinite_updates = 0
+    last_gradient_log_data: dict[str, float] = {}
     update_started_at = time.perf_counter()
     epoch = 0
+    batches_consumed_in_epoch = 0
+    if resume_from is not None:
+        progress = load_trainer_state(
+            resume_from,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=accelerator.scaler,
+            process_index=accelerator.process_index,
+            num_processes=accelerator.num_processes,
+            expected_contract=resume_contract,
+        )
+        global_step = int(progress["global_step"])
+        epoch = int(progress["epoch"])
+        batches_consumed_in_epoch = int(
+            progress["batches_consumed_in_epoch"]
+        )
+        skipped_nonfinite_updates = int(
+            progress.get("skipped_nonfinite_updates", 0)
+        )
+        consecutive_nonfinite_updates = int(
+            progress.get("consecutive_nonfinite_updates", 0)
+        )
+        logging_accumulators = progress.get("logging_accumulators", {})
+        running_loss = float(logging_accumulators.get("loss", 0.0))
+        running_imitation_loss = float(
+            logging_accumulators.get("imitation_loss", 0.0)
+        )
+        running_gripper_bce_loss = float(
+            logging_accumulators.get("gripper_bce_loss", 0.0)
+        )
+        running_rotation_geodesic_loss = float(
+            logging_accumulators.get("rotation_geodesic_loss", 0.0)
+        )
+        running_mae = float(logging_accumulators.get("mae", 0.0))
+        running_xyz_loss = float(logging_accumulators.get("xyz_loss", 0.0))
+        running_rot_loss = float(logging_accumulators.get("rot_loss", 0.0))
+        running_gripper_loss = float(
+            logging_accumulators.get("gripper_loss", 0.0)
+        )
+        running_step_time = float(
+            logging_accumulators.get("step_time", 0.0)
+        )
+        running_steps = int(logging_accumulators.get("steps", 0))
+        if global_step > cfg.training.max_steps:
+            raise ValueError(
+                "Checkpoint global_step exceeds configured max_steps: "
+                f"{global_step} > {cfg.training.max_steps}"
+            )
+        if accelerator.is_main_process:
+            print(
+                "Resuming exact trainer state from "
+                f"{resume_from}: global_step={global_step}, epoch={epoch}, "
+                f"batches_consumed_in_epoch={batches_consumed_in_epoch}"
+            )
+
+    def checkpoint_progress() -> dict[str, object]:
+        progress_epoch, progress_batches = normalized_data_position(
+            epoch,
+            batches_consumed_in_epoch,
+            len(train_loader),
+        )
+        return {
+            "global_step": global_step,
+            "epoch": progress_epoch,
+            "batches_consumed_in_epoch": progress_batches,
+            "skipped_nonfinite_updates": skipped_nonfinite_updates,
+            "consecutive_nonfinite_updates": consecutive_nonfinite_updates,
+            "logging_accumulators": {
+                "loss": running_loss,
+                "imitation_loss": running_imitation_loss,
+                "gripper_bce_loss": running_gripper_bce_loss,
+                "rotation_geodesic_loss": running_rotation_geodesic_loss,
+                "mae": running_mae,
+                "xyz_loss": running_xyz_loss,
+                "rot_loss": running_rot_loss,
+                "gripper_loss": running_gripper_loss,
+                "step_time": running_step_time,
+                "steps": running_steps,
+            },
+        }
+
     model.train()
     while global_step < cfg.training.max_steps:
         if hasattr(train_loader, "set_epoch"):
             train_loader.set_epoch(epoch)
+        epoch_loader = train_loader
+        if batches_consumed_in_epoch:
+            epoch_loader = accelerator.skip_first_batches(
+                train_loader,
+                num_batches=batches_consumed_in_epoch,
+            )
+            if accelerator.is_main_process:
+                print(
+                    f"Efficiently skipped {batches_consumed_in_epoch} "
+                    "already-consumed "
+                    f"batches in epoch {epoch}"
+                )
+        if batches_consumed_in_epoch:
+            # Starting a replacement DataLoader iterator can draw a worker base
+            # seed from the parent CPU generator. The uninterrupted run already
+            # created this epoch's iterator, so undo that extra parent RNG draw.
+            parent_cpu_rng = torch.get_rng_state()
+            iterator = iter(epoch_loader)
+            torch.set_rng_state(parent_cpu_rng)
+        else:
+            iterator = iter(epoch_loader)
         saw_batch = False
-        for batch in train_loader:
+        for batch_index, batch in enumerate(
+            iterator,
+            start=batches_consumed_in_epoch,
+        ):
             saw_batch = True
+            batches_consumed_in_epoch = batch_index + 1
             if online_siglip is not None:
                 batch = add_online_siglip_features(
                     batch,
@@ -1445,16 +2488,94 @@ def train(
             with accelerator.accumulate(model):
                 metrics = model(batch)
                 loss = metrics["loss"]
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        model.parameters(), cfg.training.max_grad_norm
-                    )
-                optimizer.step()
-                optimizer_update_succeeded = (
-                    accelerator.sync_gradients
-                    and not accelerator.optimizer_step_was_skipped
+                finite_loss_checks = [
+                    torch.isfinite(value.detach()).all()
+                    for name, value in metrics.items()
+                    if "loss" in name and isinstance(value, torch.Tensor)
+                ]
+                local_bad_loss = (~torch.stack(finite_loss_checks).all()).to(
+                    device=accelerator.device, dtype=torch.int64
                 )
+                bad_loss = bool(
+                    accelerator.reduce(
+                        local_bad_loss, reduction="max"
+                    ).item()
+                )
+                bad_accumulation_window = bad_accumulation_window or bad_loss
+                if bad_loss and not cfg.training.skip_nonfinite_updates:
+                    raise FloatingPointError(
+                        "Non-finite diffusion loss detected; refusing to continue"
+                    )
+                if not bad_accumulation_window:
+                    accelerator.backward(loss)
+
+                optimizer_update_succeeded = False
+                last_gradient_log_data = {}
+                if accelerator.sync_gradients:
+                    gradient_bad = bad_accumulation_window
+                    grad_norm_value = math.nan
+                    if not gradient_bad:
+                        accelerator.unscale_gradients(optimizer)
+                        if cfg.training.log_gradient_stats:
+                            (
+                                last_gradient_log_data,
+                                gradient_bad,
+                            ) = gradient_statistics(optimizer, accelerator)
+                        grad_norm = accelerator.clip_grad_norm_(
+                            model.parameters(), cfg.training.max_grad_norm
+                        )
+                        grad_norm_tensor = torch.as_tensor(
+                            grad_norm,
+                            device=accelerator.device,
+                            dtype=torch.float64,
+                        )
+                        global_bad_gradient = accelerator.reduce(
+                            (~torch.isfinite(grad_norm_tensor)).to(torch.int64),
+                            reduction="max",
+                        )
+                        gradient_bad = gradient_bad or bool(
+                            global_bad_gradient.item()
+                        )
+                        grad_norm_value = float(grad_norm_tensor.detach().cpu())
+                        last_gradient_log_data.update(
+                            {
+                                "train/grad_norm_pre_clip": grad_norm_value,
+                                "train/grad_clip_threshold": float(
+                                    cfg.training.max_grad_norm
+                                ),
+                                "train/gradient_was_clipped": float(
+                                    math.isfinite(grad_norm_value)
+                                    and grad_norm_value
+                                    > cfg.training.max_grad_norm
+                                ),
+                            }
+                        )
+                    if gradient_bad:
+                        if not cfg.training.skip_nonfinite_updates:
+                            raise FloatingPointError(
+                                "Non-finite gradient norm detected; refusing to continue"
+                            )
+                        skipped_nonfinite_updates += 1
+                        consecutive_nonfinite_updates += 1
+                        if (
+                            consecutive_nonfinite_updates
+                            >= cfg.training.max_consecutive_nonfinite_updates
+                        ):
+                            raise FloatingPointError(
+                                "Reached configured consecutive non-finite update "
+                                f"limit ({consecutive_nonfinite_updates})"
+                            )
+                    else:
+                        optimizer.step()
+                        optimizer_update_succeeded = (
+                            not accelerator.optimizer_step_was_skipped
+                        )
+                        if optimizer_update_succeeded:
+                            consecutive_nonfinite_updates = 0
+                elif not bad_accumulation_window:
+                    # AcceleratedOptimizer intentionally turns this into a no-op
+                    # until the configured accumulation boundary.
+                    optimizer.step()
                 if optimizer_update_succeeded:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1494,9 +2615,13 @@ def train(
                 pending_gripper_loss_sum = 0.0
                 pending_gripper_valid_count = 0.0
                 pending_microbatches = 0
+                bad_accumulation_window = False
                 update_started_at = time.perf_counter()
                 continue
+            bad_accumulation_window = False
             global_step += 1
+            if accelerator.device.type == "cuda":
+                torch.cuda.synchronize(accelerator.device)
             local_step_time = time.perf_counter() - update_started_at
             step_time_tensor = torch.tensor(
                 local_step_time,
@@ -1547,7 +2672,7 @@ def train(
             pending_gripper_valid_count = 0.0
             pending_microbatches = 0
 
-            step_log_data: dict[str, float | int] = {}
+            step_log_data: dict[str, object] = {}
             if cfg.training.log_every > 0 and global_step % cfg.training.log_every == 0:
                 average_step_time = running_step_time / max(running_steps, 1)
                 training_log_data = {
@@ -1569,10 +2694,32 @@ def train(
                     "train/step": global_step,
                     "train/effective_global_batch": effective_global_batch,
                     "train/step_time_sec": average_step_time,
+                    "train/step_time_sec_last": step_time,
                     "train/samples_per_sec": (
                         effective_global_batch / max(average_step_time, 1e-12)
                     ),
+                    "train/skipped_nonfinite_updates": skipped_nonfinite_updates,
+                    "train/consecutive_nonfinite_updates": (
+                        consecutive_nonfinite_updates
+                    ),
                 }
+                if accelerator.device.type == "cuda":
+                    gib = 1024.0 ** 3
+                    training_log_data.update(
+                        {
+                            "system/cuda_memory_allocated_gib": (
+                                torch.cuda.memory_allocated(accelerator.device) / gib
+                            ),
+                            "system/cuda_memory_reserved_gib": (
+                                torch.cuda.memory_reserved(accelerator.device) / gib
+                            ),
+                            "system/cuda_max_memory_allocated_gib": (
+                                torch.cuda.max_memory_allocated(accelerator.device)
+                                / gib
+                            ),
+                        }
+                    )
+                training_log_data.update(last_gradient_log_data)
                 for index, group in enumerate(optimizer.param_groups):
                     group_name = group.get("name", str(index))
                     training_log_data[f"train/lr_{group_name}"] = group["lr"]
@@ -1589,6 +2736,53 @@ def train(
                 running_gripper_loss = 0.0
                 running_step_time = 0.0
                 running_steps = 0
+                if accelerator.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(accelerator.device)
+
+            # Save before validation and tracker logging when schedules coincide.
+            # A validation or remote logging failure must not prevent the local
+            # checkpoint for an already completed optimizer step.
+            if (
+                cfg.training.save_every > 0
+                and global_step % cfg.training.save_every == 0
+            ):
+                accelerator.wait_for_everyone()
+                state_dict = model_state_dict_for_save(accelerator, model)
+                if accelerator.is_main_process:
+                    unwrapped = unwrap_model_without_optional_deepspeed(
+                        accelerator, model
+                    )
+                    save_trainable_artifact(
+                        unwrapped,
+                        output_dir / f"checkpoint-{global_step}",
+                        {
+                            "global_step": global_step,
+                            "effective_global_batch": effective_global_batch,
+                            "pretrained_model": cfg.pretrained_model,
+                            "model_report": model_report,
+                            "horizon_loss_weights": horizon_loss_weights,
+                            "mask_noisy_gripper_input": (
+                                resolved_mask_noisy_gripper_input
+                            ),
+                            "training_objective": training_objective,
+                            "config": asdict(cfg),
+                        },
+                        model_state_dict=state_dict,
+                    )
+                del state_dict
+                accelerator.wait_for_everyone()
+                save_trainer_state(
+                    output_dir / f"checkpoint-{global_step}",
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=accelerator.scaler,
+                    progress=checkpoint_progress(),
+                    resume_contract=resume_contract,
+                    process_index=accelerator.process_index,
+                    num_processes=accelerator.num_processes,
+                    is_main_process=accelerator.is_main_process,
+                )
+                accelerator.wait_for_everyone()
 
             if (
                 cfg.training.validate_every > 0
@@ -1621,36 +2815,6 @@ def train(
                     report_to=report_to,
                 )
 
-            if (
-                cfg.training.save_every > 0
-                and global_step % cfg.training.save_every == 0
-            ):
-                accelerator.wait_for_everyone()
-                state_dict = model_state_dict_for_save(accelerator, model)
-                if accelerator.is_main_process:
-                    unwrapped = unwrap_model_without_optional_deepspeed(
-                        accelerator, model
-                    )
-                    save_trainable_artifact(
-                        unwrapped,
-                        output_dir / f"checkpoint-{global_step}",
-                        {
-                            "global_step": global_step,
-                            "effective_global_batch": effective_global_batch,
-                            "pretrained_model": cfg.pretrained_model,
-                            "model_report": model_report,
-                            "horizon_loss_weights": horizon_loss_weights,
-                            "mask_noisy_gripper_input": (
-                                resolved_mask_noisy_gripper_input
-                            ),
-                            "training_objective": training_objective,
-                            "config": asdict(cfg),
-                        },
-                        model_state_dict=state_dict,
-                    )
-                del state_dict
-                accelerator.wait_for_everyone()
-
             # Start the next update timer after logging, validation, and saves,
             # so those maintenance costs do not inflate training step latency.
             update_started_at = time.perf_counter()
@@ -1661,7 +2825,12 @@ def train(
                 "Training dataloader yielded no batches. Check dataset filtering "
                 "and whether drop_last exceeds the available sample count."
             )
+        if global_step >= cfg.training.max_steps:
+            # The epoch was interrupted at the requested optimizer-step limit;
+            # preserve its exact batch cursor for the final resumable artifact.
+            break
         epoch += 1
+        batches_consumed_in_epoch = 0
 
     accelerator.wait_for_everyone()
     state_dict = model_state_dict_for_save(accelerator, model)
@@ -1684,4 +2853,16 @@ def train(
         )
     accelerator.wait_for_everyone()
     del state_dict
+    save_trainer_state(
+        output_dir / "final",
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=accelerator.scaler,
+        progress=checkpoint_progress(),
+        resume_contract=resume_contract,
+        process_index=accelerator.process_index,
+        num_processes=accelerator.num_processes,
+        is_main_process=accelerator.is_main_process,
+    )
+    accelerator.wait_for_everyone()
     accelerator.end_training()
