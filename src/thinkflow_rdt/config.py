@@ -147,6 +147,9 @@ class TrainingConfig:
     max_consecutive_nonfinite_updates: int = 10
     log_gradient_stats: bool = True
     qualitative_validation_examples: int = 2
+    # Validation can use a larger batch than training because it has no
+    # backward activations. ``None`` preserves the training micro batch size.
+    validation_batch_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -258,12 +261,14 @@ class ExperimentConfig:
                 )
             if self.model.resolved_rdt_state_dim != 128:
                 raise ValueError("rdt_native_128 requires rdt_state_dim=128")
-            if (
-                self.model.resolved_cache_state_dim != 7
-                or self.model.resolved_cache_action_dim != 7
-            ):
+            cache_layout = (
+                self.model.resolved_cache_state_dim,
+                self.model.resolved_cache_action_dim,
+            )
+            if cache_layout not in {(7, 7), (11, 10)}:
                 raise ValueError(
-                    "rdt_native_128 currently requires cached 7-D state/actions"
+                    "rdt_native_128 requires cached 7-D OXE state/actions or "
+                    "11-D state + 10-D action LIBERO caches"
                 )
         elif self.model.resolved_rdt_state_dim != self.model.state_dim:
             raise ValueError(
@@ -297,6 +302,11 @@ class ExperimentConfig:
             raise ValueError(
                 "training.qualitative_validation_examples must be non-negative"
             )
+        if (
+            self.training.validation_batch_size is not None
+            and self.training.validation_batch_size <= 0
+        ):
+            raise ValueError("training.validation_batch_size must be positive")
 
 
 def _require(mapping: dict[str, Any], key: str) -> Any:

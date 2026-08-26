@@ -536,8 +536,14 @@ class RDTBatchCollator:
         if self.native_rdt_128:
             if self.state_dim != 128 or self.action_dim != 128:
                 raise ValueError("native_rdt_128 requires state_dim=action_dim=128")
-            if self.cache_state_dim != 7 or self.cache_action_dim != 7:
-                raise ValueError("native_rdt_128 requires cached 7-D state/actions")
+            if (self.cache_state_dim, self.cache_action_dim) not in {
+                (7, 7),
+                (11, 10),
+            }:
+                raise ValueError(
+                    "native_rdt_128 requires cached 7-D OXE state/actions or "
+                    "11-D state + 10-D action LIBERO caches"
+                )
 
     def _pad_sequence(
         self,
@@ -592,6 +598,13 @@ class RDTBatchCollator:
         mask = state_mask.new_zeros(128)
         values[RDT_XYZ_SLICE] = state[:3] * state_mask[:3]
         mask[RDT_XYZ_SLICE] = state_mask[:3]
+        if self.cache_state_dim == 11:
+            # LIBERO cache: xyz + absolute ortho6D + two raw finger states.
+            values[RDT_ORTHO6D_SLICE] = state[3:9] * state_mask[3:9]
+            mask[RDT_ORTHO6D_SLICE] = state_mask[3:9]
+            values[10:12] = state[9:11] * state_mask[9:11]
+            mask[10:12] = state_mask[9:11]
+            return values, mask
         rotation_valid = state_mask[3:6].amin()
         rotation = euler_xyz_to_ortho6d(state[3:6])
         values[RDT_ORTHO6D_SLICE] = rotation * rotation_valid
@@ -612,6 +625,21 @@ class RDTBatchCollator:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         values = actions.new_zeros(actions.shape[0], 128)
         mask = action_mask.new_zeros(128)
+
+        if self.cache_action_dim == 10:
+            if actions_normalized:
+                raise ValueError(
+                    "LIBERO 10-D ortho6D actions must be cached without "
+                    "normalization"
+                )
+            # LIBERO cache: dxyz + relative ortho6D + raw gripper command.
+            values[:, RDT_XYZ_SLICE] = actions[:, :3] * action_mask[:3]
+            mask[RDT_XYZ_SLICE] = action_mask[:3]
+            values[:, RDT_ORTHO6D_SLICE] = actions[:, 3:9] * action_mask[3:9]
+            mask[RDT_ORTHO6D_SLICE] = action_mask[3:9]
+            values[:, RDT_GRIPPER_INDEX] = actions[:, 9] * action_mask[9]
+            mask[RDT_GRIPPER_INDEX] = action_mask[9]
+            return values, mask
 
         # Keep the already normalized XYZ commands. Euler angles must first be
         # restored to radians; applying trigonometry to standardized values is

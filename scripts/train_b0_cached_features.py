@@ -264,6 +264,10 @@ def build_config(args: argparse.Namespace):
                 cfg.training.qualitative_validation_examples,
             )
         ),
+        validation_batch_size=optional_override(
+            args.validation_batch_size,
+            cfg.training.validation_batch_size,
+        ),
     )
     model_cfg = cfg.model
     if args.no_gradient_checkpointing:
@@ -402,6 +406,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=None)
     parser.add_argument("--validation-batches", type=int, default=None)
     parser.add_argument("--validation-samples", type=int, default=None)
+    parser.add_argument("--validation-batch-size", type=int, default=None)
     parser.add_argument("--sample-validation-batches", type=int, default=None)
     parser.add_argument("--mixed-precision", default=None)
     parser.add_argument("--report-to", default=None)

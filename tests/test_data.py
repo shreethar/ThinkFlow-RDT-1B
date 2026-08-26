@@ -179,6 +179,59 @@ def test_collator_builds_native_128d_targets_with_exact_ten_dim_mask(
     assert batch["actions"][0, 1, 10].item() == -1.0
 
 
+def test_collator_maps_raw_libero_11d_10d_cache_to_native_128() -> None:
+    collator = RDTBatchCollator(
+        max_lang_tokens=1,
+        image_tokens=1,
+        pred_horizon=3,
+        feature_dim=8,
+        state_dim=128,
+        action_dim=128,
+        cache_state_dim=11,
+        cache_action_dim=10,
+        native_rdt_128=True,
+        convert_cached_gripper_closed_to_open=False,
+    )
+    state = torch.tensor(
+        [1.0, 2.0, 3.0, *range(4, 10), 0.04, -0.04],
+        dtype=torch.float32,
+    )
+    action = torch.tensor(
+        [[0.1, 0.2, 0.3, *range(4, 10), -1.0]],
+        dtype=torch.float32,
+    )
+    sample = {
+        "qwen_kv": torch.zeros(1, 8),
+        "lang_tokens": torch.zeros(1, 8),
+        "img_tokens": torch.zeros(1, 8),
+        "state": state,
+        "actions": action,
+        "actions_normalized": False,
+        "dataset_id": "libero_10",
+        "ctrl_freq": 20.0,
+    }
+
+    batch = collator([sample])
+
+    assert torch.nonzero(batch["state_dim_mask"][0]).flatten().tolist() == [
+        10,
+        11,
+        *range(30, 39),
+    ]
+    assert torch.nonzero(batch["action_dim_mask"][0]).flatten().tolist() == [
+        10,
+        *range(30, 39),
+    ]
+    torch.testing.assert_close(batch["state"][0, 30:39], state[:9])
+    torch.testing.assert_close(batch["state"][0, 10:12], state[9:11])
+    torch.testing.assert_close(batch["actions"][0, 0, 30:39], action[0, :9])
+    assert batch["actions"][0, 0, 10].item() == -1.0
+    assert batch["action_time_mask"].tolist() == [[True, False, False]]
+    # Padded commands remain zero but are not supervised; the model separately
+    # supplies a full temporal conditioning mask to the action adaptor.
+    assert batch["actions"][0, 1:].count_nonzero().item() == 0
+
+
 def test_cached_feature_dataset_reads_episode_pack(tmp_path):
     pack_path = tmp_path / "episode_000000000.pt"
     manifest_path = tmp_path / "manifest.jsonl"

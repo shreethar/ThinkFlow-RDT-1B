@@ -271,6 +271,7 @@ def create_dataloader(
     *,
     online_siglip: bool = False,
     stratified: bool = False,
+    batch_size: int | None = None,
 ) -> DataLoader:
     if online_siglip:
         dataset = CachedFeatureDataset(
@@ -338,7 +339,9 @@ def create_dataloader(
         )
     return DataLoader(
         dataset,
-        batch_size=cfg.training.micro_batch_size,
+        batch_size=(
+            cfg.training.micro_batch_size if batch_size is None else batch_size
+        ),
         shuffle=shuffle and sampler is None,
         sampler=sampler,
         num_workers=cfg.data.num_workers,
@@ -664,14 +667,17 @@ def resolve_validation_batch_limit(
     requested_samples = cfg.training.validation_samples
     if requested_samples is None:
         return cfg.training.validation_batches
-    global_examples_per_round = (
-        cfg.training.micro_batch_size * accelerator.num_processes
+    local_validation_batch = (
+        cfg.training.micro_batch_size
+        if getattr(cfg.training, "validation_batch_size", None) is None
+        else cfg.training.validation_batch_size
     )
+    global_examples_per_round = local_validation_batch * accelerator.num_processes
     if requested_samples % global_examples_per_round != 0:
         raise ValueError(
             "training.validation_samples must be divisible by "
             "micro_batch_size * world_size for an exact distributed subset; got "
-            f"{requested_samples} vs {cfg.training.micro_batch_size} * "
+            f"{requested_samples} vs {local_validation_batch} * "
             f"{accelerator.num_processes}"
         )
     return requested_samples // global_examples_per_round
@@ -837,6 +843,7 @@ def validate(
     gripper_bce_weight: float = 0.0,
     gripper_bce_logit_scale: float = 1.0,
     rotation_geodesic_weight: float = 0.0,
+    validation_step: int | None = None,
 ) -> dict[str, object]:
     model.eval()
     action_encoder_layout = getattr(
@@ -890,6 +897,15 @@ def validate(
         len(sampled_horizons),
         3,
         8,
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    # Per horizon and phase (approach-open, close-hold, release-open): correct
+    # commands, valid commands, and chunks containing that phase.
+    sampled_native_gripper_phase = torch.zeros(
+        len(sampled_horizons),
+        3,
+        3,
         device=accelerator.device,
         dtype=torch.float64,
     )
@@ -1219,8 +1235,19 @@ def validate(
                     gripper_valid = raw_time_mask & batch[
                         "action_dim_mask"
                     ][:, 10].to(accelerator.device, dtype=torch.bool).unsqueeze(1)
-                    predicted_open = prediction[..., 10] >= 0.0
-                    target_open = target[..., 10] >= 0.0
+                    native_libero_layout = (
+                        getattr(cfg.model, "resolved_cache_state_dim", None) == 11
+                        and getattr(cfg.model, "resolved_cache_action_dim", None) == 10
+                    )
+                    # Native OXE slot 10 is gripper-open. The LIBERO cache keeps
+                    # its simulator command convention: negative=open,
+                    # positive=close/hold.
+                    if native_libero_layout:
+                        predicted_open = prediction[..., 10] < 0.0
+                        target_open = target[..., 10] < 0.0
+                    else:
+                        predicted_open = prediction[..., 10] >= 0.0
+                        target_open = target[..., 10] >= 0.0
                     sampled_native_gripper_confusion += torch.stack(
                         (
                             (
@@ -1278,9 +1305,14 @@ def validate(
                         )
                         state_values = batch.get("state")
                         if state_values is not None:
-                            state_open = state_values[:, 10].to(
-                                accelerator.device
-                            ) >= 0.5
+                            if native_libero_layout:
+                                state_open = state_values[:, 10].to(
+                                    accelerator.device
+                                ).abs() >= 0.035
+                            else:
+                                state_open = state_values[:, 10].to(
+                                    accelerator.device
+                                ) >= 0.5
                             group_names = ("all", "open", "close")
                             stat_names = (
                                 "target",
@@ -1321,6 +1353,38 @@ def validate(
                                         device=accelerator.device,
                                         dtype=torch.float64,
                                     )
+
+                        # Phase accuracy distinguishes easy open approaches and
+                        # close holds from the usually difficult release-open
+                        # tail. Convert to LIBERO's positive=close convention
+                        # before using the shared release-phase detector.
+                        close_command = (
+                            target[:, :horizon, 10]
+                            if native_libero_layout
+                            else -target[:, :horizon, 10]
+                        )
+                        phase_release = infer_gripper_release_mask(
+                            close_command,
+                            horizon_valid,
+                        )
+                        phase_masks = (
+                            horizon_valid & horizon_target_open & ~phase_release,
+                            horizon_valid & ~horizon_target_open,
+                            phase_release,
+                        )
+                        for phase_index, phase_mask in enumerate(phase_masks):
+                            sampled_native_gripper_phase[
+                                horizon_slot, phase_index, 0
+                            ] += (
+                                (horizon_predicted_open == horizon_target_open)
+                                & phase_mask
+                            ).sum().double()
+                            sampled_native_gripper_phase[
+                                horizon_slot, phase_index, 1
+                            ] += phase_mask.sum().double()
+                            sampled_native_gripper_phase[
+                                horizon_slot, phase_index, 2
+                            ] += phase_mask.any(dim=1).sum().double()
                         difference_10d = (
                             prediction_10d[:, :horizon]
                             - target_10d[:, :horizon]
@@ -1401,6 +1465,7 @@ def validate(
                             ).float().cpu().tolist()
                             qualitative_rows.append(
                                 [
+                                    validation_step,
                                     dataset_ids[row],
                                     list(batch.get("episode_id", [""]))[row],
                                     list(batch.get("step_idx", [""]))[row],
@@ -1618,6 +1683,9 @@ def validate(
     )
     sampled_native_gripper_transitions = accelerator.reduce(
         sampled_native_gripper_transitions, reduction="sum"
+    )
+    sampled_native_gripper_phase = accelerator.reduce(
+        sampled_native_gripper_phase, reduction="sum"
     )
     qwen_reference_loss_sum = accelerator.reduce(
         qwen_reference_loss_sum, reduction="sum"
@@ -1898,6 +1966,44 @@ def validate(
                     if matched_events.item() > 0
                     else math.nan
                 )
+                if group_name in {"open", "close"}:
+                    semantic_name = (
+                        "close_to_open" if group_name == "open" else "open_to_close"
+                    )
+                    semantic_prefix = (
+                        f"{horizon_prefix}/gripper_transition/{semantic_name}"
+                    )
+                    for suffix in (
+                        "target_events",
+                        "predicted_events",
+                        "matched_events",
+                        "missed_events",
+                        "spurious_events",
+                        "event_precision",
+                        "event_recall",
+                        "exact_recall",
+                        "within_1_step_recall",
+                        "within_2_steps_recall",
+                        "mean_signed_error_steps",
+                        "mae_steps",
+                    ):
+                        result[f"{semantic_prefix}/{suffix}"] = result[
+                            f"{transition_prefix}/{suffix}"
+                        ]
+            for phase_index, phase_name in enumerate(
+                ("approach_open", "close_hold", "release_open")
+            ):
+                correct, commands, chunks = sampled_native_gripper_phase[
+                    slot, phase_index
+                ]
+                phase_prefix = f"{horizon_prefix}/gripper_phase/{phase_name}"
+                result[f"{phase_prefix}/accuracy"] = (
+                    float((correct / commands).cpu())
+                    if commands.item() > 0
+                    else math.nan
+                )
+                result[f"{phase_prefix}/commands"] = float(commands.cpu())
+                result[f"{phase_prefix}/chunks"] = float(chunks.cpu())
             for ablation_index, ablation_name in enumerate(
                 qwen_ablation_names
             ):
@@ -1924,6 +2030,7 @@ def validate(
                 # W&B 0.21+ validates this as an actual list rather than any
                 # generic sequence; a tuple raises AssertionError.
                 columns=[
+                    "validation_step",
                     "dataset",
                     "episode_id",
                     "step_idx",
@@ -1933,6 +2040,10 @@ def validate(
                     "target_vs_diffusion_sample",
                 ],
                 data=qualitative_rows,
+                # Append one fresh partition per validation event. This keeps
+                # all 32 rows in W&B history instead of leaving an immutable
+                # two-row table from the first validation visible forever.
+                log_mode="INCREMENTAL",
             )
     if action_encoder_layout == "libero_ortho6d":
         for slot, horizon in enumerate(sampled_horizons):
@@ -2229,6 +2340,7 @@ def train(
         shuffle=cfg.data.shuffle_validation,
         online_siglip=use_online_siglip,
         stratified=cfg.data.stratified_validation,
+        batch_size=cfg.training.validation_batch_size,
     )
     model = SFTConditionedRDT(
         cfg,
@@ -2798,6 +2910,7 @@ def train(
                     gripper_bce_weight=gripper_bce_weight,
                     gripper_bce_logit_scale=gripper_bce_logit_scale,
                     rotation_geodesic_weight=rotation_geodesic_weight,
+                    validation_step=global_step,
                 )
                 step_log_data.update(validation)
                 if accelerator.is_main_process:
