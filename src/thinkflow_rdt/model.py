@@ -37,11 +37,14 @@ def _self_attention_with_external_kv(
 
     batch_size, token_count, width = x.shape
     expected_width = width * 2
-    if external_kv.ndim != 3 or external_kv.shape[:2] != (batch_size, 1):
+    if external_kv.ndim != 3 or external_kv.shape[0] != batch_size:
         raise ValueError(
-            "Projected Qwen KV must be [B, 1, 2 * hidden_size], got "
+            "Projected Qwen KV must be [B, tokens, 2 * hidden_size], got "
             f"{tuple(external_kv.shape)}"
         )
+    external_token_count = int(external_kv.shape[1])
+    if external_token_count <= 0:
+        raise ValueError("Projected Qwen KV must contain at least one token")
     if external_kv.shape[-1] != expected_width:
         raise ValueError(
             f"Projected Qwen KV width must be {expected_width}, got "
@@ -58,10 +61,16 @@ def _self_attention_with_external_kv(
     query, key, value = qkv.unbind(0)
     external_key, external_value = external_kv.chunk(2, dim=-1)
     external_key = external_key.reshape(
-        batch_size, 1, attention.num_heads, attention.head_dim
+        batch_size,
+        external_token_count,
+        attention.num_heads,
+        attention.head_dim,
     ).permute(0, 2, 1, 3)
     external_value = external_value.reshape(
-        batch_size, 1, attention.num_heads, attention.head_dim
+        batch_size,
+        external_token_count,
+        attention.num_heads,
+        attention.head_dim,
     ).permute(0, 2, 1, 3)
 
     query = attention.q_norm(query)

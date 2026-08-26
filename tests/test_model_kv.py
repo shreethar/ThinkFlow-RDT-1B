@@ -48,7 +48,7 @@ def test_native_rdt_kv_injection_has_projector_gradient():
         norm_layer=torch.nn.LayerNorm,
     )
     values = torch.randn(2, 5, 16, requires_grad=True)
-    external_kv = torch.randn(2, 1, 32, requires_grad=True)
+    external_kv = torch.randn(2, 5, 32, requires_grad=True)
 
     output = _self_attention_with_external_kv(attention, values, external_kv)
     output.square().mean().backward()
@@ -151,7 +151,7 @@ def test_full_kv_model_uses_128d_frozen_state_interface():
         "lang_mask": torch.ones(batch_size, 12, dtype=torch.bool),
         "img_tokens": torch.randn(batch_size, 16, 64),
         "img_mask": torch.ones(batch_size, 16, dtype=torch.bool),
-        "qwen_kv": torch.randn(batch_size, 1, 64),
+        "qwen_kv": torch.randn(batch_size, 5, 64),
         "state": torch.randn(batch_size, 7),
         "actions": torch.randn(batch_size, 16, 7),
         "action_time_mask": torch.ones(batch_size, 16, dtype=torch.bool),
