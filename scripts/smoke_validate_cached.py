@@ -65,6 +65,7 @@ def main() -> None:
             global_batch_size=args.samples * accelerator.num_processes,
             validation_samples=args.samples * accelerator.num_processes,
             validation_batches=1,
+            validation_batch_size=args.samples,
             sample_validation_batches=1,
             qualitative_validation_examples=args.qualitative_examples,
             # This constructs the exact wandb.Table object but does not create
@@ -108,11 +109,13 @@ def main() -> None:
         "scalar_metric_count": len(metrics),
         "sample_mse": metrics.get("val/sample_mse"),
         "gripper_accuracy": metrics.get(
-            "val/sampled_native10/gripper_open/accuracy"
+            "val/sampled_native10/horizon_10/gripper_command/accuracy"
         ),
-        "gripper_f1": metrics.get("val/sampled_native10/gripper_open/f1"),
-        "gripper_valid_commands": metrics.get(
-            "val/sampled_native10/gripper_open/valid_commands"
+        "gripper_f1": metrics.get(
+            "val/sampled_native10/horizon_10/gripper_command/f1"
+        ),
+        "gripper_transition_f1": metrics.get(
+            "val/sampled_native10/horizon_10/gripper_transition/f1"
         ),
         "qualitative_table_type": (
             type(table).__name__ if table is not None else None

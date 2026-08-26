@@ -256,12 +256,18 @@ def test_cached_feature_dataset_remaps_legacy_uniform_anchor(tmp_path):
     assert sample["qwen_anchor_count"] == 1
 
 
-def _write_episode_pack(path, *, dataset_id: str, num_samples: int) -> None:
+def _write_episode_pack(
+    path,
+    *,
+    dataset_id: str,
+    num_samples: int,
+    episode_id: str | None = None,
+) -> None:
     torch.save(
         {
             "cache_layout": "episode_pack",
             "dataset_id": dataset_id,
-            "episode_id": f"{dataset_id}_episode",
+            "episode_id": episode_id or f"{dataset_id}_episode",
             "num_samples": num_samples,
             "sample_step_idx": [str(index) for index in range(num_samples)],
             "sample_anchor_index": torch.zeros(num_samples, dtype=torch.long),
@@ -370,6 +376,65 @@ def test_fixed_stratified_sampler_balances_dataset_prefix(tmp_path):
     assert sorted(first_order) == list(range(len(dataset)))
     first_six_ids = [dataset[index]["dataset_id"] for index in first_order[:6]]
     assert first_six_ids == ["bc_z", "fractal", "kuka"] * 2
+
+
+def test_fixed_stratified_sampler_reads_merged_manifest_and_diversifies_tasks(
+    tmp_path,
+):
+    rows = []
+    for suite in ("libero_goal", "libero_object"):
+        for task_number in range(2):
+            for demo_number in range(2):
+                episode_id = (
+                    f"{suite}_task_{task_number}_demo:demo_{demo_number}"
+                )
+                path = tmp_path / f"{suite}_{task_number}_{demo_number}.pt"
+                _write_episode_pack(
+                    path,
+                    dataset_id=suite,
+                    num_samples=2,
+                    episode_id=episode_id,
+                )
+                rows.append(
+                    {
+                        "path": path.name,
+                        "cache_layout": "episode_pack",
+                        "first_dataset_id": suite,
+                        "first_episode_id": episode_id,
+                        "num_samples": 2,
+                    }
+                )
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    dataset = CachedFeatureDataset(
+        manifest_path,
+        required_keys=ONLINE_SIGLIP_REQUIRED_KEYS,
+    )
+
+    first_order = list(FixedStratifiedSampler(dataset, seed=123))
+    assert first_order == list(FixedStratifiedSampler(dataset, seed=123))
+    assert dataset.contiguous_range_dataset_ids == (
+        "libero_goal",
+        "libero_goal",
+        "libero_goal",
+        "libero_goal",
+        "libero_object",
+        "libero_object",
+        "libero_object",
+        "libero_object",
+    )
+    first_four = [dataset[index] for index in first_order[:4]]
+    assert [sample["dataset_id"] for sample in first_four] == [
+        "libero_goal",
+        "libero_object",
+        "libero_goal",
+        "libero_object",
+    ]
+    assert len({sample["episode_id"] for sample in first_four}) == 4
+    assert len({sample["episode_id"].split("_demo:")[0] for sample in first_four}) == 4
 
 
 def test_cached_feature_dataset_uses_restricted_torch_load(tmp_path, monkeypatch):

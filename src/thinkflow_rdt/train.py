@@ -150,6 +150,29 @@ def _match_binary_transition_events(
     return result
 
 
+def _add_binary_confusion_metrics(
+    result: dict[str, object],
+    prefix: str,
+    confusion: torch.Tensor,
+) -> None:
+    """Add compact accuracy/precision/recall/F1 and TP/FP/FN/TN metrics."""
+    tp, fp, fn, tn = confusion
+    total = tp + fp + fn + tn
+    precision = tp / (tp + fp).clamp_min(1.0)
+    recall = tp / (tp + fn).clamp_min(1.0)
+    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-12)
+    result[f"{prefix}/accuracy"] = (
+        float(((tp + tn) / total).cpu()) if total.item() > 0 else math.nan
+    )
+    result[f"{prefix}/precision"] = float(precision.cpu())
+    result[f"{prefix}/recall"] = float(recall.cpu())
+    result[f"{prefix}/f1"] = float(f1.cpu())
+    result[f"{prefix}/tp"] = float(tp.cpu())
+    result[f"{prefix}/fp"] = float(fp.cpu())
+    result[f"{prefix}/fn"] = float(fn.cpu())
+    result[f"{prefix}/tn"] = float(tn.cpu())
+
+
 def _validation_observation_grid(payloads: list[bytes]) -> Image.Image | None:
     images = [decode_cached_image(payload) for payload in payloads[:3]]
     if not images:
@@ -864,9 +887,13 @@ def validate(
     sample_error_sum = torch.zeros_like(loss_sum)
     sample_valid_count = torch.zeros_like(loss_sum)
     sampled_horizons = tuple(
-        horizon
-        for horizon in (1, 4, 8, 10, 64)
-        if horizon <= cfg.model.pred_horizon
+        int(horizon)
+        for horizon in getattr(
+            cfg.training,
+            "sampled_validation_horizons",
+            (1, 4, 8, 10, 64),
+        )
+        if int(horizon) <= cfg.model.pred_horizon
     )
     sampled_command_squared_error = torch.zeros(
         len(sampled_horizons), device=accelerator.device, dtype=torch.float64
@@ -880,32 +907,17 @@ def validate(
         sampled_command_squared_error
     )
     sampled_native10_count = torch.zeros_like(sampled_command_squared_error)
-    # TP, FP, FN, TN for the native RDT gripper_open class (value >= 0).
-    sampled_native_gripper_confusion = torch.zeros(
-        4, device=accelerator.device, dtype=torch.float64
-    )
     sampled_native_gripper_confusion_by_horizon = torch.zeros(
         len(sampled_horizons),
         4,
         device=accelerator.device,
         dtype=torch.float64,
     )
-    # For each horizon and transition group (all/open/close): target events,
-    # predicted events, matched events, exact, within one, within two, signed
-    # error sum, and absolute error sum. Transitions include state -> action[0].
-    sampled_native_gripper_transitions = torch.zeros(
+    # TP, FP, FN, TN for an exact gripper transition at each command boundary,
+    # including the current proprioceptive state -> predicted action[0].
+    sampled_native_transition_confusion_by_horizon = torch.zeros(
         len(sampled_horizons),
-        3,
-        8,
-        device=accelerator.device,
-        dtype=torch.float64,
-    )
-    # Per horizon and phase (approach-open, close-hold, release-open): correct
-    # commands, valid commands, and chunks containing that phase.
-    sampled_native_gripper_phase = torch.zeros(
-        len(sampled_horizons),
-        3,
-        3,
+        4,
         device=accelerator.device,
         dtype=torch.float64,
     )
@@ -1248,30 +1260,6 @@ def validate(
                     else:
                         predicted_open = prediction[..., 10] >= 0.0
                         target_open = target[..., 10] >= 0.0
-                    sampled_native_gripper_confusion += torch.stack(
-                        (
-                            (
-                                predicted_open
-                                & target_open
-                                & gripper_valid
-                            ).sum().double(),
-                            (
-                                predicted_open
-                                & ~target_open
-                                & gripper_valid
-                            ).sum().double(),
-                            (
-                                ~predicted_open
-                                & target_open
-                                & gripper_valid
-                            ).sum().double(),
-                            (
-                                ~predicted_open
-                                & ~target_open
-                                & gripper_valid
-                            ).sum().double(),
-                        )
-                    )
                     for horizon_slot, horizon in enumerate(sampled_horizons):
                         horizon_valid = raw_time_mask[:, :horizon]
                         horizon_gripper_valid = gripper_valid[:, :horizon]
@@ -1313,78 +1301,55 @@ def validate(
                                 state_open = state_values[:, 10].to(
                                     accelerator.device
                                 ) >= 0.5
-                            group_names = ("all", "open", "close")
-                            stat_names = (
-                                "target",
-                                "predicted",
-                                "matched",
-                                "exact",
-                                "within_1",
-                                "within_2",
-                                "signed_error_sum",
-                                "absolute_error_sum",
+                            target_transition = torch.cat(
+                                (
+                                    horizon_target_open[:, :1]
+                                    != state_open.unsqueeze(1),
+                                    horizon_target_open[:, 1:]
+                                    != horizon_target_open[:, :-1],
+                                ),
+                                dim=1,
                             )
-                            for row in range(predicted_open.shape[0]):
-                                valid_steps = int(
-                                    horizon_gripper_valid[row].sum().item()
+                            predicted_transition = torch.cat(
+                                (
+                                    horizon_predicted_open[:, :1]
+                                    != state_open.unsqueeze(1),
+                                    horizon_predicted_open[:, 1:]
+                                    != horizon_predicted_open[:, :-1],
+                                ),
+                                dim=1,
+                            )
+                            transition_valid = horizon_gripper_valid.clone()
+                            if horizon > 1:
+                                transition_valid[:, 1:] &= (
+                                    horizon_gripper_valid[:, :-1]
                                 )
-                                if valid_steps <= 0:
-                                    continue
-                                target_events = _binary_transition_events(
-                                    horizon_target_open[row, :valid_steps],
-                                    initial_value=bool(state_open[row].item()),
+                            sampled_native_transition_confusion_by_horizon[
+                                horizon_slot
+                            ] += torch.stack(
+                                (
+                                    (
+                                        predicted_transition
+                                        & target_transition
+                                        & transition_valid
+                                    ).sum().double(),
+                                    (
+                                        predicted_transition
+                                        & ~target_transition
+                                        & transition_valid
+                                    ).sum().double(),
+                                    (
+                                        ~predicted_transition
+                                        & target_transition
+                                        & transition_valid
+                                    ).sum().double(),
+                                    (
+                                        ~predicted_transition
+                                        & ~target_transition
+                                        & transition_valid
+                                    ).sum().double(),
                                 )
-                                predicted_events = _binary_transition_events(
-                                    horizon_predicted_open[row, :valid_steps],
-                                    initial_value=bool(state_open[row].item()),
-                                )
-                                transition_stats = _match_binary_transition_events(
-                                    target_events,
-                                    predicted_events,
-                                )
-                                for group_index, group_name in enumerate(group_names):
-                                    sampled_native_gripper_transitions[
-                                        horizon_slot, group_index
-                                    ] += torch.tensor(
-                                        [
-                                            transition_stats[group_name][stat_name]
-                                            for stat_name in stat_names
-                                        ],
-                                        device=accelerator.device,
-                                        dtype=torch.float64,
-                                    )
-
-                        # Phase accuracy distinguishes easy open approaches and
-                        # close holds from the usually difficult release-open
-                        # tail. Convert to LIBERO's positive=close convention
-                        # before using the shared release-phase detector.
-                        close_command = (
-                            target[:, :horizon, 10]
-                            if native_libero_layout
-                            else -target[:, :horizon, 10]
-                        )
-                        phase_release = infer_gripper_release_mask(
-                            close_command,
-                            horizon_valid,
-                        )
-                        phase_masks = (
-                            horizon_valid & horizon_target_open & ~phase_release,
-                            horizon_valid & ~horizon_target_open,
-                            phase_release,
-                        )
-                        for phase_index, phase_mask in enumerate(phase_masks):
-                            sampled_native_gripper_phase[
-                                horizon_slot, phase_index, 0
-                            ] += (
-                                (horizon_predicted_open == horizon_target_open)
-                                & phase_mask
-                            ).sum().double()
-                            sampled_native_gripper_phase[
-                                horizon_slot, phase_index, 1
-                            ] += phase_mask.sum().double()
-                            sampled_native_gripper_phase[
-                                horizon_slot, phase_index, 2
-                            ] += phase_mask.any(dim=1).sum().double()
+                            )
                         difference_10d = (
                             prediction_10d[:, :horizon]
                             - target_10d[:, :horizon]
@@ -1675,17 +1640,11 @@ def validate(
     sampled_native10_count = accelerator.reduce(
         sampled_native10_count, reduction="sum"
     )
-    sampled_native_gripper_confusion = accelerator.reduce(
-        sampled_native_gripper_confusion, reduction="sum"
-    )
     sampled_native_gripper_confusion_by_horizon = accelerator.reduce(
         sampled_native_gripper_confusion_by_horizon, reduction="sum"
     )
-    sampled_native_gripper_transitions = accelerator.reduce(
-        sampled_native_gripper_transitions, reduction="sum"
-    )
-    sampled_native_gripper_phase = accelerator.reduce(
-        sampled_native_gripper_phase, reduction="sum"
+    sampled_native_transition_confusion_by_horizon = accelerator.reduce(
+        sampled_native_transition_confusion_by_horizon, reduction="sum"
     )
     qwen_reference_loss_sum = accelerator.reduce(
         qwen_reference_loss_sum, reduction="sum"
@@ -1822,42 +1781,6 @@ def validate(
                 ).cpu()
             )
     if action_encoder_layout == "rdt_native_128":
-        tp, fp, fn, tn = sampled_native_gripper_confusion
-        gripper_total = sampled_native_gripper_confusion.sum()
-        precision_denominator = tp + fp
-        recall_denominator = tp + fn
-        precision = (
-            tp / precision_denominator
-            if precision_denominator.item() > 0
-            else tp.new_zeros(())
-        )
-        recall = (
-            tp / recall_denominator
-            if recall_denominator.item() > 0
-            else tp.new_zeros(())
-        )
-        f1_denominator = precision + recall
-        f1 = (
-            2.0 * precision * recall / f1_denominator
-            if f1_denominator.item() > 0
-            else tp.new_zeros(())
-        )
-        gripper_prefix = "val/sampled_native10/gripper_open"
-        result[f"{gripper_prefix}/accuracy"] = (
-            float(((tp + tn) / gripper_total).cpu())
-            if gripper_total.item() > 0
-            else math.nan
-        )
-        result[f"{gripper_prefix}/precision"] = float(precision.cpu())
-        result[f"{gripper_prefix}/recall"] = float(recall.cpu())
-        result[f"{gripper_prefix}/f1"] = float(f1.cpu())
-        result[f"{gripper_prefix}/tp"] = float(tp.cpu())
-        result[f"{gripper_prefix}/fp"] = float(fp.cpu())
-        result[f"{gripper_prefix}/fn"] = float(fn.cpu())
-        result[f"{gripper_prefix}/tn"] = float(tn.cpu())
-        result[f"{gripper_prefix}/valid_commands"] = float(
-            gripper_total.cpu()
-        )
         for slot, horizon in enumerate(sampled_horizons):
             horizon_prefix = f"val/sampled_native10/horizon_{horizon}"
             result[f"{horizon_prefix}/rmse"] = (
@@ -1870,140 +1793,16 @@ def validate(
                 if sampled_native10_count[slot].item() > 0
                 else math.nan
             )
-            horizon_tp, horizon_fp, horizon_fn, horizon_tn = (
-                sampled_native_gripper_confusion_by_horizon[slot]
+            _add_binary_confusion_metrics(
+                result,
+                f"{horizon_prefix}/gripper_command",
+                sampled_native_gripper_confusion_by_horizon[slot],
             )
-            horizon_total = horizon_tp + horizon_fp + horizon_fn + horizon_tn
-            horizon_precision = horizon_tp / (horizon_tp + horizon_fp).clamp_min(1.0)
-            horizon_recall = horizon_tp / (horizon_tp + horizon_fn).clamp_min(1.0)
-            horizon_f1 = (
-                2.0
-                * horizon_precision
-                * horizon_recall
-                / (horizon_precision + horizon_recall).clamp_min(1e-12)
+            _add_binary_confusion_metrics(
+                result,
+                f"{horizon_prefix}/gripper_transition",
+                sampled_native_transition_confusion_by_horizon[slot],
             )
-            horizon_gripper_prefix = f"{horizon_prefix}/gripper_open"
-            result[f"{horizon_gripper_prefix}/accuracy"] = (
-                float(((horizon_tp + horizon_tn) / horizon_total).cpu())
-                if horizon_total.item() > 0
-                else math.nan
-            )
-            result[f"{horizon_gripper_prefix}/precision"] = float(
-                horizon_precision.cpu()
-            )
-            result[f"{horizon_gripper_prefix}/recall"] = float(
-                horizon_recall.cpu()
-            )
-            result[f"{horizon_gripper_prefix}/f1"] = float(horizon_f1.cpu())
-            result[f"{horizon_gripper_prefix}/tp"] = float(horizon_tp.cpu())
-            result[f"{horizon_gripper_prefix}/fp"] = float(horizon_fp.cpu())
-            result[f"{horizon_gripper_prefix}/fn"] = float(horizon_fn.cpu())
-            result[f"{horizon_gripper_prefix}/tn"] = float(horizon_tn.cpu())
-            result[f"{horizon_gripper_prefix}/valid_commands"] = float(
-                horizon_total.cpu()
-            )
-            for group_index, group_name in enumerate(("all", "open", "close")):
-                (
-                    target_events,
-                    predicted_events,
-                    matched_events,
-                    exact_events,
-                    within_1_events,
-                    within_2_events,
-                    signed_error_sum,
-                    absolute_error_sum,
-                ) = sampled_native_gripper_transitions[slot, group_index]
-                transition_prefix = (
-                    f"{horizon_prefix}/gripper_transition/{group_name}"
-                )
-                result[f"{transition_prefix}/target_events"] = float(
-                    target_events.cpu()
-                )
-                result[f"{transition_prefix}/predicted_events"] = float(
-                    predicted_events.cpu()
-                )
-                result[f"{transition_prefix}/matched_events"] = float(
-                    matched_events.cpu()
-                )
-                result[f"{transition_prefix}/missed_events"] = float(
-                    (target_events - matched_events).cpu()
-                )
-                result[f"{transition_prefix}/spurious_events"] = float(
-                    (predicted_events - matched_events).cpu()
-                )
-                result[f"{transition_prefix}/event_precision"] = (
-                    float((matched_events / predicted_events).cpu())
-                    if predicted_events.item() > 0
-                    else math.nan
-                )
-                result[f"{transition_prefix}/event_recall"] = (
-                    float((matched_events / target_events).cpu())
-                    if target_events.item() > 0
-                    else math.nan
-                )
-                result[f"{transition_prefix}/exact_recall"] = (
-                    float((exact_events / target_events).cpu())
-                    if target_events.item() > 0
-                    else math.nan
-                )
-                result[f"{transition_prefix}/within_1_step_recall"] = (
-                    float((within_1_events / target_events).cpu())
-                    if target_events.item() > 0
-                    else math.nan
-                )
-                result[f"{transition_prefix}/within_2_steps_recall"] = (
-                    float((within_2_events / target_events).cpu())
-                    if target_events.item() > 0
-                    else math.nan
-                )
-                result[f"{transition_prefix}/mean_signed_error_steps"] = (
-                    float((signed_error_sum / matched_events).cpu())
-                    if matched_events.item() > 0
-                    else math.nan
-                )
-                result[f"{transition_prefix}/mae_steps"] = (
-                    float((absolute_error_sum / matched_events).cpu())
-                    if matched_events.item() > 0
-                    else math.nan
-                )
-                if group_name in {"open", "close"}:
-                    semantic_name = (
-                        "close_to_open" if group_name == "open" else "open_to_close"
-                    )
-                    semantic_prefix = (
-                        f"{horizon_prefix}/gripper_transition/{semantic_name}"
-                    )
-                    for suffix in (
-                        "target_events",
-                        "predicted_events",
-                        "matched_events",
-                        "missed_events",
-                        "spurious_events",
-                        "event_precision",
-                        "event_recall",
-                        "exact_recall",
-                        "within_1_step_recall",
-                        "within_2_steps_recall",
-                        "mean_signed_error_steps",
-                        "mae_steps",
-                    ):
-                        result[f"{semantic_prefix}/{suffix}"] = result[
-                            f"{transition_prefix}/{suffix}"
-                        ]
-            for phase_index, phase_name in enumerate(
-                ("approach_open", "close_hold", "release_open")
-            ):
-                correct, commands, chunks = sampled_native_gripper_phase[
-                    slot, phase_index
-                ]
-                phase_prefix = f"{horizon_prefix}/gripper_phase/{phase_name}"
-                result[f"{phase_prefix}/accuracy"] = (
-                    float((correct / commands).cpu())
-                    if commands.item() > 0
-                    else math.nan
-                )
-                result[f"{phase_prefix}/commands"] = float(commands.cpu())
-                result[f"{phase_prefix}/chunks"] = float(chunks.cpu())
             for ablation_index, ablation_name in enumerate(
                 qwen_ablation_names
             ):

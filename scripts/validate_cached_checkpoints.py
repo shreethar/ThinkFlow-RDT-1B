@@ -397,10 +397,13 @@ def main() -> None:
                             "val/sample_mse"
                         ),
                         "gripper_accuracy": report["metrics"].get(
-                            "val/sampled_native10/gripper_open/accuracy"
+                            "val/sampled_native10/horizon_10/gripper_command/accuracy"
                         ),
                         "gripper_f1": report["metrics"].get(
-                            "val/sampled_native10/gripper_open/f1"
+                            "val/sampled_native10/horizon_10/gripper_command/f1"
+                        ),
+                        "gripper_transition_f1": report["metrics"].get(
+                            "val/sampled_native10/horizon_10/gripper_transition/f1"
                         ),
                     },
                     indent=2,

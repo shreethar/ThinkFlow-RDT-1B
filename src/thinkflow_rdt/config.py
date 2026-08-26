@@ -150,6 +150,9 @@ class TrainingConfig:
     # Validation can use a larger batch than training because it has no
     # backward activations. ``None`` preserves the training micro batch size.
     validation_batch_size: int | None = None
+    # Diffusion-sampled trajectory metrics are expensive. Keep this explicit so
+    # experiments can evaluate only the deployed replanning horizon (LIBERO: 10).
+    sampled_validation_horizons: tuple[int, ...] | list[int] = (1, 4, 8, 10, 64)
 
 
 @dataclass(frozen=True)
@@ -307,6 +310,15 @@ class ExperimentConfig:
             and self.training.validation_batch_size <= 0
         ):
             raise ValueError("training.validation_batch_size must be positive")
+        sampled_horizons = tuple(self.training.sampled_validation_horizons)
+        if not sampled_horizons:
+            raise ValueError("training.sampled_validation_horizons cannot be empty")
+        if len(set(sampled_horizons)) != len(sampled_horizons):
+            raise ValueError("training.sampled_validation_horizons must be unique")
+        if any(horizon <= 0 for horizon in sampled_horizons):
+            raise ValueError(
+                "training.sampled_validation_horizons must contain positive values"
+            )
 
 
 def _require(mapping: dict[str, Any], key: str) -> Any:

@@ -4,7 +4,7 @@ set -euo pipefail
 CACHE_ROOT=${CACHE_ROOT:-cache_features_libero_b0_raw_ortho6d}
 CONFIG=${CONFIG:-configs/libero_b0_native128_full.yaml}
 INIT_ARTIFACT=${INIT_ARTIFACT:-output_2/checkpoint-20000}
-OUTPUT_DIR=${OUTPUT_DIR:-output_2/libero_b0_from_oxe20k}
+OUTPUT_DIR=${OUTPUT_DIR:-output_2/libero_b0_from_oxe20k_v2}
 SUITES=${SUITES:-"libero_spatial libero_object libero_goal libero_10"}
 
 MAX_STEPS=${MAX_STEPS:-20000}
@@ -17,7 +17,7 @@ VALIDATE_EVERY=${VALIDATE_EVERY:-500}
 SAVE_EVERY=${SAVE_EVERY:-1000}
 NUM_WORKERS=${NUM_WORKERS:-4}
 WANDB_PROJECT=${WANDB_PROJECT:-ThinkLite B0 LIBERO}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-libero-b0-native128-from-oxe20k-full}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-libero-b0-native128-from-oxe20k-full-v2}
 SIGLIP_MODEL_ID=${SIGLIP_MODEL_ID:-/home/ubuntu/models/siglip-so400m-patch14-384}
 SIGLIP_FALLBACK_MODEL_ID=${SIGLIP_FALLBACK_MODEL_ID:-google/siglip-so400m-patch14-384}
 # A 200-rollout job needs a GPU separate from active training.  Set

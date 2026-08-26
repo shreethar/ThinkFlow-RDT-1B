@@ -110,6 +110,7 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         self.entries: list[dict[str, Any]] = []
         manifest_entry_ranges: list[range] = []
         manifest_entry_dataset_ids: list[str | None] = []
+        manifest_entry_episode_ids: list[str | None] = []
         episode_pack_ranges: list[range] = []
         with self.manifest_path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -117,10 +118,14 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
                 if not line:
                     continue
                 item = json.loads(line)
+                manifest_dataset_id = (
+                    item.get("dataset_id") or item.get("first_dataset_id")
+                    if isinstance(item, dict)
+                    else None
+                )
                 if (
-                    isinstance(item, dict)
-                    and item.get("dataset_id") is not None
-                    and str(item["dataset_id"]) in self.excluded_dataset_ids
+                    manifest_dataset_id is not None
+                    and str(manifest_dataset_id) in self.excluded_dataset_ids
                 ):
                     continue
                 path_value = item if isinstance(item, str) else item.get("path")
@@ -160,8 +165,13 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
                     )
                 manifest_entry_ranges.append(range(range_start, len(self.entries)))
                 manifest_entry_dataset_ids.append(
-                    str(item["dataset_id"])
-                    if isinstance(item, dict) and item.get("dataset_id") is not None
+                    str(manifest_dataset_id)
+                    if manifest_dataset_id is not None
+                    else None
+                )
+                manifest_entry_episode_ids.append(
+                    str(item.get("first_episode_id"))
+                    if isinstance(item, dict) and item.get("first_episode_id")
                     else None
                 )
         if not self.entries:
@@ -175,6 +185,7 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         # exposing or depending on the internal entry dictionaries.
         self.contiguous_ranges = tuple(manifest_entry_ranges)
         self.contiguous_range_dataset_ids = tuple(manifest_entry_dataset_ids)
+        self.contiguous_range_episode_ids = tuple(manifest_entry_episode_ids)
         self.episode_pack_ranges = tuple(episode_pack_ranges)
         self.paths = [entry["path"] for entry in self.entries]
         self._pack_cache: OrderedDict[Path, dict[str, Any]] = OrderedDict()
@@ -400,6 +411,18 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             "step_idx": str(metadata.get("step_idx", sample_index)),
             "cache_layout": "sample_shard",
         }
+        instructions = pack.get("instructions")
+        if instructions is not None:
+            if isinstance(instructions, (list, tuple)):
+                instruction_index = (
+                    sample_index
+                    if len(instructions) == num_samples
+                    else lang_index
+                )
+                if instruction_index < len(instructions):
+                    sample["instruction"] = str(instructions[instruction_index])
+            else:
+                sample["instruction"] = str(instructions)
         if lang_tokens is not None:
             sample["lang_tokens"] = lang_tokens
         if lang_mask is not None:
@@ -458,37 +481,101 @@ class EpisodePackSampler(Sampler[int]):
 
 
 class FixedStratifiedSampler(Sampler[int]):
-    """Fixed, dataset-balanced validation order with episode-pack locality."""
+    """Fixed suite/task/demo-diverse validation order.
+
+    The first pass emits one shuffled sample from each shuffled manifest range,
+    round-robin across tasks and suites. For 32-sample validation batches over
+    four LIBERO suites, this yields eight suites/tasks/demos representatives per
+    suite instead of 32 adjacent steps from one shard. The order is regenerated
+    from the same seed on every iteration, so checkpoint comparisons remain
+    sample-for-sample fixed.
+    """
 
     def __init__(self, data_source: CachedFeatureDataset, *, seed: int = 0) -> None:
         self.data_source = data_source
         self.seed = int(seed)
 
     def __iter__(self) -> Iterator[int]:
-        grouped_ranges: dict[str, list[range]] = {}
-        for index_range, dataset_id in zip(
+        grouped_ranges: dict[str, dict[str, list[range]]] = {}
+        for range_index, (index_range, dataset_id) in enumerate(zip(
             self.data_source.contiguous_ranges,
             self.data_source.contiguous_range_dataset_ids,
-        ):
-            grouped_ranges.setdefault(dataset_id or "<unknown>", []).append(
-                index_range
+        )):
+            episode_id = self.data_source.contiguous_range_episode_ids[range_index]
+            # LIBERO episode IDs are ``<task>_demo:demo_<n>``. Grouping by the
+            # prefix makes the initial selection cover different tasks before
+            # taking another demonstration/shard from the same task.
+            task_id = (
+                episode_id.rsplit("_demo:", 1)[0]
+                if episode_id and "_demo:" in episode_id
+                else episode_id or f"<range-{range_index}>"
             )
+            grouped_ranges.setdefault(dataset_id or "<unknown>", {}).setdefault(
+                task_id, []
+            ).append(index_range)
 
         generator = torch.Generator()
         generator.manual_seed(self.seed)
         streams: list[list[int]] = []
         for dataset_id in sorted(grouped_ranges):
-            ranges = grouped_ranges[dataset_id]
-            range_order = torch.randperm(
-                len(ranges), generator=generator
+            by_task = grouped_ranges[dataset_id]
+            task_names = sorted(by_task)
+            task_order = torch.randperm(
+                len(task_names), generator=generator
             ).tolist()
-            stream: list[int] = []
-            for range_index in range_order:
-                index_range = ranges[range_index]
-                offsets = torch.randperm(
-                    len(index_range), generator=generator
-                ).tolist()
-                stream.extend(index_range.start + offset for offset in offsets)
+            shuffled_by_task: list[list[range]] = []
+            for task_index in task_order:
+                ranges = by_task[task_names[task_index]]
+                order = torch.randperm(len(ranges), generator=generator).tolist()
+                shuffled_by_task.append([ranges[index] for index in order])
+
+            # Interleave task range lists: first one range per task, then the
+            # second range per task, etc. This is what gives the first batch its
+            # task diversity.
+            range_order: list[range] = []
+            depth = 0
+            while True:
+                emitted = False
+                for ranges in shuffled_by_task:
+                    if depth < len(ranges):
+                        range_order.append(ranges[depth])
+                        emitted = True
+                if not emitted:
+                    break
+                depth += 1
+
+            randomized_ranges: list[list[int]] = []
+            for index_range in range_order:
+                # The merged manifest identifies the first episode in each
+                # shard. Keep that representative first so its suite/task/demo
+                # label is exact; shuffle the remaining shard samples.
+                offsets = [0]
+                if len(index_range) > 1:
+                    offsets.extend(
+                        1 + offset
+                        for offset in torch.randperm(
+                            len(index_range) - 1,
+                            generator=generator,
+                        ).tolist()
+                    )
+                randomized_ranges.append(
+                    [index_range.start + offset for offset in offsets]
+                )
+
+            # Emit one sample per range before returning to the next sample in
+            # that range. This prevents shard-local adjacent trajectories from
+            # occupying an entire qualitative batch.
+            stream = []
+            depth = 0
+            while True:
+                emitted = False
+                for indices in randomized_ranges:
+                    if depth < len(indices):
+                        stream.append(indices[depth])
+                        emitted = True
+                if not emitted:
+                    break
+                depth += 1
             streams.append(stream)
 
         positions = [0] * len(streams)

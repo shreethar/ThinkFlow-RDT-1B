@@ -207,6 +207,7 @@ def test_validation_reports_controlled_qwen_ablation_metrics() -> None:
     action_dim_mask[:, 10] = 1.0
     batch = {
         "dataset_id": ["bc_z", "bridge"],
+        "state": torch.zeros(2, 128),
         "actions": actions,
         "action_time_mask": torch.ones(2, 2, dtype=torch.bool),
         "action_dim_mask": action_dim_mask,
@@ -227,5 +228,12 @@ def test_validation_reports_controlled_qwen_ablation_metrics() -> None:
     assert metrics[
         "val/qwen_ablation/shuffled/sampled_native10/horizon_1/rmse"
     ] > 0.0
-    assert metrics["val/sampled_native10/gripper_open/accuracy"] == 1.0
-    assert metrics["val/sampled_native10/gripper_open/f1"] == 1.0
+    assert metrics[
+        "val/sampled_native10/horizon_1/gripper_command/accuracy"
+    ] == 1.0
+    assert metrics[
+        "val/sampled_native10/horizon_1/gripper_command/f1"
+    ] == 1.0
+    assert metrics[
+        "val/sampled_native10/horizon_1/gripper_transition/accuracy"
+    ] == 1.0

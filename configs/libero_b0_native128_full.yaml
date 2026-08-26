@@ -1,7 +1,7 @@
 seed: 42
 rdt_repo: /home/ubuntu/RoboticsDiffusionTransformer
 pretrained_model: robotics-diffusion-transformer/rdt-1b
-output_dir: output_2/libero_b0_from_oxe20k
+output_dir: output_2/libero_b0_from_oxe20k_v2
 
 model:
   # The cache remains LIBERO's 11-D state / 10-D ortho6D action layout. The
@@ -84,10 +84,12 @@ training:
   validation_samples: 256
   sample_validation_batches: 1
   validation_seed: 12345
+  # Deployment replans after 10 commands, so only evaluate that sampled horizon.
+  sampled_validation_horizons: [10]
   mixed_precision: bf16
   report_to: wandb
   wandb_project: "ThinkLite B0 LIBERO"
-  wandb_run_name: libero-b0-native128-from-oxe20k-full
+  wandb_run_name: libero-b0-native128-from-oxe20k-full-v2
   skip_nonfinite_updates: true
   max_consecutive_nonfinite_updates: 10
   log_gradient_stats: true

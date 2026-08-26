@@ -305,6 +305,7 @@ def test_cached_feature_dataset_reads_sample_shard(tmp_path):
             "lang_tokens": [torch.randn(2, 4), torch.randn(3, 4)],
             "lang_mask": [torch.ones(2, dtype=torch.bool), torch.ones(3, dtype=torch.bool)],
             "sample_lang_index": torch.tensor([0, 1]),
+            "instructions": ["first instruction", "second instruction"],
             "state": torch.randn(2, 7),
             "actions": torch.randn(2, 5, 7),
             "action_time_mask": torch.ones(2, 5, dtype=torch.bool),
@@ -345,6 +346,7 @@ def test_cached_feature_dataset_reads_sample_shard(tmp_path):
     assert sample["qwen_kv"].shape == (5, 8)
     assert sample["qwen_kv"].unique().item() == 3.0
     assert sample["lang_tokens"].shape == (3, 4)
+    assert sample["instruction"] == "second instruction"
     assert sample["image_slot_jpegs"] == [b"image-b", b"image-a"]
     assert sample["image_slot_mask"].tolist() == [True, True]
     assert sample["latent_waypoints"].shape == (5, 2)
