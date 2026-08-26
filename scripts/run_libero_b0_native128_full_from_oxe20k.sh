@@ -20,11 +20,16 @@ WANDB_PROJECT=${WANDB_PROJECT:-ThinkLite B0 LIBERO}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-libero-b0-native128-from-oxe20k-full-v2}
 SIGLIP_MODEL_ID=${SIGLIP_MODEL_ID:-/home/ubuntu/models/siglip-so400m-patch14-384}
 SIGLIP_FALLBACK_MODEL_ID=${SIGLIP_FALLBACK_MODEL_ID:-google/siglip-so400m-patch14-384}
-# A 200-rollout job needs a GPU separate from active training.  Set
-# ROLLOUT_EVAL=1 ROLLOUT_GPU=<spare gpu id> to start the watcher below.
-ROLLOUT_EVAL=${ROLLOUT_EVAL:-0}
+# On one GPU, stop at each rollout boundary, release training VRAM, evaluate,
+# then bit-exact resume. Other supported modes are post_training, parallel
+# (requires a spare GPU), and 0 (disabled).
+ROLLOUT_EVAL=${ROLLOUT_EVAL:-interleaved}
 ROLLOUT_GPU=${ROLLOUT_GPU:-}
 ROLLOUT_SAVE_VIDEOS=${ROLLOUT_SAVE_VIDEOS:-0}
+ROLLOUT_EVERY=${ROLLOUT_EVERY:-5000}
+ROLLOUT_EPISODES_PER_TASK=${ROLLOUT_EPISODES_PER_TASK:-2}
+ROLLOUT_ENV_BATCH_SIZE=${ROLLOUT_ENV_BATCH_SIZE:-2}
+ROLLOUT_TASK_IDS=${ROLLOUT_TASK_IDS:-"0 2 4 6 8"}
 
 CACHE_ARGS=()
 for suite in $SUITES; do
@@ -43,50 +48,163 @@ if [[ ! -f "$INIT_ARTIFACT/rdt_full.pt" ]] || [[ ! -f "$INIT_ARTIFACT/interfaces
   exit 1
 fi
 
-if [[ "$ROLLOUT_EVAL" == "1" ]]; then
-  if [[ -z "$ROLLOUT_GPU" ]]; then
-    echo "ROLLOUT_EVAL=1 requires ROLLOUT_GPU to avoid contending with training" >&2
-    exit 2
-  fi
-  mkdir -p "$OUTPUT_DIR/rollout_evaluations"
+if (( MAX_STEPS % ROLLOUT_EVERY != 0 )); then
+  echo "MAX_STEPS must be divisible by ROLLOUT_EVERY: $MAX_STEPS/$ROLLOUT_EVERY" >&2
+  exit 2
+fi
+if (( ROLLOUT_EVERY % SAVE_EVERY != 0 )); then
+  echo "ROLLOUT_EVERY must be divisible by SAVE_EVERY so each boundary has a checkpoint" >&2
+  exit 2
+fi
+
+run_rollout_watcher() {
+  local available_steps=${1:-$MAX_STEPS}
   OUTPUT_DIR="$OUTPUT_DIR" \
-    MAX_STEPS="$MAX_STEPS" \
-    EVAL_EVERY=2000 \
+    MAX_STEPS="$available_steps" \
+    EVAL_EVERY="$ROLLOUT_EVERY" \
     ROLLOUT_GPU="$ROLLOUT_GPU" \
     CONFIG="$CONFIG" \
     CACHE_PARENT="$CACHE_ROOT" \
+    EPISODES_PER_TASK="$ROLLOUT_EPISODES_PER_TASK" \
+    ENV_BATCH_SIZE="$ROLLOUT_ENV_BATCH_SIZE" \
+    TASK_IDS="$ROLLOUT_TASK_IDS" \
     WANDB_PROJECT="$WANDB_PROJECT" \
     WANDB_RUN_NAME="$WANDB_RUN_NAME" \
     SAVE_VIDEOS="$ROLLOUT_SAVE_VIDEOS" \
-    bash scripts/watch_libero_rollout_evaluations.sh \
-      >"$OUTPUT_DIR/rollout_evaluations/watcher.log" 2>&1 &
-  echo "Started 2,000-step rollout watcher on GPU $ROLLOUT_GPU (PID $!)"
+    bash scripts/watch_libero_rollout_evaluations.sh
+}
+
+if [[ "$ROLLOUT_EVAL" != "parallel" && "$ROLLOUT_EVAL" != "1" && -z "$ROLLOUT_GPU" ]]; then
+  ROLLOUT_GPU=0
 fi
 
-uv run --no-sync python scripts/train_b0_cached_features.py \
-  --config "$CONFIG" \
-  --output-dir "$OUTPUT_DIR" \
-  "${CACHE_ARGS[@]}" \
-  --init-artifact "$INIT_ARTIFACT" \
-  --online-siglip \
-  --siglip-model-id "$SIGLIP_MODEL_ID" \
-  --siglip-fallback-model-id "$SIGLIP_FALLBACK_MODEL_ID" \
-  --max-steps "$MAX_STEPS" \
-  --micro-batch-size "$MICRO_BATCH_SIZE" \
-  --global-batch-size "$GLOBAL_BATCH_SIZE" \
-  --validation-batch-size "$VALIDATION_BATCH_SIZE" \
-  --validation-samples "$VALIDATION_SAMPLES" \
-  --sample-validation-batches 1 \
-  --qualitative-validation-examples "$QUALITATIVE_VALIDATION_EXAMPLES" \
-  --validate-every "$VALIDATE_EVERY" \
-  --save-every "$SAVE_EVERY" \
-  --mask-noisy-gripper-input \
-  --gripper-bce-weight 1.0 \
-  --gripper-bce-logit-scale 5.0 \
-  --rotation-geodesic-weight 1.0 \
-  --num-workers "$NUM_WORKERS" \
-  --pin-memory \
-  --persistent-workers \
-  --report-to wandb \
-  --wandb-project "$WANDB_PROJECT" \
+TRAIN_ARGS=(
+  --config "$CONFIG"
+  --output-dir "$OUTPUT_DIR"
+  "${CACHE_ARGS[@]}"
+  --online-siglip
+  --siglip-model-id "$SIGLIP_MODEL_ID"
+  --siglip-fallback-model-id "$SIGLIP_FALLBACK_MODEL_ID"
+  --max-steps "$MAX_STEPS"
+  --micro-batch-size "$MICRO_BATCH_SIZE"
+  --global-batch-size "$GLOBAL_BATCH_SIZE"
+  --validation-batch-size "$VALIDATION_BATCH_SIZE"
+  --validation-samples "$VALIDATION_SAMPLES"
+  --sample-validation-batches 1
+  --qualitative-validation-examples "$QUALITATIVE_VALIDATION_EXAMPLES"
+  --validate-every "$VALIDATE_EVERY"
+  --save-every "$SAVE_EVERY"
+  --mask-noisy-gripper-input
+  --gripper-bce-weight 1.0
+  --gripper-bce-logit-scale 5.0
+  --rotation-geodesic-weight 1.0
+  --num-workers "$NUM_WORKERS"
+  --pin-memory
+  --persistent-workers
+  --report-to wandb
+  --wandb-project "$WANDB_PROJECT"
   --wandb-run-name "$WANDB_RUN_NAME"
+)
+
+mkdir -p "$OUTPUT_DIR/rollout_evaluations"
+TRAIN_WANDB_RUN_ID_FILE="$OUTPUT_DIR/.training_wandb_run_id"
+if [[ -n "${WANDB_RUN_ID:-}" ]]; then
+  TRAIN_WANDB_RUN_ID="$WANDB_RUN_ID"
+elif [[ -s "$TRAIN_WANDB_RUN_ID_FILE" ]]; then
+  IFS= read -r TRAIN_WANDB_RUN_ID < "$TRAIN_WANDB_RUN_ID_FILE"
+else
+  TRAIN_WANDB_RUN_ID=$(uv run --no-sync python -c 'import wandb; print(wandb.util.generate_id())')
+  printf '%s\n' "$TRAIN_WANDB_RUN_ID" > "$TRAIN_WANDB_RUN_ID_FILE"
+fi
+
+checkpoint_complete() {
+  local checkpoint=$1
+  [[ -f "$checkpoint/rdt_full.pt" \
+    && -f "$checkpoint/interfaces.pt" \
+    && -f "$checkpoint/metadata.json" \
+    && -f "$checkpoint/trainer_state.pt" \
+    && -f "$checkpoint/rng_state_rank_00000.pt" ]]
+}
+
+latest_checkpoint_before() {
+  local target_step=$1
+  local latest_step=0
+  local latest_path=""
+  local candidate step
+  for candidate in "$OUTPUT_DIR"/checkpoint-*; do
+    [[ -d "$candidate" ]] || continue
+    step=${candidate##*-}
+    [[ "$step" =~ ^[0-9]+$ ]] || continue
+    if (( step < target_step && step > latest_step )) && checkpoint_complete "$candidate"; then
+      latest_step=$step
+      latest_path=$candidate
+    fi
+  done
+  printf '%s' "$latest_path"
+}
+
+run_training_until() {
+  local target_step=$1
+  local target_checkpoint="$OUTPUT_DIR/checkpoint-$target_step"
+  if checkpoint_complete "$target_checkpoint"; then
+    echo "Complete checkpoint-$target_step already exists; skipping its training segment"
+    return
+  fi
+
+  local resume_checkpoint
+  local artifact_args=()
+  resume_checkpoint=$(latest_checkpoint_before "$target_step")
+  if [[ -n "$resume_checkpoint" ]]; then
+    artifact_args=(--resume-from "$resume_checkpoint")
+    echo "Bit-exact training resume: $resume_checkpoint -> checkpoint-$target_step"
+  else
+    artifact_args=(--init-artifact "$INIT_ARTIFACT")
+    echo "Starting LIBERO fine-tuning from $INIT_ARTIFACT -> checkpoint-$target_step"
+  fi
+
+  WANDB_RUN_ID="$TRAIN_WANDB_RUN_ID" WANDB_RESUME=allow \
+    uv run --no-sync python scripts/train_b0_cached_features.py \
+      "${TRAIN_ARGS[@]}" \
+      "${artifact_args[@]}" \
+      --stop-after-step "$target_step"
+
+  if ! checkpoint_complete "$target_checkpoint"; then
+    echo "Training segment ended without a complete checkpoint-$target_step" >&2
+    exit 3
+  fi
+}
+
+case "$ROLLOUT_EVAL" in
+  interleaved)
+    for ((target_step=ROLLOUT_EVERY; target_step<=MAX_STEPS; target_step+=ROLLOUT_EVERY)); do
+      run_training_until "$target_step"
+      echo "Training paused at step $target_step; releasing GPU for 40 online-Qwen rollouts"
+      run_rollout_watcher "$target_step" 2>&1 | tee -a "$OUTPUT_DIR/rollout_evaluations/watcher.log"
+      if (( target_step < MAX_STEPS )); then
+        echo "Rollouts complete at step $target_step; resuming bit-exact training"
+      fi
+    done
+    ;;
+  post_training)
+    run_training_until "$MAX_STEPS"
+    echo "Training complete; starting checkpoint rollout evaluations on GPU $ROLLOUT_GPU"
+    run_rollout_watcher "$MAX_STEPS" 2>&1 | tee -a "$OUTPUT_DIR/rollout_evaluations/watcher.log"
+    ;;
+  parallel|1)
+    if [[ -z "$ROLLOUT_GPU" ]]; then
+      echo "ROLLOUT_EVAL=parallel requires ROLLOUT_GPU=<spare gpu id>" >&2
+      exit 2
+    fi
+    mkdir -p "$OUTPUT_DIR/rollout_evaluations"
+    run_rollout_watcher "$MAX_STEPS" >"$OUTPUT_DIR/rollout_evaluations/watcher.log" 2>&1 &
+    echo "Started online-Qwen rollout watcher on spare GPU $ROLLOUT_GPU (PID $!)"
+    run_training_until "$MAX_STEPS"
+    ;;
+  0)
+    run_training_until "$MAX_STEPS"
+    ;;
+  *)
+    echo "ROLLOUT_EVAL must be interleaved, post_training, parallel (or 1), or 0" >&2
+    exit 2
+    ;;
+esac

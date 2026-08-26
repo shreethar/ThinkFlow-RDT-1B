@@ -386,6 +386,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument(
+        "--stop-after-step",
+        type=int,
+        default=None,
+        help=(
+            "Exit cleanly after this optimizer step while retaining the configured "
+            "total max_steps and scheduler. Intended for interleaved rollout jobs."
+        ),
+    )
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None)
     parser.add_argument(
@@ -495,6 +504,7 @@ def main() -> None:
         base_artifact=args.base_artifact,
         init_artifact=args.init_artifact,
         resume_from=args.resume_from,
+        stop_after_step=args.stop_after_step,
         horizon_loss_weights=horizon_loss_weights,
         mask_noisy_gripper_input=args.mask_noisy_gripper_input,
         gripper_bce_weight=args.gripper_bce_weight,

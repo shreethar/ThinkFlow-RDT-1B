@@ -2032,6 +2032,7 @@ def train(
     base_artifact: str | Path | None = None,
     init_artifact: str | Path | None = None,
     resume_from: str | Path | None = None,
+    stop_after_step: int | None = None,
     horizon_loss_weights: list[float] | None = None,
     mask_noisy_gripper_input: bool | None = None,
     gripper_bce_weight: float = 0.0,
@@ -2047,6 +2048,16 @@ def train(
         raise ValueError(
             "Bit-exact mid-epoch resume requires data.episode_aware_shuffle=true "
             "so the shuffled order is reproducible from seed + epoch"
+        )
+    terminal_step = (
+        cfg.training.max_steps
+        if stop_after_step is None
+        else int(stop_after_step)
+    )
+    if terminal_step <= 0 or terminal_step > cfg.training.max_steps:
+        raise ValueError(
+            "stop_after_step must lie within the configured training range: "
+            f"got {terminal_step}, max_steps={cfg.training.max_steps}"
         )
     seed_everything(cfg.seed)
     output_dir = Path(cfg.output_dir)
@@ -2089,11 +2100,18 @@ def train(
         )
     effective_global_batch = actual_global_batch
     if accelerator_log_with is not None:
-        init_kwargs: dict[str, dict[str, str]] | None = None
+        init_kwargs: dict[str, dict[str, object]] | None = None
         if cfg.training.wandb_run_name is not None and report_to.lower() == "wandb":
-            init_kwargs = {
-                "wandb": {"name": cfg.training.wandb_run_name}
+            wandb_kwargs: dict[str, object] = {
+                "name": cfg.training.wandb_run_name
             }
+            wandb_run_id = os.environ.get("WANDB_RUN_ID")
+            if wandb_run_id:
+                wandb_kwargs["id"] = wandb_run_id
+                wandb_kwargs["resume"] = os.environ.get(
+                    "WANDB_RESUME", "allow"
+                )
+            init_kwargs = {"wandb": wandb_kwargs}
         tracker_config = asdict(cfg)
         tracker_config["training_objective"] = {
             "horizon_loss_weights": horizon_loss_weights,
@@ -2316,6 +2334,11 @@ def train(
                 "Checkpoint global_step exceeds configured max_steps: "
                 f"{global_step} > {cfg.training.max_steps}"
             )
+        if global_step >= terminal_step:
+            raise ValueError(
+                "Resume checkpoint is already at or beyond stop_after_step: "
+                f"global_step={global_step}, stop_after_step={terminal_step}"
+            )
         if accelerator.is_main_process:
             print(
                 "Resuming exact trainer state from "
@@ -2350,7 +2373,7 @@ def train(
         }
 
     model.train()
-    while global_step < cfg.training.max_steps:
+    while global_step < terminal_step:
         if hasattr(train_loader, "set_epoch"):
             train_loader.set_epoch(epoch)
         epoch_loader = train_loader
@@ -2730,14 +2753,14 @@ def train(
             # Start the next update timer after logging, validation, and saves,
             # so those maintenance costs do not inflate training step latency.
             update_started_at = time.perf_counter()
-            if global_step >= cfg.training.max_steps:
+            if global_step >= terminal_step:
                 break
         if not saw_batch:
             raise RuntimeError(
                 "Training dataloader yielded no batches. Check dataset filtering "
                 "and whether drop_last exceeds the available sample count."
             )
-        if global_step >= cfg.training.max_steps:
+        if global_step >= terminal_step:
             # The epoch was interrupted at the requested optimizer-step limit;
             # preserve its exact batch cursor for the final resumable artifact.
             break
@@ -2760,6 +2783,7 @@ def train(
                 "mask_noisy_gripper_input": resolved_mask_noisy_gripper_input,
                 "training_objective": training_objective,
                 "config": asdict(cfg),
+                "segment_stop_step": terminal_step,
             },
             model_state_dict=state_dict,
         )

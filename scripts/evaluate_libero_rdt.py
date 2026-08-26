@@ -124,6 +124,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable Qwen fusion/extraction for rollout while still loading the checkpoint artifact.",
     )
+    parser.add_argument(
+        "--require-qwen-fusion",
+        action="store_true",
+        help="Fail instead of silently running if the resolved config disables Qwen fusion.",
+    )
     parser.add_argument("--cache-root", type=Path, default=Path("cache_features/libero_spatial/full"))
     parser.add_argument("--action-stats", type=Path, default=Path("dataset/LIBERO/Spatial/datasets/libero_spatial/audit.json"))
     parser.add_argument(
@@ -361,6 +366,11 @@ def main() -> None:
     cfg = load_config(args.config)
     if args.pretrained_only or args.disable_qwen_fusion:
         cfg = replace(cfg, model=replace(cfg.model, qwen_fusion="none"))
+    if args.require_qwen_fusion and cfg.model.qwen_fusion == "none":
+        raise ValueError(
+            "--require-qwen-fusion was requested, but the resolved model config "
+            "has qwen_fusion='none'"
+        )
     if args.action_chunk <= 0:
         raise ValueError("--action-chunk must be positive")
     if args.action_chunk > cfg.model.pred_horizon:
