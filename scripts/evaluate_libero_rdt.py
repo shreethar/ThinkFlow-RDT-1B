@@ -56,6 +56,47 @@ from thinkflow_rdt.config import load_config  # noqa: E402
 from thinkflow_rdt.model import SFTConditionedRDT  # noqa: E402
 
 
+def native_rdt_action_to_libero_10d(actions: np.ndarray) -> np.ndarray:
+    """Extract LIBERO's supervised 10-D command from native RDT output."""
+    values = np.asarray(actions)
+    if values.shape[-1] != 128:
+        raise ValueError(
+            f"Expected native RDT action width 128, got {values.shape[-1]}"
+        )
+    return np.concatenate(
+        [values[..., 30:33], values[..., 33:39], values[..., 10:11]],
+        axis=-1,
+    )
+
+
+def native_rdt_policy_inputs(
+    state: torch.Tensor,
+    state_dim_mask: torch.Tensor,
+    action_dim_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Map live LIBERO 11-D state / 10-D action masks into RDT's 128 slots."""
+    if state.ndim != 2 or state.shape[-1] != 11:
+        raise ValueError(f"Expected live LIBERO state [B, 11], got {tuple(state.shape)}")
+    if state_dim_mask.shape != state.shape:
+        raise ValueError("LIBERO state_dim_mask must match state shape")
+    if action_dim_mask.ndim != 2 or action_dim_mask.shape != (state.shape[0], 10):
+        raise ValueError(
+            "Expected live LIBERO action_dim_mask [B, 10], got "
+            f"{tuple(action_dim_mask.shape)}"
+        )
+    native_state = state.new_zeros(state.shape[0], 128)
+    native_state_mask = state_dim_mask.new_zeros(state.shape[0], 128)
+    native_state[:, 30:39] = state[:, :9] * state_dim_mask[:, :9]
+    native_state_mask[:, 30:39] = state_dim_mask[:, :9]
+    native_state[:, 10:12] = state[:, 9:11] * state_dim_mask[:, 9:11]
+    native_state_mask[:, 10:12] = state_dim_mask[:, 9:11]
+
+    native_action_mask = action_dim_mask.new_zeros(state.shape[0], 128)
+    native_action_mask[:, 30:39] = action_dim_mask[:, :9]
+    native_action_mask[:, 10] = action_dim_mask[:, 9]
+    return native_state, native_state_mask, native_action_mask
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Measure RDT success rate across LIBERO episodes.")
     parser.add_argument("--config", default="configs/b0_rdt1b_lora.yaml")
@@ -522,10 +563,21 @@ def main() -> None:
                         device=device,
                     )
                     lang_tokens, lang_mask = language_by_task[task_id]
+                    state = encoded["state"]
+                    state_dim_mask = encoded["state_dim_mask"]
+                    action_dim_mask = encoded["action_dim_mask"]
+                    if cfg.model.state_encoder_layout == "rdt_native_128":
+                        state, state_dim_mask, action_dim_mask = (
+                            native_rdt_policy_inputs(
+                                state,
+                                state_dim_mask,
+                                action_dim_mask,
+                            )
+                        )
                     policy_batch = {
-                        "state": encoded["state"].to(device),
-                        "state_dim_mask": encoded["state_dim_mask"].to(device),
-                        "action_dim_mask": encoded["action_dim_mask"].to(device),
+                        "state": state.to(device),
+                        "state_dim_mask": state_dim_mask.to(device),
+                        "action_dim_mask": action_dim_mask.to(device),
                         "ctrl_freq": encoded["ctrl_freq"].to(device),
                         "lang_tokens": lang_tokens.expand(len(active), -1, -1).to(device),
                         "lang_mask": lang_mask.expand(len(active), -1).to(device),
@@ -539,11 +591,21 @@ def main() -> None:
                     model_output = model.sample_actions(policy_batch).float().cpu().numpy()
                     predicted = None
                     if args.action_output_mode == "raw_delta_ortho6d":
-                        predicted = rdt_action_to_libero(model_output)
+                        rdt_commands = (
+                            native_rdt_action_to_libero_10d(model_output)
+                            if cfg.model.action_encoder_layout == "rdt_native_128"
+                            else model_output
+                        )
+                        predicted = rdt_action_to_libero(rdt_commands)
                         finite_actions = predicted
                     elif args.action_output_mode == "normalized_delta":
                         assert stats is not None
-                        predicted = rdt_action_to_libero(model_output, stats)
+                        rdt_commands = (
+                            native_rdt_action_to_libero_10d(model_output)
+                            if cfg.model.action_encoder_layout == "rdt_native_128"
+                            else model_output
+                        )
+                        predicted = rdt_action_to_libero(rdt_commands, stats)
                         finite_actions = predicted
                     else:
                         finite_actions = model_output

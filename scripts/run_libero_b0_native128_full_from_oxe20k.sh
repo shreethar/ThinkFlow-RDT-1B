@@ -20,6 +20,11 @@ WANDB_PROJECT=${WANDB_PROJECT:-ThinkLite B0 LIBERO}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-libero-b0-native128-from-oxe20k-full}
 SIGLIP_MODEL_ID=${SIGLIP_MODEL_ID:-/home/ubuntu/models/siglip-so400m-patch14-384}
 SIGLIP_FALLBACK_MODEL_ID=${SIGLIP_FALLBACK_MODEL_ID:-google/siglip-so400m-patch14-384}
+# A 200-rollout job needs a GPU separate from active training.  Set
+# ROLLOUT_EVAL=1 ROLLOUT_GPU=<spare gpu id> to start the watcher below.
+ROLLOUT_EVAL=${ROLLOUT_EVAL:-0}
+ROLLOUT_GPU=${ROLLOUT_GPU:-}
+ROLLOUT_SAVE_VIDEOS=${ROLLOUT_SAVE_VIDEOS:-0}
 
 CACHE_ARGS=()
 for suite in $SUITES; do
@@ -36,6 +41,26 @@ done
 if [[ ! -f "$INIT_ARTIFACT/rdt_full.pt" ]] || [[ ! -f "$INIT_ARTIFACT/interfaces.pt" ]]; then
   echo "Incomplete OXE initialization artifact: $INIT_ARTIFACT" >&2
   exit 1
+fi
+
+if [[ "$ROLLOUT_EVAL" == "1" ]]; then
+  if [[ -z "$ROLLOUT_GPU" ]]; then
+    echo "ROLLOUT_EVAL=1 requires ROLLOUT_GPU to avoid contending with training" >&2
+    exit 2
+  fi
+  mkdir -p "$OUTPUT_DIR/rollout_evaluations"
+  OUTPUT_DIR="$OUTPUT_DIR" \
+    MAX_STEPS="$MAX_STEPS" \
+    EVAL_EVERY=2000 \
+    ROLLOUT_GPU="$ROLLOUT_GPU" \
+    CONFIG="$CONFIG" \
+    CACHE_PARENT="$CACHE_ROOT" \
+    WANDB_PROJECT="$WANDB_PROJECT" \
+    WANDB_RUN_NAME="$WANDB_RUN_NAME" \
+    SAVE_VIDEOS="$ROLLOUT_SAVE_VIDEOS" \
+    bash scripts/watch_libero_rollout_evaluations.sh \
+      >"$OUTPUT_DIR/rollout_evaluations/watcher.log" 2>&1 &
+  echo "Started 2,000-step rollout watcher on GPU $ROLLOUT_GPU (PID $!)"
 fi
 
 uv run --no-sync python scripts/train_b0_cached_features.py \
