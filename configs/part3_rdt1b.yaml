@@ -1,12 +1,16 @@
 seed: 42
 rdt_repo: /home/ubuntu/RoboticsDiffusionTransformer
 pretrained_model: robotics-diffusion-transformer/rdt-1b
-output_dir: outputs/part3_rdt1b_kv
+output_dir: output_2
 
 model:
-  # Raw cache/action space.
-  action_dim: 7
-  state_dim: 7
+  # Native pretrained RDT state/action space. The cache remains 7-D; the
+  # collator converts XYZ + Euler RPY + gripper to native slots 30:33,
+  # 33:39, and 10 respectively. Loss is masked to exactly those ten slots.
+  action_dim: 128
+  state_dim: 128
+  cache_action_dim: 7
+  cache_state_dim: 7
   pred_horizon: 64
   qwen_hidden_size: 2560
   qwen_kv_dim: 2048
@@ -22,19 +26,24 @@ model:
   img_adaptor: mlp2x_gelu
   state_adaptor: mlp3x_gelu
   copy_pretrained_final_fc1: true
-  gradient_checkpointing: true
+  # The 8 x 4 benchmark was ~13% faster without checkpointing and peaked at
+  # only ~21 GiB on the 48 GiB RTX 6000 Ada.
+  gradient_checkpointing: false
 
   finetune_mode: full
-  qwen_fusion: self_attention_kv
+  qwen_fusion: fastthinkact_state_kv
   pretrained_copy_mode: compatible
 
-  # Convert current observations to native RDT state slots and keep that
-  # pretrained state encoder frozen. Delta actions use a separate trainable
-  # 7-D adaptor/output head and remain in cache coordinates.
+  # Qwen [K;V] is projected once by the two-layer adaptor and appended directly
+  # to every RDT self-attention block's native K/V tensor. Because RDT places
+  # state and noisy-action tokens in that stream, action queries attend jointly
+  # to state-derived K/V and the external visual-planning K/V.
   rdt_state_dim: 128
-  state_encoder_layout: rdt_eef
+  state_encoder_layout: rdt_native_128
+  action_encoder_layout: rdt_native_128
   freeze_state_adaptor: true
-  freeze_condition_adaptors: false
+  freeze_condition_adaptors: true
+  convert_cached_gripper_closed_to_open: false
 
 # Retained so the same config schema can still construct legacy LoRA runs;
 # ignored when model.finetune_mode is full.
@@ -55,23 +64,32 @@ noise_scheduler:
   clip_sample: false
 
 data:
-  train_manifest: cache_features/part_3/train/manifest.jsonl
-  val_manifest: cache_features/part_3/validation/manifest.jsonl
+  # The launcher overrides these with merged manifests from each --cache-root.
+  # Part 1 is the executable default while Part 2 is still downloading.
+  train_manifest: cache_features/part_1_32frame_per_sample_qwen/train/manifest.jsonl
+  val_manifest: cache_features/part_1_32frame_per_sample_qwen/validation/manifest.jsonl
   num_workers: 4
   pin_memory: true
   persistent_workers: true
   episode_aware_shuffle: true
   shuffle_validation: false
   stratified_validation: true
-  # Existing Part 3 Bridge packs contain merged trajectories. Remove this line
-  # only after regenerating Bridge with the fixed precompute code.
-  excluded_dataset_ids: [bridge]
+  excluded_dataset_ids: []
+  # Cached actions were normalized in 7-D. RPY must be denormalized back to
+  # radians before its orthogonal-6D conversion. These audits contain the q01
+  # and q99 values used by feature extraction.
+  action_stats_paths:
+    bc_z: dataset/mock_dataset/bc_z_dataset/audit.json
+    bridge: dataset/mock_dataset/bridge_dataset/audit.json
+    droid: dataset/mock_dataset/droid_dataset/audit.json
+    fractal: dataset/mock_dataset/fractal_dataset/audit.json
+    kuka: dataset/mock_dataset/kuka_dataset/audit.json
 
 training:
   max_steps: 20000  # tune for the desired training budget
-  micro_batch_size: 1
-  gradient_accumulation_steps: 256  # fallback when global_batch_size is null
-  global_batch_size: 256
+  micro_batch_size: 8
+  gradient_accumulation_steps: 4
+  global_batch_size: 32
   learning_rate: 1.0e-4
   learning_rate_lora: 1.0e-4
   learning_rate_interfaces: 1.0e-4
@@ -79,13 +97,17 @@ training:
   warmup_steps: 500
   max_grad_norm: 1.0
   log_every: 10
-  validate_every: 100
+  validate_every: 500
   save_every: 1000
   validation_batches: 256  # legacy fallback when validation_samples is null
   validation_samples: 256  # exact global subset, independent of GPU count
-  sample_validation_batches: 0
+  sample_validation_batches: 1
   validation_seed: 12345
   mixed_precision: bf16
   report_to: wandb
-  wandb_project: thinkflow-rdt
-  wandb_run_name: part3-rdt1b-kv
+  wandb_project: "ThinkLite B0 OXE"
+  skip_nonfinite_updates: true
+  max_consecutive_nonfinite_updates: 10
+  log_gradient_stats: true
+  qualitative_validation_examples: 2
+  wandb_run_name: oxe-rdt1b-native128-fastthinkact-full
