@@ -1205,6 +1205,30 @@ def truncate_episode_batch(
     return batch, kept_samples[:keep]
 
 
+def episode_sample_count_is_allowed(
+    samples: list[dict[str, Any]],
+    *,
+    required_samples: int | None,
+    allow_short_dataset_ids: set[str],
+) -> bool:
+    """Return whether an episode can be emitted under the exact-size policy.
+
+    Selected datasets may retain a non-empty episode shorter than the requested
+    size. This is primarily for Kuka, whose trajectories are commonly shorter
+    than the 32-frame episode-pack target. Episodes above the requested size and
+    mixed-dataset groups are never accepted by this exception.
+    """
+    if required_samples is None:
+        return bool(samples)
+    sample_count = len(samples)
+    if sample_count == required_samples:
+        return True
+    if sample_count <= 0 or sample_count > required_samples:
+        return False
+    dataset_ids = {str(sample.get("dataset_id", "")) for sample in samples}
+    return len(dataset_ids) == 1 and next(iter(dataset_ids)) in allow_short_dataset_ids
+
+
 def prepare_episode_anchor_item(
     *,
     episode_samples: list[dict[str, Any]],
@@ -1218,7 +1242,14 @@ def prepare_episode_anchor_item(
         if getattr(args, "require_exact_samples_per_episode", False)
         else None
     )
-    if required_samples is not None and len(episode_samples) != required_samples:
+    allow_short_dataset_ids = set(
+        getattr(args, "allow_short_episode_dataset", None) or ()
+    )
+    if not episode_sample_count_is_allowed(
+        episode_samples,
+        required_samples=required_samples,
+        allow_short_dataset_ids=allow_short_dataset_ids,
+    ):
         return None
     collate_start = time.perf_counter()
     batch = standardized_collate_fn(
@@ -1234,11 +1265,15 @@ def prepare_episode_anchor_item(
         return None
 
     kept_samples = list(batch["kept_samples"])
-    if required_samples is not None and len(kept_samples) != required_samples:
+    if not episode_sample_count_is_allowed(
+        kept_samples,
+        required_samples=required_samples,
+        allow_short_dataset_ids=allow_short_dataset_ids,
+    ):
         return None
     if remaining_samples is not None:
         keep = min(remaining_samples, len(batch["metadata"]))
-        if required_samples is not None and keep != required_samples:
+        if required_samples is not None and keep != len(batch["metadata"]):
             return None
         if keep <= 0:
             return None
@@ -2520,7 +2555,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Skip an episode unless preprocessing retains exactly "
-            "--max-samples-per-episode samples."
+            "--max-samples-per-episode samples, except for datasets named by "
+            "--allow-short-episode-dataset."
+        ),
+    )
+    parser.add_argument(
+        "--allow-short-episode-dataset",
+        action="append",
+        default=[],
+        metavar="DATASET_ID",
+        help=(
+            "Allow a non-empty episode from this dataset to retain all available "
+            "steps when it has fewer than --max-samples-per-episode. Repeat for "
+            "multiple datasets."
         ),
     )
     parser.add_argument(
@@ -2861,6 +2908,7 @@ def main() -> None:
         "require_exact_samples_per_episode": bool(
             args.require_exact_samples_per_episode
         ),
+        "allow_short_episode_datasets": list(args.allow_short_episode_dataset),
         "all_samples_per_episode": bool(args.all_samples_per_episode),
         "gripper_change_scope": args.gripper_change_scope,
         "open_to_close_before": args.open_to_close_before,
