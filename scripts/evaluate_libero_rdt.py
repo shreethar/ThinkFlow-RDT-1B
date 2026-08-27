@@ -13,6 +13,9 @@ from typing import Any
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp/thinkflow-cache")
+# Model snapshots were downloaded to the normal user Hugging Face cache. Keep
+# simulation/matplotlib scratch files in /tmp without hiding those snapshots.
+os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/thinkflow-matplotlib")
 
 import imageio.v2 as imageio
@@ -45,6 +48,7 @@ from rollout_libero_rdt import (  # noqa: E402
     install_robosuite_mujoco_compatibility,
     load_feature_metadata,
     load_t5_encoder,
+    resolve_model_id,
     rdt_state_open_from_libero,
     rollout_sample,
     t5_device_from_encoder,
@@ -227,6 +231,13 @@ def parse_args() -> argparse.Namespace:
         help="Override SigLIP model path/id. Defaults to cache metadata, then google/siglip-so400m-patch14-384.",
     )
     parser.add_argument(
+        "--siglip-fallback-model-id",
+        default="google/siglip-so400m-patch14-384",
+        help=(
+            "Fallback when --siglip-model-id is a local path that does not exist."
+        ),
+    )
+    parser.add_argument(
         "--task-id",
         type=int,
         action="append",
@@ -394,7 +405,13 @@ def main() -> None:
     metadata = load_feature_metadata(args.cache_root)
     qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
     qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
-    siglip_id = args.siglip_model_id or metadata.get("siglip_model_id", "google/siglip-so400m-patch14-384")
+    siglip_id = resolve_model_id(
+        args.siglip_model_id
+        or metadata.get(
+            "siglip_model_id", "google/siglip-so400m-patch14-384"
+        ),
+        args.siglip_fallback_model_id,
+    )
     t5_id = (
         args.t5_model_id
         or metadata.get("t5_model_id")

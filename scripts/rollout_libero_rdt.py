@@ -14,6 +14,7 @@ from typing import Any
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp/thinkflow-cache")
+os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/thinkflow-matplotlib")
 
 import cv2

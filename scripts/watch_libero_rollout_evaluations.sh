@@ -33,6 +33,8 @@ WANDB_PROJECT=${WANDB_PROJECT:-ThinkLite B0 LIBERO}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-libero-b0-native128-from-oxe20k-full-v2}
 SAVE_VIDEOS=${SAVE_VIDEOS:-0}
 VIDEO_RESOLUTION=${VIDEO_RESOLUTION:-512}
+SIGLIP_MODEL_ID=${SIGLIP_MODEL_ID:-/home/ubuntu/models/siglip-so400m-patch14-384}
+SIGLIP_FALLBACK_MODEL_ID=${SIGLIP_FALLBACK_MODEL_ID:-google/siglip-so400m-patch14-384}
 
 if (( EVAL_EVERY <= 0 || MAX_STEPS <= 0 || MAX_STEPS < EVAL_EVERY )); then
   echo "Invalid MAX_STEPS/EVAL_EVERY: $MAX_STEPS/$EVAL_EVERY" >&2
@@ -99,6 +101,8 @@ for ((step=EVAL_EVERY; step<=MAX_STEPS; step+=EVAL_EVERY)); do
       --env-batch-size "$ENV_BATCH_SIZE" \
       --action-chunk "$ACTION_CHUNK" \
       --max-steps "$MAX_ROLLOUT_STEPS" \
+      --siglip-model-id "$SIGLIP_MODEL_ID" \
+      --siglip-fallback-model-id "$SIGLIP_FALLBACK_MODEL_ID" \
       "${task_args[@]}" \
       --wandb-project "$WANDB_PROJECT" \
       --wandb-run-name "$WANDB_RUN_NAME" \

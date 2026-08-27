@@ -20,10 +20,10 @@ WANDB_PROJECT=${WANDB_PROJECT:-ThinkLite B0 LIBERO}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-libero-b0-native128-from-oxe20k-full-v2}
 SIGLIP_MODEL_ID=${SIGLIP_MODEL_ID:-/home/ubuntu/models/siglip-so400m-patch14-384}
 SIGLIP_FALLBACK_MODEL_ID=${SIGLIP_FALLBACK_MODEL_ID:-google/siglip-so400m-patch14-384}
-# On one GPU, stop at each rollout boundary, release training VRAM, evaluate,
-# then bit-exact resume. Other supported modes are post_training, parallel
-# (requires a spare GPU), and 0 (disabled).
-ROLLOUT_EVAL=${ROLLOUT_EVAL:-interleaved}
+# On one GPU, finish training first and then evaluate all saved 5,000-step
+# checkpoints. Other supported modes are interleaved, parallel (requires a
+# spare GPU), and 0 (disabled).
+ROLLOUT_EVAL=${ROLLOUT_EVAL:-post_training}
 ROLLOUT_GPU=${ROLLOUT_GPU:-}
 ROLLOUT_SAVE_VIDEOS=${ROLLOUT_SAVE_VIDEOS:-0}
 ROLLOUT_EVERY=${ROLLOUT_EVERY:-5000}
@@ -70,6 +70,8 @@ run_rollout_watcher() {
     TASK_IDS="$ROLLOUT_TASK_IDS" \
     WANDB_PROJECT="$WANDB_PROJECT" \
     WANDB_RUN_NAME="$WANDB_RUN_NAME" \
+    SIGLIP_MODEL_ID="$SIGLIP_MODEL_ID" \
+    SIGLIP_FALLBACK_MODEL_ID="$SIGLIP_FALLBACK_MODEL_ID" \
     SAVE_VIDEOS="$ROLLOUT_SAVE_VIDEOS" \
     bash scripts/watch_libero_rollout_evaluations.sh
 }

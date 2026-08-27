@@ -45,6 +45,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
     parser.add_argument("--t5-precision", choices=("bf16", "8bit"), default="bf16")
     parser.add_argument("--siglip-model-id", default="/home/ubuntu/models/siglip-so400m-patch14-384")
+    parser.add_argument(
+        "--siglip-fallback-model-id",
+        default="google/siglip-so400m-patch14-384",
+    )
     parser.add_argument("--save-videos", action="store_true")
     parser.add_argument("--video-resolution", type=int, default=512)
     parser.add_argument("--video-fps", type=int, default=20)
@@ -111,6 +115,7 @@ def main() -> None:
             "--require-qwen-fusion",
             "--t5-precision", args.t5_precision,
             "--siglip-model-id", args.siglip_model_id,
+            "--siglip-fallback-model-id", args.siglip_fallback_model_id,
         ]
         for task_id in task_ids:
             command.extend(["--task-id", str(task_id)])
