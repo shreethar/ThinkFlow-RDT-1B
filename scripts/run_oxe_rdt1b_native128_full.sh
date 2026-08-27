@@ -63,9 +63,11 @@ fi
   --gradient-accumulation-steps 4 \
   --global-batch-size 32 \
   --validate-every 500 \
+  --validation-batch-size 32 \
+  --validation-samples 256 \
   --save-every 1000 \
   --sample-validation-batches 1 \
-  --qualitative-validation-examples 2 \
+  --qualitative-validation-examples 32 \
   --skip-nonfinite-updates \
   --log-gradient-stats \
   --report-to wandb \

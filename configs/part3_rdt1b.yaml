@@ -101,6 +101,7 @@ training:
   save_every: 1000
   validation_batches: 256  # legacy fallback when validation_samples is null
   validation_samples: 256  # exact global subset, independent of GPU count
+  validation_batch_size: 32
   sample_validation_batches: 1
   validation_seed: 12345
   mixed_precision: bf16
@@ -109,5 +110,5 @@ training:
   skip_nonfinite_updates: true
   max_consecutive_nonfinite_updates: 10
   log_gradient_stats: true
-  qualitative_validation_examples: 2
+  qualitative_validation_examples: 32
   wandb_run_name: oxe-rdt1b-native128-fastthinkact-full
