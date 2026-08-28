@@ -269,6 +269,81 @@ def rollout_sample(
     }
 
 
+def native_rdt_policy_inputs(
+    state: torch.Tensor,
+    state_dim_mask: torch.Tensor,
+    action_dim_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack live LIBERO state/action masks into native RDT's 128 slots."""
+    if state.ndim != 2 or state.shape[-1] != LIBERO_STATE_DIM:
+        raise ValueError(
+            f"Expected live LIBERO state [B, {LIBERO_STATE_DIM}], got "
+            f"{tuple(state.shape)}"
+        )
+    if state_dim_mask.shape != state.shape:
+        raise ValueError("LIBERO state_dim_mask must match state shape")
+    if action_dim_mask.ndim != 2 or action_dim_mask.shape != (
+        state.shape[0],
+        LIBERO_ACTION_DIM,
+    ):
+        raise ValueError(
+            f"Expected live LIBERO action_dim_mask [B, {LIBERO_ACTION_DIM}], "
+            f"got {tuple(action_dim_mask.shape)}"
+        )
+
+    native_state = state.new_zeros(state.shape[0], 128)
+    native_state_mask = state_dim_mask.new_zeros(state.shape[0], 128)
+    # Compact live state: xyz + absolute ortho6D + two finger qpos values.
+    native_state[:, 30:39] = state[:, :9] * state_dim_mask[:, :9]
+    native_state_mask[:, 30:39] = state_dim_mask[:, :9]
+    native_state[:, 10:12] = state[:, 9:11] * state_dim_mask[:, 9:11]
+    native_state_mask[:, 10:12] = state_dim_mask[:, 9:11]
+
+    native_action_mask = action_dim_mask.new_zeros(state.shape[0], 128)
+    # Compact action: dxyz + relative ortho6D + raw gripper command.
+    native_action_mask[:, 30:39] = action_dim_mask[:, :9]
+    native_action_mask[:, 10] = action_dim_mask[:, 9]
+    return native_state, native_state_mask, native_action_mask
+
+
+def native_rdt_action_to_libero_10d(actions: np.ndarray) -> np.ndarray:
+    """Extract the supervised LIBERO 10D command from native RDT output."""
+    values = np.asarray(actions)
+    if values.shape[-1] != 128:
+        raise ValueError(
+            f"Expected native RDT action width 128, got {values.shape[-1]}"
+        )
+    return np.concatenate(
+        [values[..., 30:33], values[..., 33:39], values[..., 10:11]],
+        axis=-1,
+    )
+
+
+def apply_demo_action_override(
+    model_action: np.ndarray,
+    demo_action: np.ndarray,
+    mode: str,
+) -> np.ndarray:
+    """Replace only motion or gripper with the aligned demonstration command."""
+    predicted = np.asarray(model_action, dtype=np.float32)
+    reference = np.asarray(demo_action, dtype=np.float32)
+    if predicted.shape != (7,) or reference.shape[0] < 7:
+        raise ValueError(
+            "Causal LIBERO action override expects model [7] and demo [>=7], "
+            f"got {predicted.shape} and {reference.shape}"
+        )
+    result = predicted.copy()
+    if mode == "none":
+        return result
+    if mode == "gripper":
+        result[6] = reference[6]
+        return result
+    if mode == "motion":
+        result[:6] = reference[:6]
+        return result
+    raise ValueError(f"Unknown demonstration action override mode: {mode!r}")
+
+
 def frame_for_video(frame: np.ndarray, text: str) -> np.ndarray:
     # LIBERO camera arrays use OpenGL's bottom-up convention.
     frame = np.asarray(frame)[::-1].copy()
@@ -360,6 +435,16 @@ def parse_args() -> argparse.Namespace:
         help="Start from the first recorded simulator state of this HDF5 demo instead of a benchmark init state.",
     )
     parser.add_argument("--demo-name", default="demo_0")
+    parser.add_argument(
+        "--demo-action-override",
+        choices=["none", "gripper", "motion"],
+        default="none",
+        help=(
+            "Closed-loop causal ablation. Replace only the executed gripper "
+            "command or the six motion commands with the aligned HDF5 demo "
+            "action while the model continues observing and replanning."
+        ),
+    )
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument(
         "--action-chunk",
@@ -424,7 +509,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Save synchronized policy agent-view/wrist frames and observed "
-            "11D states for notebook diagnostics."
+            "11D policy states plus full MuJoCo simulator states for notebook "
+            "diagnostics."
         ),
     )
     return parser.parse_args()
@@ -453,6 +539,10 @@ def main() -> None:
         )
     if args.target_state_start_index < 0:
         raise ValueError("--target-state-start-index must be non-negative")
+    if args.demo_action_override != "none" and args.demo_hdf5 is None:
+        raise ValueError(
+            "--demo-action-override requires --demo-hdf5 and --demo-name"
+        )
     max_delta_pos = None if args.max_delta_pos < 0 else args.max_delta_pos
     max_delta_rot = None if args.max_delta_rot < 0 else args.max_delta_rot
     stats = None
@@ -548,12 +638,19 @@ def main() -> None:
         horizon=args.max_steps + 10,
     )
     observation = env.reset()
+    demo_actions: np.ndarray | None = None
     if args.demo_hdf5 is not None:
         import h5py
 
         with h5py.File(args.demo_hdf5, "r") as handle:
             demo = handle["data"][args.demo_name]
             recorded_state = np.asarray(demo["states"][0], dtype=np.float64)
+            if args.demo_action_override != "none":
+                if "actions" not in demo:
+                    raise KeyError(
+                        f"{demo.name} has no actions for causal override"
+                    )
+                demo_actions = np.asarray(demo["actions"], dtype=np.float32)[:, :7]
         state_index = -1
         observation = env.set_init_state(recorded_state)
     else:
@@ -584,6 +681,10 @@ def main() -> None:
     action_debug_handle = None
     initial_converted = libero_observation_to_rdt(observation)
     debug_states = [initial_converted["state"].copy()]
+    # Keep the complete MuJoCo state alongside the compact 11D policy state.
+    # This is only persisted when --observation-debug-npz is requested and is
+    # useful for exact-state, full-episode trajectory diagnostics.
+    debug_sim_states = [np.asarray(env.get_sim_state()).copy()]
     debug_agent_frames = [np.asarray(initial_converted["primary"]).copy()]
     debug_wrist_frames = (
         []
@@ -633,10 +734,19 @@ def main() -> None:
                 expected_dim=cfg.model.img_token_dim,
                 device=device,
             )
+            state = encoded["state"]
+            state_dim_mask = encoded["state_dim_mask"]
+            action_dim_mask = encoded["action_dim_mask"]
+            if cfg.model.state_encoder_layout == "rdt_native_128":
+                state, state_dim_mask, action_dim_mask = native_rdt_policy_inputs(
+                    state,
+                    state_dim_mask,
+                    action_dim_mask,
+                )
             batch = {
-                "state": encoded["state"].to(device),
-                "state_dim_mask": encoded["state_dim_mask"].to(device),
-                "action_dim_mask": encoded["action_dim_mask"].to(device),
+                "state": state.to(device),
+                "state_dim_mask": state_dim_mask.to(device),
+                "action_dim_mask": action_dim_mask.to(device),
                 "ctrl_freq": encoded["ctrl_freq"].to(device),
                 "lang_tokens": lang_tokens.to(device),
                 "lang_mask": lang_mask.to(device),
@@ -647,7 +757,12 @@ def main() -> None:
                 assert cached_qwen is not None
                 batch["qwen_kv"] = cached_qwen
             torch.manual_seed(args.seed + plan_index)
-            model_output = model.sample_actions(batch)[0].float().cpu().numpy()
+            native_model_output = model.sample_actions(batch)[0].float().cpu().numpy()
+            model_output = (
+                native_rdt_action_to_libero_10d(native_model_output)
+                if cfg.model.action_encoder_layout == "rdt_native_128"
+                else native_model_output
+            )
             if args.action_output_mode == "raw_delta_ortho6d":
                 denormalized = None
                 actions = rdt_action_to_libero(model_output)
@@ -699,6 +814,10 @@ def main() -> None:
                     "planned_libero_action_stats": action_debug_stats(actions),
                     "planned_libero_actions_at_replan_start": array_to_nested_float_list(actions),
                 }
+                if cfg.model.action_encoder_layout == "rdt_native_128":
+                    debug_row["native_128_model_output_stats"] = (
+                        action_debug_stats(native_model_output)
+                    )
                 if args.action_output_mode == "normalized_delta":
                     assert stats is not None and denormalized is not None
                     debug_row["normalization"] = {
@@ -727,6 +846,7 @@ def main() -> None:
                         "gripper": "dim 9 copied unchanged apart from [-1,1] clipping",
                     }
             executed_actions: list[np.ndarray] = []
+            override_reference_actions: list[np.ndarray] = []
             observed_states = [
                 libero_observation_to_rdt(observation)["state"].copy()
             ]
@@ -744,6 +864,20 @@ def main() -> None:
                     )
                 else:
                     action = actions[action_index]
+                if args.demo_action_override != "none":
+                    assert demo_actions is not None
+                    if simulator_step >= len(demo_actions):
+                        raise IndexError(
+                            "Policy rollout exceeded the available aligned "
+                            f"demonstration actions ({len(demo_actions)})"
+                        )
+                    reference_action = demo_actions[simulator_step]
+                    action = apply_demo_action_override(
+                        action,
+                        reference_action,
+                        args.demo_action_override,
+                    )
+                    override_reference_actions.append(reference_action.copy())
                 executed_actions.append(action.copy())
                 # Keep adjacent t-1/t frames for the next SigLIP history, matching
                 # the feature-precomputation contract even when actions are chunked.
@@ -752,6 +886,7 @@ def main() -> None:
                 converted_observation = libero_observation_to_rdt(observation)
                 observed_states.append(converted_observation["state"].copy())
                 debug_states.append(converted_observation["state"].copy())
+                debug_sim_states.append(np.asarray(env.get_sim_state()).copy())
                 debug_agent_frames.append(
                     np.asarray(converted_observation["primary"]).copy()
                 )
@@ -775,6 +910,13 @@ def main() -> None:
                 debug_row["observed_rdt_states"] = array_to_nested_float_list(
                     np.stack(observed_states, axis=0)
                 )
+                debug_row["demo_action_override"] = args.demo_action_override
+                if override_reference_actions:
+                    debug_row["override_reference_actions"] = (
+                        array_to_nested_float_list(
+                            np.stack(override_reference_actions, axis=0)
+                        )
+                    )
                 action_debug_handle.write(json.dumps(debug_row) + "\n")
                 action_debug_handle.flush()
             plan_index += 1
@@ -791,6 +933,7 @@ def main() -> None:
             np.savez_compressed(
                 args.observation_debug_npz,
                 states=np.stack(debug_states),
+                sim_states=np.stack(debug_sim_states),
                 agent_frames=np.stack(debug_agent_frames),
                 wrist_frames=(
                     np.stack(debug_wrist_frames)
@@ -811,6 +954,7 @@ def main() -> None:
         "steps": simulator_step,
         "plans": plan_index,
         "success": success,
+        "demo_action_override": args.demo_action_override,
         "video": str(args.output.resolve()),
     }
     if args.action_debug_jsonl is not None:
