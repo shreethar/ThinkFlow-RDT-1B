@@ -9,11 +9,15 @@ description = "SFT-conditioned RDT-1B diffusion action model with LoRA"
 requires-python = ">=3.12"
 dependencies = [
   "flash-linear-attention[cuda]",
-  "flash-attn==2.8.3+cu12torch2.10cxx11abiTRUE",
-  "causal-conv1d==1.6.2.post1+cu12torch2.10cxx11abiTRUE",
+  # The direct wheel URLs below select the CUDA 12 / Torch 2.10 builds. Their
+  # embedded package metadata exposes the base versions without local tags.
+  "flash-attn==2.8.3",
+  "causal-conv1d==1.6.2.post1",
   "torch==2.10.0",
   "torchvision==0.25.0",
-  "accelerate>=0.30",
+  # Transformers 5.x treats older Accelerate releases as unavailable for
+  # device_map, even if the package can be imported.
+  "accelerate>=1.1.0",
   "diffusers>=0.27",
   "huggingface-hub>=0.23",
   "numpy>=1.24,<2.0.0",
