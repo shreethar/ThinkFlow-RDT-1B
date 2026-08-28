@@ -54,6 +54,7 @@ def test_attach_training_objective_uses_action_dtype_and_device() -> None:
     attach_training_objective(
         batch,
         horizon_loss_weights=[5.0, 3.0, 2.0, 1.0],
+        xyz_loss_weight=0.5,
         gripper_bce_weight=1.0,
         gripper_bce_logit_scale=5.0,
         rotation_geodesic_weight=1.0,
@@ -61,6 +62,7 @@ def test_attach_training_objective_uses_action_dtype_and_device() -> None:
 
     for key in (
         "horizon_loss_weights",
+        "xyz_loss_weight",
         "gripper_bce_weight",
         "gripper_bce_logit_scale",
         "rotation_geodesic_weight",

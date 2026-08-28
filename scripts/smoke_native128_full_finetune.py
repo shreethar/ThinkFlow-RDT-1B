@@ -231,6 +231,7 @@ def main() -> None:
         attach_training_objective(
             batch,
             horizon_loss_weights=None,
+            xyz_loss_weight=0.0,
             gripper_bce_weight=0.0,
             gripper_bce_logit_scale=1.0,
             rotation_geodesic_weight=0.0,

@@ -393,6 +393,60 @@ def test_horizon_loss_weights_change_only_the_optimization_objective():
     torch.testing.assert_close(metrics["loss"], torch.tensor(expected_weighted))
 
 
+def test_xyz_auxiliary_loss_uses_horizon_weights_and_changes_total_loss():
+    base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
+    model_config = replace(
+        base.model,
+        finetune_mode="full",
+        qwen_fusion="self_attention_kv",
+        rdt_state_dim=128,
+        state_encoder_layout="rdt_eef",
+        freeze_state_adaptor=True,
+        allow_random_frozen_state_adaptor=True,
+    )
+    model = SFTConditionedRDT(
+        replace(base, model=model_config), load_pretrained=False
+    )
+
+    def zero_prediction(self, x, *_args, **_kwargs):
+        return x.new_zeros(x.shape[0], model.horizon, 7)
+
+    model.runner.model.forward = MethodType(zero_prediction, model.runner.model)
+    actions = torch.zeros(1, model.horizon, 7)
+    actions[:, 0, :3] = 2.0
+    actions[:, 1:, :3] = 1.0
+    weights = torch.tensor([4.0] + [1.0] * (model.horizon - 1))
+    batch = {
+        "lang_tokens": torch.randn(1, 12, 64),
+        "lang_mask": torch.ones(1, 12, dtype=torch.bool),
+        "img_tokens": torch.randn(1, 16, 64),
+        "img_mask": torch.ones(1, 16, dtype=torch.bool),
+        "qwen_kv": torch.randn(1, 1, 64),
+        "state": torch.zeros(1, 7),
+        "actions": actions,
+        "action_time_mask": torch.ones(1, model.horizon, dtype=torch.bool),
+        "action_dim_mask": torch.ones(1, 7),
+        "horizon_loss_weights": weights,
+        "xyz_loss_weight": torch.tensor(0.5),
+        "ctrl_freq": torch.full((1,), 10.0),
+    }
+
+    metrics = model(batch)
+    weighted_horizon_error = 4.0 * 4.0 + model.horizon - 1
+    weighted_horizon_count = 4.0 + model.horizon - 1
+    expected_xyz = weighted_horizon_error / weighted_horizon_count
+    expected_imitation = 3.0 * weighted_horizon_error / (
+        7.0 * weighted_horizon_count
+    )
+    torch.testing.assert_close(
+        metrics["xyz_auxiliary_loss"], torch.tensor(expected_xyz)
+    )
+    torch.testing.assert_close(
+        metrics["loss"],
+        torch.tensor(expected_imitation + 0.5 * expected_xyz),
+    )
+
+
 def test_auxiliary_gripper_bce_uses_existing_clean_output_without_a_head():
     base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
     model_config = replace(

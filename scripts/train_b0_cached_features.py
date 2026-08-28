@@ -483,6 +483,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gripper-bce-weight", type=float, default=0.0)
     parser.add_argument("--gripper-bce-logit-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--xyz-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for an auxiliary XYZ MSE objective. It follows "
+            "--horizon-loss-schedule; zero preserves the previous objective."
+        ),
+    )
     parser.add_argument("--rotation-geodesic-weight", type=float, default=0.0)
     return parser.parse_args()
 
@@ -507,6 +516,7 @@ def main() -> None:
         stop_after_step=args.stop_after_step,
         horizon_loss_weights=horizon_loss_weights,
         mask_noisy_gripper_input=args.mask_noisy_gripper_input,
+        xyz_loss_weight=args.xyz_loss_weight,
         gripper_bce_weight=args.gripper_bce_weight,
         gripper_bce_logit_scale=args.gripper_bce_logit_scale,
         rotation_geodesic_weight=args.rotation_geodesic_weight,
