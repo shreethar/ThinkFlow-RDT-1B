@@ -19,6 +19,7 @@ import os
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from multiprocessing.connection import Client
@@ -45,6 +46,7 @@ DEFAULT_SIMPLER_PYTHON = DEFAULT_SIMPLER_ROOT / ".venv/bin/python"
 DEFAULT_CHECKPOINT = REPO_ROOT / "output_2/checkpoint-20000"
 DEFAULT_CONFIG = REPO_ROOT / "configs/part3_rdt1b.yaml"
 DEFAULT_QWEN = REPO_ROOT / "model/model/stage1_unsloth"
+AF_UNIX_SAFE_PATH_BYTES = 103
 
 
 def jsonable(value: Any) -> Any:
@@ -419,10 +421,29 @@ class PolicyEngine:
         }
 
 
+def worker_socket_path() -> Path:
+    """Return a short temporary path below Linux's AF_UNIX path limit."""
+    filename = f"tfse_{os.getpid()}_{secrets.token_hex(4)}.sock"
+    configured = os.environ.get("THINKFLOW_SIMPLER_SOCKET_DIR")
+    candidate_dirs = []
+    if configured:
+        candidate_dirs.append(Path(configured).expanduser())
+    candidate_dirs.extend((Path(tempfile.gettempdir()), Path("/tmp")))
+    for directory in candidate_dirs:
+        candidate = directory.resolve() / filename
+        if len(os.fsencode(candidate)) <= AF_UNIX_SAFE_PATH_BYTES:
+            return candidate
+    raise OSError(
+        "Could not construct a SimplerEnv worker socket path shorter than "
+        f"{AF_UNIX_SAFE_PATH_BYTES + 1} bytes"
+    )
+
+
 def start_worker(args: argparse.Namespace) -> tuple[subprocess.Popen[str], Any, Path]:
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    socket_path = output_dir / f"simpler_{os.getpid()}_{secrets.token_hex(4)}.sock"
+    socket_path = worker_socket_path()
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
     authkey = secrets.token_bytes(32)
     command = [
         str(args.simpler_python),
