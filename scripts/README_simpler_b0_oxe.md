@@ -50,16 +50,25 @@ uv run --no-sync python scripts/evaluate_simpler_b0_oxe.py \
 ```
 
 Run a real episode on a native-Linux machine with a Vulkan-capable NVIDIA
-driver. `--action-chunk 1` matches SimplerEnv's normal policy-step cadence;
-also test `--action-chunk 10` because this RDT was developed around ten-step
-execution before replanning.
+driver. No X server or physical display is required when
+`--renderer-offscreen` is supplied. `--action-chunk 1` matches SimplerEnv's
+normal policy-step cadence; also test `--action-chunk 10` because this RDT was
+developed around ten-step execution before replanning.
 
 ```bash
+RDT_REPO=/path/to/RoboticsDiffusionTransformer \
 uv run --no-sync python scripts/evaluate_simpler_b0_oxe.py \
   --mode rollout --task google_robot_pick_coke_can \
+  --renderer-offscreen \
   --action-chunk 10 --max-steps 80 \
   --output-dir output_2/simpler_b0_oxe/google_coke_chunk10
 ```
+
+`RDT_REPO` overrides a machine-specific `rdt_repo` path from the YAML when
+that configured path is unavailable.
+
+Full-fine-tune artifacts such as `output_2/checkpoint-20000` do not require
+PEFT at inference time. PEFT is imported only when a LoRA artifact is selected.
 
 The local WSL2 host cannot run the renderer. SAPIEN reports that WSL is not
 supported and Vulkan device creation fails with `ErrorExtensionNotPresent`.

@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Iterable
 
 import torch.nn as nn
-from peft import LoraConfig, get_peft_model
 
 from .config import LoraConfigData
 
@@ -49,6 +48,13 @@ def find_lora_targets(rdt_core: nn.Module, cfg: LoraConfigData) -> list[str]:
 
 
 def apply_lora(rdt_core: nn.Module, cfg: LoraConfigData) -> tuple[nn.Module, list[str]]:
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as exc:
+        raise RuntimeError(
+            "model.finetune_mode='lora' requires a PEFT installation "
+            "compatible with the installed Accelerate version"
+        ) from exc
     targets = find_lora_targets(rdt_core, cfg)
     modules_to_save = ["final_layer"] if cfg.train_final_layer else None
     peft_cfg = LoraConfig(

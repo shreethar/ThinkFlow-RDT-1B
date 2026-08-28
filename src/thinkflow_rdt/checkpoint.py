@@ -7,8 +7,15 @@ from typing import Any
 
 import numpy as np
 import torch
-from peft import PeftModel
-from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
+
+
+# PEFT is optional for full-fine-tune checkpoints. Keep these names at module
+# scope so tests and downstream callers can replace them, but import the real
+# implementations only when a LoRA artifact is actually loaded. Importing PEFT
+# eagerly makes full-checkpoint inference fail when an otherwise unused PEFT
+# installation is incompatible with the installed Accelerate version.
+load_peft_weights: Any | None = None
+set_peft_model_state_dict: Any | None = None
 
 
 INTERFACE_FILE = "interfaces.pt"
@@ -185,10 +192,30 @@ def _configured_artifact_format(model) -> str | None:
 
 def _is_peft_model(module) -> bool:
     """Detect PEFT without mistaking hub models' save_pretrained for LoRA."""
-    return (
-        isinstance(module, PeftModel)
-        or getattr(module, "peft_config", None) is not None
-    )
+    # Every supported PeftModel exposes ``peft_config``. Attribute-based
+    # detection avoids importing PEFT on the full-fine-tune inference path.
+    return getattr(module, "peft_config", None) is not None
+
+
+def _require_peft_checkpoint_api() -> tuple[Any, Any]:
+    """Return PEFT checkpoint helpers, importing them only for LoRA usage."""
+    global load_peft_weights, set_peft_model_state_dict
+    if callable(load_peft_weights) and callable(set_peft_model_state_dict):
+        return load_peft_weights, set_peft_model_state_dict
+    try:
+        from peft.utils.save_and_load import (
+            load_peft_weights as peft_load_weights,
+            set_peft_model_state_dict as peft_set_state_dict,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "Loading an RDT LoRA artifact requires a PEFT installation "
+            "compatible with the installed Accelerate version. Full-RDT "
+            "artifacts do not require PEFT."
+        ) from exc
+    load_peft_weights = peft_load_weights
+    set_peft_model_state_dict = peft_set_state_dict
+    return load_peft_weights, set_peft_model_state_dict
 
 
 def _artifact_format_for_save(model) -> str:
@@ -420,8 +447,9 @@ def load_lora_rdt_core(model, artifact_dir: str | Path, *, trainable: bool) -> N
         raise TypeError("A LoRA artifact requires a PEFT-wrapped RDT model")
     # The model constructor has already created the same default LoRA layout.
     # Load into it instead of wrapping the model a second time.
-    adapter_state = load_peft_weights(str(adapter_dir), device="cpu")
-    set_peft_model_state_dict(
+    peft_load_weights, peft_set_state_dict = _require_peft_checkpoint_api()
+    adapter_state = peft_load_weights(str(adapter_dir), device="cpu")
+    peft_set_state_dict(
         model.runner.model,
         adapter_state,
         adapter_name="default",
