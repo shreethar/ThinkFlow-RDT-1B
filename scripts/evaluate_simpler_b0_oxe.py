@@ -127,6 +127,47 @@ class ActionStats:
     q99: np.ndarray
 
 
+@dataclass
+class GoogleGripperTargetAdapter:
+    """Convert an absolute open target into Google's relative command.
+
+    OXE preprocessing turns Fractal's command stream into a persistent binary
+    target. SimplerEnv's Google controller instead consumes ``+1`` to close,
+    ``-1`` to open, and ``0`` to hold. A sticky transition gives the physical
+    gripper enough controller steps to finish moving if the prediction chatters.
+    """
+
+    sticky_steps: int
+    assumed_open: bool
+    active_command: float = 0.0
+    remaining_steps: int = 0
+
+    def command(self, desired_open: bool) -> float:
+        desired_open = bool(desired_open)
+        if self.sticky_steps <= 0:
+            # Preserve the original stateless evaluator behavior when disabled.
+            return -1.0 if desired_open else 1.0
+
+        if self.remaining_steps > 0:
+            command = self.active_command
+            self.remaining_steps -= 1
+            if self.remaining_steps == 0:
+                self.assumed_open = command < 0.0
+                self.active_command = 0.0
+            return command
+
+        if desired_open == self.assumed_open:
+            return 0.0
+
+        self.active_command = -1.0 if desired_open else 1.0
+        self.remaining_steps = self.sticky_steps - 1
+        command = self.active_command
+        if self.remaining_steps == 0:
+            self.assumed_open = desired_open
+            self.active_command = 0.0
+        return command
+
+
 def load_stats(path: Path) -> ActionStats:
     payload = json.loads(path.read_text(encoding="utf-8"))
     block = payload.get("action_normalization", payload)
@@ -168,6 +209,7 @@ def decode_native_actions(
     dataset: str,
     task: str,
     stats: ActionStats,
+    rotation_scale: float = 1.0,
 ) -> dict[str, np.ndarray]:
     """Decode RDT-128 output into SimplerEnv's 7-D controller action.
 
@@ -192,6 +234,7 @@ def decode_native_actions(
     else:
         # Bridge/WidowX's controller consumes a true axis-angle (rotvec).
         environment_rotation = Rotation.from_euler("xyz", euler_xyz).as_rotvec().astype(np.float32)
+    environment_rotation = (environment_rotation * float(rotation_scale)).astype(np.float32)
 
     gripper_open_score = values[:, RDT_GRIPPER_INDEX]
     gripper_open = gripper_open_score >= 0.0
@@ -572,7 +615,13 @@ def run_contract(args: argparse.Namespace) -> dict[str, Any]:
     identity_6d = euler_xyz_to_ortho6d_numpy(np.zeros(3, dtype=np.float32))
     native[:, RDT_ORTHO6D_SLICE] = identity_6d
     native[:, RDT_GRIPPER_INDEX] = [0.25, -0.25]
-    decoded = decode_native_actions(native, dataset=dataset, task=args.task, stats=stats)
+    decoded = decode_native_actions(
+        native,
+        dataset=dataset,
+        task=args.task,
+        stats=stats,
+        rotation_scale=args.rotation_scale,
+    )
 
     expected_first_xyz = np.asarray(
         [stats.q01[0], (stats.q01[1] + stats.q99[1]) * 0.5, stats.q99[2]],
@@ -624,7 +673,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         control_frequency=control_frequency,
         seed=args.seed,
     )
-    decoded = decode_native_actions(native, dataset=dataset, task=args.task, stats=stats)
+    decoded = decode_native_actions(
+        native,
+        dataset=dataset,
+        task=args.task,
+        stats=stats,
+        rotation_scale=args.rotation_scale,
+    )
     result = {
         "status": "completed",
         "warning": "Static probe: the image is official SimplerEnv output, but the state is user/synthetic because this host cannot create a Vulkan simulator.",
@@ -676,6 +731,8 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
                 "initial_state_7d": packet["state_7d"],
                 "initial_robot_qpos": packet["robot_qpos"],
                 "initial_object_states": packet["object_states"],
+                "rotation_scale": args.rotation_scale,
+                "google_gripper_sticky_steps": args.google_gripper_sticky_steps,
             },
         )
         # Load 30+ GiB of policy encoders only after the simulator proves it can
@@ -686,6 +743,12 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
             video_path, format="FFMPEG", fps=args.video_fps, codec="libx264", quality=8
         )
         previous_image: np.ndarray | None = None
+        google_gripper = None
+        if robot_family(args.task) == "google_robot":
+            google_gripper = GoogleGripperTargetAdapter(
+                sticky_steps=args.google_gripper_sticky_steps,
+                assumed_open=float(packet["state_7d"][6]) < 0.5,
+            )
         step = 0
         plan_index = 0
         success = False
@@ -698,11 +761,22 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
                 control_frequency=control_frequency,
                 seed=args.seed + plan_index,
             )
-            decoded = decode_native_actions(native, dataset=dataset, task=args.task, stats=stats)
+            decoded = decode_native_actions(
+                native,
+                dataset=dataset,
+                task=args.task,
+                stats=stats,
+                rotation_scale=args.rotation_scale,
+            )
             chunk = min(args.action_chunk, native.shape[0], args.max_steps - step)
             for offset in range(chunk):
                 before = packet
-                requested = decoded["environment_action"][offset]
+                requested = decoded["environment_action"][offset].copy()
+                raw_gripper_command = float(requested[6])
+                if google_gripper is not None:
+                    requested[6] = google_gripper.command(
+                        bool(decoded["gripper_open_binary"][offset])
+                    )
                 connection.send({"command": "step", "action": requested})
                 if not connection.poll(args.worker_timeout):
                     raise TimeoutError("SimplerEnv worker did not return from env.step")
@@ -727,6 +801,11 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
                     "environment_rotation": decoded["environment_rotation"][offset],
                     "gripper_open_score": decoded["gripper_open_score"][offset],
                     "gripper_open_binary": decoded["gripper_open_binary"][offset],
+                    "raw_environment_gripper_command": raw_gripper_command,
+                    "postprocessed_gripper_command": float(requested[6]),
+                    "google_gripper_sticky_remaining": (
+                        google_gripper.remaining_steps if google_gripper is not None else 0
+                    ),
                     "requested_action": requested,
                     "executed_action": packet["executed_action"],
                     "state_after_7d": packet["state_7d"],
@@ -760,6 +839,8 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
             "steps": step,
             "plans": plan_index,
             "action_chunk": args.action_chunk,
+            "rotation_scale": args.rotation_scale,
+            "google_gripper_sticky_steps": args.google_gripper_sticky_steps,
             "elapsed_seconds": time.perf_counter() - started,
             "video": str(video_path.resolve()),
             "trajectory": str((args.output_dir / "trajectory.jsonl").resolve()),
@@ -788,6 +869,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-steps", type=int, default=80)
     parser.add_argument("--action-chunk", type=int, default=1)
+    parser.add_argument(
+        "--rotation-scale",
+        type=float,
+        default=1.0,
+        help="Multiply decoded rotation commands by this value; 0 disables rotation.",
+    )
+    parser.add_argument(
+        "--google-gripper-sticky-steps",
+        type=int,
+        default=0,
+        help=(
+            "Repeat Google Robot open/close transitions for this many control "
+            "steps. Use 15 to match SimplerEnv's Google Octo post-processing."
+        ),
+    )
     parser.add_argument("--control-frequency", type=float, default=None)
     parser.add_argument("--worker-timeout", type=float, default=120.0)
     parser.add_argument("--renderer-offscreen", action="store_true")
@@ -814,6 +910,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--action-chunk must be positive")
     if args.max_steps <= 0:
         parser.error("--max-steps must be positive")
+    if args.rotation_scale < 0.0:
+        parser.error("--rotation-scale must be non-negative")
+    if args.google_gripper_sticky_steps < 0:
+        parser.error("--google-gripper-sticky-steps must be non-negative")
     return args
 
 

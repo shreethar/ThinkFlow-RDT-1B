@@ -26,7 +26,12 @@ RDT returns `[64, 128]`. The adapter extracts the same ten supervised slots:
 - Fractal's three learned rotation numbers are supplied numerically as its
   axis-angle delta; Bridge Euler XYZ is converted to a true axis-angle vector;
 - RDT gripper-open is thresholded at zero. It is inverted for Google Robot
-  (`+1=close`) and used directly for WidowX (`+1=open`).
+  (`+1=close`) and used directly for WidowX (`+1=open`). For Google Robot,
+  `--google-gripper-sticky-steps N` converts the absolute target into a
+  stateful relative command and holds each transition for `N` controller
+  steps.
+- `--rotation-scale` multiplies the decoded rotation command after conversion;
+  use `0` for the no-rotation ablation or `0.25` for quarter-strength rotation.
 
 Every closed-loop step records raw native output, decoded and executed action,
 TCP state before/after, achieved TCP displacement, joint state, gripper state,
@@ -60,8 +65,9 @@ RDT_REPO=/path/to/RoboticsDiffusionTransformer \
 uv run --no-sync python scripts/evaluate_simpler_b0_oxe.py \
   --mode rollout --task google_robot_pick_coke_can \
   --renderer-offscreen \
-  --action-chunk 10 --max-steps 80 \
-  --output-dir output_2/simpler_b0_oxe/google_coke_chunk10
+  --action-chunk 4 --max-steps 80 \
+  --google-gripper-sticky-steps 15 --rotation-scale 0.25 \
+  --output-dir output_2/simpler_b0_oxe/google_coke_chunk4_sticky15_rot025
 ```
 
 `RDT_REPO` overrides a machine-specific `rdt_repo` path from the YAML when
