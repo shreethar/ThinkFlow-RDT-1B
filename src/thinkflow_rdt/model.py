@@ -625,6 +625,7 @@ class SFTConditionedRDT(nn.Module):
             "gripper_loss_weights",
             "gripper_bce_weight",
             "gripper_bce_logit_scale",
+            "xyz_loss_weight",
             "rotation_geodesic_weight",
             "diffusion_noise",
             "ctrl_freq",
@@ -1099,12 +1100,42 @@ class SFTConditionedRDT(nn.Module):
             sample_gripper_loss * sample_gripper_valid
         ).sum()
         gripper_valid_count = sample_gripper_valid.sum()
+
+        # Unlike the unweighted component diagnostic above, this auxiliary XYZ
+        # objective follows horizon_loss_weights. This lets deployment-relevant
+        # near-term translation commands receive the same temporal emphasis as
+        # the main imitation objective.
+        xyz_objective_valid = objective_valid[..., xyz_start:xyz_stop]
+        sample_xyz_objective_count = xyz_objective_valid.sum(dim=(1, 2))
+        sample_xyz_auxiliary_loss = (
+            (
+                diff[..., xyz_start:xyz_stop].pow(2)
+                * xyz_objective_valid
+            ).sum(dim=(1, 2))
+            / sample_xyz_objective_count.clamp_min(1.0)
+        )
+        xyz_auxiliary_valid = (
+            sample_xyz_objective_count > 0
+        ).to(prediction.dtype)
+        xyz_auxiliary_loss = (
+            sample_xyz_auxiliary_loss * xyz_auxiliary_valid
+        ).sum() / xyz_auxiliary_valid.sum().clamp_min(1.0)
+        xyz_loss_weight = batch.get("xyz_loss_weight")
+        if xyz_loss_weight is None:
+            xyz_loss_weight = prediction.new_tensor(0.0)
+        if xyz_loss_weight.numel() != 1 or not bool(
+            torch.isfinite(xyz_loss_weight).all()
+        ) or bool((xyz_loss_weight < 0).any()):
+            raise ValueError(
+                "xyz_loss_weight must be one finite non-negative scalar"
+            )
         horizon_loss_sum = squared_error.sum(dim=(0, 2))
         horizon_valid_count = valid.sum(dim=(0, 2))
         # The optimization objective is imitation loss: masked MSE between the
         # predicted clean action/target-state chunk and the ground-truth chunk.
-        # Components are diagnostics only and are not separately weighted into
-        # the gradient objective. Ortho6D targets use ordinary residuals.
+        # The unweighted component values above remain diagnostics. Optional
+        # auxiliary objectives below add explicitly configured component terms.
+        # Ortho6D targets use ordinary residuals in imitation loss.
         loss_sum = (sample_imitation_loss * sample_is_valid).sum()
         mae_sum = (sample_mae * sample_is_valid).sum()
         valid_count = sample_is_valid.sum()
@@ -1189,12 +1220,15 @@ class SFTConditionedRDT(nn.Module):
                 )
         total_loss = (
             imitation_loss
+            + xyz_loss_weight * xyz_auxiliary_loss
             + gripper_bce_weight * gripper_bce_loss
             + rotation_geodesic_weight.float() * rotation_geodesic_loss
         )
         result = {
             "loss": total_loss,
             "imitation_loss": imitation_loss.detach(),
+            "xyz_auxiliary_loss": xyz_auxiliary_loss.detach(),
+            "xyz_loss_weight": xyz_loss_weight.detach(),
             "gripper_bce_loss": gripper_bce_loss.detach(),
             "gripper_bce_weight": gripper_bce_weight.detach(),
             "rotation_geodesic_loss": rotation_geodesic_loss.detach(),
@@ -1219,6 +1253,10 @@ class SFTConditionedRDT(nn.Module):
             "sample_target_mae": sample_mae.detach(),
             "sample_is_valid": sample_is_valid.detach(),
             "sample_xyz_loss": sample_xyz_loss.detach(),
+            "sample_xyz_auxiliary_loss": (
+                sample_xyz_auxiliary_loss.detach()
+            ),
+            "sample_xyz_auxiliary_valid": xyz_auxiliary_valid.detach(),
             "sample_xyz_valid": sample_xyz_valid.detach(),
             "sample_rot_loss": sample_rot_loss.detach(),
             "sample_rot_valid": sample_rot_valid.detach(),

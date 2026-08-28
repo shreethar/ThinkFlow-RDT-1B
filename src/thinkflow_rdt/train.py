@@ -835,6 +835,7 @@ def attach_training_objective(
     batch: dict[str, object],
     *,
     horizon_loss_weights: list[float] | None,
+    xyz_loss_weight: float,
     gripper_bce_weight: float,
     gripper_bce_logit_scale: float,
     rotation_geodesic_weight: float,
@@ -845,6 +846,7 @@ def attach_training_objective(
         raise TypeError("batch['actions'] must be a tensor")
     if horizon_loss_weights is not None:
         batch["horizon_loss_weights"] = actions.new_tensor(horizon_loss_weights)
+    batch["xyz_loss_weight"] = actions.new_tensor(xyz_loss_weight)
     batch["gripper_bce_weight"] = actions.new_tensor(gripper_bce_weight)
     batch["gripper_bce_logit_scale"] = actions.new_tensor(
         gripper_bce_logit_scale
@@ -863,6 +865,7 @@ def validate(
     *,
     online_siglip: tuple[SiglipImageProcessor, SiglipVisionModel] | None = None,
     horizon_loss_weights: list[float] | None = None,
+    xyz_loss_weight: float = 0.0,
     gripper_bce_weight: float = 0.0,
     gripper_bce_logit_scale: float = 1.0,
     rotation_geodesic_weight: float = 0.0,
@@ -878,6 +881,7 @@ def validate(
     valid_count = torch.zeros_like(loss_sum)
     xyz_loss_sum = torch.zeros_like(loss_sum)
     xyz_valid_count = torch.zeros_like(loss_sum)
+    xyz_auxiliary_sum = torch.zeros_like(loss_sum)
     rot_loss_sum = torch.zeros_like(loss_sum)
     rot_valid_count = torch.zeros_like(loss_sum)
     gripper_loss_sum = torch.zeros_like(loss_sum)
@@ -1019,6 +1023,7 @@ def validate(
                 attach_training_objective(
                     batch,
                     horizon_loss_weights=horizon_loss_weights,
+                    xyz_loss_weight=xyz_loss_weight,
                     gripper_bce_weight=gripper_bce_weight,
                     gripper_bce_logit_scale=gripper_bce_logit_scale,
                     rotation_geodesic_weight=rotation_geodesic_weight,
@@ -1118,6 +1123,19 @@ def validate(
             )
             xyz_valid_count += accelerator.reduce(
                 metrics["xyz_valid_count"].double(), reduction="sum"
+            )
+            xyz_auxiliary_sum += accelerator.reduce(
+                (
+                    metrics.get(
+                        "sample_xyz_auxiliary_loss",
+                        metrics["sample_xyz_loss"],
+                    ).double()
+                    * metrics.get(
+                        "sample_xyz_auxiliary_valid",
+                        metrics["sample_xyz_valid"],
+                    ).double()
+                ).sum(),
+                reduction="sum",
             )
             rot_loss_sum += accelerator.reduce(
                 metrics["rot_loss_sum"].double(), reduction="sum"
@@ -1694,10 +1712,12 @@ def validate(
     loss_denominator = valid_count.clamp_min(1.0)
     sample_denominator = sample_valid_count.clamp_min(1.0)
     imitation_loss = loss_sum / loss_denominator
+    xyz_auxiliary_loss = xyz_auxiliary_sum / loss_denominator
     gripper_bce_loss = gripper_bce_sum / loss_denominator
     rotation_geodesic_loss = rotation_geodesic_sum / loss_denominator
     total_loss = (
         imitation_loss
+        + float(xyz_loss_weight) * xyz_auxiliary_loss
         + float(gripper_bce_weight) * gripper_bce_loss
         + float(rotation_geodesic_weight) * rotation_geodesic_loss
     )
@@ -1708,6 +1728,12 @@ def validate(
             if valid_count.item() > 0
             else math.nan
         ),
+        "val/xyz_auxiliary_loss": (
+            float(xyz_auxiliary_loss.cpu())
+            if valid_count.item() > 0
+            else math.nan
+        ),
+        "val/xyz_loss_weight": float(xyz_loss_weight),
         "val/gripper_bce_loss": (
             float(gripper_bce_loss.cpu())
             if valid_count.item() > 0
@@ -2035,6 +2061,7 @@ def train(
     stop_after_step: int | None = None,
     horizon_loss_weights: list[float] | None = None,
     mask_noisy_gripper_input: bool | None = None,
+    xyz_loss_weight: float = 0.0,
     gripper_bce_weight: float = 0.0,
     gripper_bce_logit_scale: float = 1.0,
     rotation_geodesic_weight: float = 0.0,
@@ -2116,6 +2143,7 @@ def train(
         tracker_config["training_objective"] = {
             "horizon_loss_weights": horizon_loss_weights,
             "mask_noisy_gripper_input": mask_noisy_gripper_input,
+            "xyz_loss_weight": float(xyz_loss_weight),
             "gripper_bce_weight": float(gripper_bce_weight),
             "gripper_bce_logit_scale": float(gripper_bce_logit_scale),
             "rotation_geodesic_weight": float(rotation_geodesic_weight),
@@ -2138,6 +2166,7 @@ def train(
         if any(not math.isfinite(weight) or weight < 0 for weight in horizon_loss_weights):
             raise ValueError("horizon_loss_weights must be finite and non-negative")
     for name, value, strictly_positive in (
+        ("xyz_loss_weight", xyz_loss_weight, False),
         ("gripper_bce_weight", gripper_bce_weight, False),
         ("gripper_bce_logit_scale", gripper_bce_logit_scale, True),
         ("rotation_geodesic_weight", rotation_geodesic_weight, False),
@@ -2173,6 +2202,7 @@ def train(
     training_objective = {
         "horizon_loss_weights": horizon_loss_weights,
         "mask_noisy_gripper_input": resolved_mask_noisy_gripper_input,
+        "xyz_loss_weight": float(xyz_loss_weight),
         "gripper_bce_weight": float(gripper_bce_weight),
         "gripper_bce_logit_scale": float(gripper_bce_logit_scale),
         "rotation_geodesic_weight": float(rotation_geodesic_weight),
@@ -2260,6 +2290,7 @@ def train(
     global_step = 0
     running_loss = 0.0
     running_imitation_loss = 0.0
+    running_xyz_auxiliary_loss = 0.0
     running_gripper_bce_loss = 0.0
     running_rotation_geodesic_loss = 0.0
     running_mae = 0.0
@@ -2270,6 +2301,7 @@ def train(
     running_steps = 0
     pending_loss = 0.0
     pending_imitation_loss = 0.0
+    pending_xyz_auxiliary_loss = 0.0
     pending_gripper_bce_loss = 0.0
     pending_rotation_geodesic_loss = 0.0
     pending_mae = 0.0
@@ -2312,6 +2344,9 @@ def train(
         running_loss = float(logging_accumulators.get("loss", 0.0))
         running_imitation_loss = float(
             logging_accumulators.get("imitation_loss", 0.0)
+        )
+        running_xyz_auxiliary_loss = float(
+            logging_accumulators.get("xyz_auxiliary_loss", 0.0)
         )
         running_gripper_bce_loss = float(
             logging_accumulators.get("gripper_bce_loss", 0.0)
@@ -2361,6 +2396,7 @@ def train(
             "logging_accumulators": {
                 "loss": running_loss,
                 "imitation_loss": running_imitation_loss,
+                "xyz_auxiliary_loss": running_xyz_auxiliary_loss,
                 "gripper_bce_loss": running_gripper_bce_loss,
                 "rotation_geodesic_loss": running_rotation_geodesic_loss,
                 "mae": running_mae,
@@ -2415,6 +2451,7 @@ def train(
             attach_training_objective(
                 batch,
                 horizon_loss_weights=horizon_loss_weights,
+                xyz_loss_weight=xyz_loss_weight,
                 gripper_bce_weight=gripper_bce_weight,
                 gripper_bce_logit_scale=gripper_bce_logit_scale,
                 rotation_geodesic_weight=rotation_geodesic_weight,
@@ -2516,6 +2553,9 @@ def train(
 
             pending_loss += float(loss.detach())
             pending_imitation_loss += float(metrics["imitation_loss"].detach())
+            pending_xyz_auxiliary_loss += float(
+                metrics["xyz_auxiliary_loss"].detach()
+            )
             pending_gripper_bce_loss += float(
                 metrics["gripper_bce_loss"].detach()
             )
@@ -2539,6 +2579,7 @@ def train(
             if not optimizer_update_succeeded:
                 pending_loss = 0.0
                 pending_imitation_loss = 0.0
+                pending_xyz_auxiliary_loss = 0.0
                 pending_gripper_bce_loss = 0.0
                 pending_rotation_geodesic_loss = 0.0
                 pending_mae = 0.0
@@ -2570,6 +2611,8 @@ def train(
                 [
                     pending_loss / max(pending_microbatches, 1),
                     pending_imitation_loss / max(pending_microbatches, 1),
+                    pending_xyz_auxiliary_loss
+                    / max(pending_microbatches, 1),
                     pending_gripper_bce_loss / max(pending_microbatches, 1),
                     pending_rotation_geodesic_loss
                     / max(pending_microbatches, 1),
@@ -2585,16 +2628,18 @@ def train(
             step_metrics = accelerator.reduce(step_metrics, reduction="mean")
             running_loss += float(step_metrics[0].cpu())
             running_imitation_loss += float(step_metrics[1].cpu())
-            running_gripper_bce_loss += float(step_metrics[2].cpu())
-            running_rotation_geodesic_loss += float(step_metrics[3].cpu())
-            running_mae += float(step_metrics[4].cpu())
-            running_xyz_loss += float(step_metrics[5].cpu())
-            running_rot_loss += float(step_metrics[6].cpu())
-            running_gripper_loss += float(step_metrics[7].cpu())
+            running_xyz_auxiliary_loss += float(step_metrics[2].cpu())
+            running_gripper_bce_loss += float(step_metrics[3].cpu())
+            running_rotation_geodesic_loss += float(step_metrics[4].cpu())
+            running_mae += float(step_metrics[5].cpu())
+            running_xyz_loss += float(step_metrics[6].cpu())
+            running_rot_loss += float(step_metrics[7].cpu())
+            running_gripper_loss += float(step_metrics[8].cpu())
             running_step_time += step_time
             running_steps += 1
             pending_loss = 0.0
             pending_imitation_loss = 0.0
+            pending_xyz_auxiliary_loss = 0.0
             pending_gripper_bce_loss = 0.0
             pending_rotation_geodesic_loss = 0.0
             pending_mae = 0.0
@@ -2614,6 +2659,10 @@ def train(
                     "train/imitation_loss": (
                         running_imitation_loss / max(running_steps, 1)
                     ),
+                    "train/xyz_auxiliary_loss": (
+                        running_xyz_auxiliary_loss / max(running_steps, 1)
+                    ),
+                    "train/xyz_loss_weight": float(xyz_loss_weight),
                     "train/gripper_bce_loss": (
                         running_gripper_bce_loss / max(running_steps, 1)
                     ),
@@ -2662,6 +2711,7 @@ def train(
                     print(training_log_data)
                 running_loss = 0.0
                 running_imitation_loss = 0.0
+                running_xyz_auxiliary_loss = 0.0
                 running_gripper_bce_loss = 0.0
                 running_rotation_geodesic_loss = 0.0
                 running_mae = 0.0
@@ -2729,6 +2779,7 @@ def train(
                     cfg,
                     online_siglip=online_siglip,
                     horizon_loss_weights=horizon_loss_weights,
+                    xyz_loss_weight=xyz_loss_weight,
                     gripper_bce_weight=gripper_bce_weight,
                     gripper_bce_logit_scale=gripper_bce_logit_scale,
                     rotation_geodesic_weight=rotation_geodesic_weight,
