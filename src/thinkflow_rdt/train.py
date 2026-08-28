@@ -572,7 +572,10 @@ def create_optimizer(model: SFTConditionedRDT, cfg: ExperimentConfig):
             parameter_groups.append(
                 {
                     "params": other_parameters,
-                    "lr": learning_rate,
+                    # Full fine-tuning can use a gentler rate for newly
+                    # unfrozen condition/action interfaces while retaining the
+                    # main RDT/Qwen-projector rate.
+                    "lr": cfg.training.learning_rate_interfaces,
                     "weight_decay": cfg.training.weight_decay_interfaces,
                     "name": "interfaces",
                 }
@@ -2241,6 +2244,15 @@ def train(
                 else cfg.model.action_dim
             )
             run.summary["model/qwen_fusion"] = cfg.model.qwen_fusion
+            run.summary["model/state_adaptor_frozen"] = model_report[
+                "state_adaptor_frozen"
+            ]
+            run.summary["model/language_adaptor_frozen"] = model_report[
+                "language_adaptor_frozen"
+            ]
+            run.summary["model/image_adaptor_frozen"] = model_report[
+                "image_adaptor_frozen"
+            ]
             run.summary["model/pretrained_copy_report"] = model_report.get(
                 "pretrained"
             )

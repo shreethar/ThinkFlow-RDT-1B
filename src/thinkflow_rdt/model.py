@@ -549,10 +549,10 @@ class SFTConditionedRDT(nn.Module):
         # These adaptors are outside ``runner.model`` and can be frozen
         # independently of the RDT transformer.
         self.runner.lang_adaptor.to(dtype=dtype).requires_grad_(
-            not cfg.model.freeze_condition_adaptors
+            not cfg.model.resolved_freeze_language_adaptor
         )
         self.runner.img_adaptor.to(dtype=dtype).requires_grad_(
-            not cfg.model.freeze_condition_adaptors
+            not cfg.model.resolved_freeze_image_adaptor
         )
         self.runner.state_adaptor.to(dtype=dtype).requires_grad_(
             not cfg.model.freeze_state_adaptor
@@ -596,6 +596,14 @@ class SFTConditionedRDT(nn.Module):
                 parameter.requires_grad
                 for module in (self.runner.lang_adaptor, self.runner.img_adaptor)
                 for parameter in module.parameters()
+            ),
+            "language_adaptor_frozen": not any(
+                parameter.requires_grad
+                for parameter in self.runner.lang_adaptor.parameters()
+            ),
+            "image_adaptor_frozen": not any(
+                parameter.requires_grad
+                for parameter in self.runner.img_adaptor.parameters()
             ),
             "native_state_encoder": self.use_native_state_encoder,
             "native_action_encoder": self.use_native_action_encoder,

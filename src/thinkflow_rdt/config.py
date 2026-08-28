@@ -46,6 +46,10 @@ class ModelConfig:
     rdt_state_dim: int | None = None
     freeze_state_adaptor: bool = False
     freeze_condition_adaptors: bool = False
+    # Optional per-modality overrides. ``None`` preserves the legacy combined
+    # freeze_condition_adaptors behavior.
+    freeze_language_adaptor: bool | None = None
+    freeze_image_adaptor: bool | None = None
     # ``rdt_eef`` is the legacy compact 7D [xyz, Euler, binary gripper] layout.
     # ``libero_ortho6d`` uses 11D state [xyz, absolute ortho6D, finger0,
     # finger1] and 10D actions [dxyz, relative ortho6D, raw gripper command].
@@ -79,6 +83,22 @@ class ModelConfig:
     @property
     def resolved_cache_action_dim(self) -> int:
         return self.action_dim if self.cache_action_dim is None else self.cache_action_dim
+
+    @property
+    def resolved_freeze_language_adaptor(self) -> bool:
+        return (
+            self.freeze_condition_adaptors
+            if self.freeze_language_adaptor is None
+            else self.freeze_language_adaptor
+        )
+
+    @property
+    def resolved_freeze_image_adaptor(self) -> bool:
+        return (
+            self.freeze_condition_adaptors
+            if self.freeze_image_adaptor is None
+            else self.freeze_image_adaptor
+        )
 
 @dataclass(frozen=True)
 class LoraConfigData:

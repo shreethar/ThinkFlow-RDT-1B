@@ -1505,6 +1505,7 @@ def save_sample_shard(
     image_history_size: int,
     image_jpeg_quality: int,
     save_padded_features: bool,
+    image_codec: str = "png",
 ) -> tuple[int, str]:
     batch_size = int(qwen_kv.shape[0])
     filename = f"shard_{shard_index:09d}.pt"
@@ -1546,6 +1547,7 @@ def save_sample_shard(
         batch,
         image_history_size=image_history_size,
         image_jpeg_quality=image_jpeg_quality,
+        image_codec=image_codec,
     )
     record["image_jpegs"] = image_pool
     record["sample_image_indices"] = sample_image_indices.cpu()
@@ -2339,6 +2341,7 @@ def precompute_split(
                     image_history_size=args.image_history_size,
                     image_jpeg_quality=args.image_jpeg_quality,
                     save_padded_features=args.save_padded_features,
+                    image_codec=args.image_codec,
                 )
                 shard_count += 1
                 progress.set_postfix(
