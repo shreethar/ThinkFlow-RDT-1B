@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate the B0 OXE RDT checkpoint in SimplerEnv.
+"""Evaluate a B0 or B2 OXE RDT checkpoint in SimplerEnv.
 
 The policy and simulator intentionally run in separate processes.  ThinkFlow
 needs Python 3.12 and its PyTorch/Transformers stack, while the official
@@ -46,7 +46,31 @@ DEFAULT_SIMPLER_PYTHON = DEFAULT_SIMPLER_ROOT / ".venv/bin/python"
 DEFAULT_CHECKPOINT = REPO_ROOT / "output_2/checkpoint-20000"
 DEFAULT_CONFIG = REPO_ROOT / "configs/part3_rdt1b.yaml"
 DEFAULT_QWEN = REPO_ROOT / "model/model/stage1_unsloth"
+DEFAULT_B2_STUDENT = REPO_ROOT / "model/LatentStudent-ckpt-400-fixed"
+DEFAULT_B2_CODE_DIR = Path("/home/ubuntu/VLA-FYP/train/stage2")
+B2_TRAJECTORY_PROMPT = (
+    "You are a robot manipulation assistant. Given an observation image and a "
+    "task instruction, predict the end-effector's 2D trajectory as 5 waypoints. "
+    "Output ONLY the coordinate list in this exact format: "
+    "[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]\n\n"
+    "Task: The task is {task}. What is the trajectory that the end effector should take?"
+)
 AF_UNIX_SAFE_PATH_BYTES = 103
+
+
+def resolve_qwen_extraction_mode(
+    requested: str,
+    *,
+    checkpoint: str | Path,
+    config: str | Path,
+) -> str:
+    """Resolve B0/B2 extraction while keeping an explicit override available."""
+    if requested in {"b0", "b2"}:
+        return requested
+    if requested != "auto":
+        raise ValueError(f"Unsupported Qwen extraction mode: {requested!r}")
+    names = f"{Path(checkpoint)} {Path(config)}".lower()
+    return "b2" if "b2" in names else "b0"
 
 
 def jsonable(value: Any) -> Any:
@@ -334,6 +358,11 @@ class PolicyEngine:
         self.args = args
         self.dataset = dataset
         self.instruction = instruction
+        self.qwen_extraction_mode = resolve_qwen_extraction_mode(
+            args.qwen_extraction,
+            checkpoint=args.checkpoint,
+            config=args.config,
+        )
         self.extract_qwen_kv = extract_qwen_kv
         self.extract_siglip_features = extract_siglip_features
         self.standardized_collate_fn = standardized_collate_fn
@@ -341,7 +370,11 @@ class PolicyEngine:
         if self.cfg.model.qwen_fusion == "none":
             raise ValueError("The selected config disables Qwen fusion; this is not B0 evaluation")
 
-        print("Loading frozen T5, Qwen, and SigLIP encoders...", flush=True)
+        print(
+            "Loading frozen T5, "
+            f"Qwen-{self.qwen_extraction_mode.upper()}, and SigLIP encoders...",
+            flush=True,
+        )
         self.t5_tokenizer, self.t5 = load_t5_encoder(
             model_id=args.t5_model_id,
             fallback_model_id=None,
@@ -357,14 +390,40 @@ class PolicyEngine:
             expected_dim=self.cfg.model.lang_token_dim,
             device=t5_device_from_encoder(self.t5, self.device),
         )
-        self.qwen_processor = AutoProcessor.from_pretrained(args.qwen_model_id)
-        self.qwen_processor.tokenizer.padding_side = "left"
-        self.qwen = AutoModelForImageTextToText.from_pretrained(
-            args.qwen_model_id,
-            torch_dtype=torch.bfloat16,
-            device_map=args.device_map,
-            attn_implementation="sdpa",
-        ).eval()
+        self.qwen = None
+        self.latent_student = None
+        self.extract_latent_student_spatial_kv = None
+        if self.qwen_extraction_mode == "b2":
+            from precompute_latent_student_kv import (
+                extract_latent_student_spatial_kv,
+                load_student_and_processor,
+            )
+            from run_precompute_32frame_episode_packs_latent_student_kv import (
+                validate_student_runtime_contract,
+            )
+
+            # The shared precompute validator names this field ``layer_index``.
+            args.layer_index = args.qwen_layer_index
+            self.latent_student, self.qwen_processor = load_student_and_processor(
+                args,
+                self.device,
+            )
+            validate_student_runtime_contract(
+                self.latent_student,
+                self.qwen_processor,
+                args=args,
+                cfg=self.cfg,
+            )
+            self.extract_latent_student_spatial_kv = extract_latent_student_spatial_kv
+        else:
+            self.qwen_processor = AutoProcessor.from_pretrained(args.qwen_model_id)
+            self.qwen_processor.tokenizer.padding_side = "left"
+            self.qwen = AutoModelForImageTextToText.from_pretrained(
+                args.qwen_model_id,
+                torch_dtype=torch.bfloat16,
+                device_map=args.device_map,
+                attn_implementation="sdpa",
+            ).eval()
         self.siglip_processor = SiglipImageProcessor.from_pretrained(args.siglip_model_id)
         self.siglip = SiglipVisionModel.from_pretrained(
             args.siglip_model_id,
@@ -372,7 +431,11 @@ class PolicyEngine:
             device_map=args.device_map,
         ).eval()
 
-        print(f"Loading B0 OXE artifact {args.checkpoint}...", flush=True)
+        print(
+            f"Loading {self.qwen_extraction_mode.upper()} OXE artifact "
+            f"{args.checkpoint}...",
+            flush=True,
+        )
         self.model = SFTConditionedRDT(self.cfg, load_pretrained=True)
         load_trainable_artifact(self.model, args.checkpoint, trainable=False)
         self.model.to(self.device).eval()
@@ -385,7 +448,7 @@ class PolicyEngine:
         state_7d: np.ndarray,
         control_frequency: float,
         seed: int,
-    ) -> tuple[np.ndarray, dict[str, float]]:
+    ) -> tuple[np.ndarray, dict[str, float | str]]:
         torch = self.torch
         started = time.perf_counter()
         sample = build_policy_sample(
@@ -409,17 +472,43 @@ class PolicyEngine:
             raise RuntimeError("The SimplerEnv observation did not contain a valid image")
 
         qwen_started = time.perf_counter()
-        qwen_kv = self.extract_qwen_kv(
-            encoded,
-            self.qwen_processor,
-            self.qwen,
-            device=self.device,
-            layer_index=self.args.qwen_layer_index,
-            max_new_tokens=self.args.qwen_max_new_tokens,
-            expected_dim=self.cfg.model.qwen_kv_dim,
-            stop_at_think_end=True,
-            enable_thinking=False,
+        if self.qwen_extraction_mode == "b2":
+            assert self.extract_latent_student_spatial_kv is not None
+            assert self.latent_student is not None
+            qwen_kv, _latent_waypoints = self.extract_latent_student_spatial_kv(
+                encoded,
+                student=self.latent_student,
+                processor=self.qwen_processor,
+                device=self.device,
+                layer_index=self.args.qwen_layer_index,
+                expected_dim=self.cfg.model.qwen_kv_dim,
+                spatial_token_count=self.args.spatial_token_count,
+                prompt_template=self.args.b2_prompt_template,
+            )
+        else:
+            assert self.qwen is not None
+            qwen_kv = self.extract_qwen_kv(
+                encoded,
+                self.qwen_processor,
+                self.qwen,
+                device=self.device,
+                layer_index=self.args.qwen_layer_index,
+                max_new_tokens=self.args.qwen_max_new_tokens,
+                expected_dim=self.cfg.model.qwen_kv_dim,
+                stop_at_think_end=True,
+                enable_thinking=False,
+            )
+        expected_qwen_tokens = 5 if self.qwen_extraction_mode == "b2" else 1
+        expected_qwen_shape = (
+            1,
+            expected_qwen_tokens,
+            self.cfg.model.qwen_kv_dim,
         )
+        if tuple(qwen_kv.shape) != expected_qwen_shape:
+            raise ValueError(
+                f"{self.qwen_extraction_mode.upper()} extraction returned "
+                f"{tuple(qwen_kv.shape)}, expected {expected_qwen_shape}"
+            )
         qwen_seconds = time.perf_counter() - qwen_started
         siglip_started = time.perf_counter()
         img_tokens, img_mask = self.extract_siglip_features(
@@ -461,6 +550,7 @@ class PolicyEngine:
             "rdt_diffusion_seconds": rdt_seconds,
             "total_policy_seconds": time.perf_counter() - started,
             "qwen_tokens": float(qwen_kv.shape[1]),
+            "qwen_extraction_mode": self.qwen_extraction_mode,
         }
 
 
@@ -841,6 +931,7 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
             "action_chunk": args.action_chunk,
             "rotation_scale": args.rotation_scale,
             "google_gripper_sticky_steps": args.google_gripper_sticky_steps,
+            "qwen_extraction_mode": engine.qwen_extraction_mode,
             "elapsed_seconds": time.perf_counter() - started,
             "video": str(video_path.resolve()),
             "trajectory": str((args.output_dir / "trajectory.jsonl").resolve()),
@@ -889,9 +980,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--renderer-offscreen", action="store_true")
     parser.add_argument("--video-fps", type=int, default=10)
     parser.add_argument("--device-map", default="auto")
+    parser.add_argument(
+        "--qwen-extraction",
+        choices=("auto", "b0", "b2"),
+        default="auto",
+        help=(
+            "Select one </think> KV token (B0) or the LatentStudent five-spatial-"
+            "token KV path (B2). Auto selects B2 when the checkpoint/config path "
+            "contains 'b2'."
+        ),
+    )
     parser.add_argument("--qwen-model-id", default=str(DEFAULT_QWEN))
     parser.add_argument("--qwen-layer-index", type=int, default=7)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
+    parser.add_argument("--student-model-id", default=str(DEFAULT_B2_STUDENT))
+    parser.add_argument("--processor-id", default=str(DEFAULT_QWEN))
+    parser.add_argument(
+        "--latent-student-code-dir",
+        type=Path,
+        default=DEFAULT_B2_CODE_DIR,
+    )
+    parser.add_argument("--spatial-parameters-path", type=Path, default=None)
+    parser.add_argument("--latent-count", type=int, default=6)
+    parser.add_argument("--spatial-token-count", type=int, default=5)
+    parser.add_argument(
+        "--attn-implementation",
+        choices=("eager", "sdpa", "flash_attention_2"),
+        default="sdpa",
+    )
+    parser.add_argument(
+        "--student-precision",
+        choices=("auto", "bf16", "fp16", "fp32"),
+        default="bf16",
+    )
+    parser.add_argument("--b2-prompt-template", default=B2_TRAJECTORY_PROMPT)
     parser.add_argument("--siglip-model-id", default="google/siglip-so400m-patch14-384")
     parser.add_argument("--t5-model-id", default="google/t5-v1_1-xxl")
     parser.add_argument("--t5-precision", choices=("bf16", "8bit"), default="bf16")
@@ -904,6 +1026,15 @@ def parse_args() -> argparse.Namespace:
         default=[0.35, 0.0, 0.30, 0.0, 0.0, 0.0, 0.0],
     )
     args = parser.parse_args()
+    args.checkpoint = args.checkpoint.expanduser().resolve()
+    args.config = args.config.expanduser().resolve()
+    args.latent_student_code_dir = args.latent_student_code_dir.expanduser().resolve()
+    if args.spatial_parameters_path is not None:
+        args.spatial_parameters_path = args.spatial_parameters_path.expanduser().resolve()
+    for name in ("student_model_id", "processor_id"):
+        value = Path(getattr(args, name)).expanduser()
+        if value.exists():
+            setattr(args, name, str(value.resolve()))
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.action_chunk <= 0:
@@ -914,6 +1045,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--rotation-scale must be non-negative")
     if args.google_gripper_sticky_steps < 0:
         parser.error("--google-gripper-sticky-steps must be non-negative")
+    if args.latent_count <= 0:
+        parser.error("--latent-count must be positive")
+    if args.spatial_token_count != 5:
+        parser.error("B2 rollout requires --spatial-token-count 5")
+    if "{task}" not in args.b2_prompt_template:
+        parser.error("--b2-prompt-template must contain {task}")
     return args
 
 

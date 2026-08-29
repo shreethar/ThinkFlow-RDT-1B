@@ -108,3 +108,30 @@ supported and Vulkan device creation fails with `ErrorExtensionNotPresent`.
 The evaluator intentionally initializes the environment before loading the
 large policy stack, so this failure is fast and saved to
 `environment_error.json` and `simpler_worker.log`.
+
+## B2 five-spatial-token rollout
+
+B2 rollout uses the same LatentStudent procedure as feature precomputation:
+six latent reasoning iterations are followed by `</think>` and five learned
+spatial tokens, then layer-7 K/V for those five tokens is flattened to
+`[5, 2048]`. It therefore requires the LatentStudent checkpoint, its stage-2
+Python implementation, and the original Qwen processor—not merely the base
+Qwen model.
+
+```bash
+RDT_REPO=/workspace/RoboticsDiffusionTransformer \
+uv run --no-sync python scripts/evaluate_simpler_b0_oxe.py \
+  --mode rollout --task google_robot_pick_coke_can \
+  --renderer-offscreen --qwen-extraction b2 \
+  --checkpoint output_2/fractal_b2_from_oxe5k_native128_full_10k/checkpoint-5000 \
+  --config configs/fractal_b2_from_oxe5k_native128_full.yaml \
+  --student-model-id model/LatentStudent-ckpt-400-fixed \
+  --processor-id model/model/stage1_unsloth \
+  --latent-student-code-dir /workspace/VLA-FYP/train/stage2 \
+  --qwen-layer-index 7 --latent-count 6 --spatial-token-count 5 \
+  --action-chunk 4 --max-steps 80 \
+  --google-gripper-sticky-steps 15 --rotation-scale 0.25 \
+  --simpler-root /workspace/SimplerEnv \
+  --simpler-python /workspace/SimplerEnv/.venv/bin/python \
+  --output-dir output_2/simpler_b2_fractal/google_coke_seed42_chunk4
+```

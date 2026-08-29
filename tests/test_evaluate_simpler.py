@@ -9,8 +9,27 @@ from scripts.evaluate_simpler_b0_oxe import (
     ActionStats,
     GoogleGripperTargetAdapter,
     decode_native_actions,
+    resolve_qwen_extraction_mode,
     worker_socket_path,
 )
+
+
+def test_qwen_extraction_mode_auto_detects_b2_artifacts() -> None:
+    assert resolve_qwen_extraction_mode(
+        "auto",
+        checkpoint="output_2/fractal_b2/checkpoint-5000",
+        config="configs/part3_rdt1b.yaml",
+    ) == "b2"
+    assert resolve_qwen_extraction_mode(
+        "auto",
+        checkpoint="output_2/b0/checkpoint-20000",
+        config="configs/part3_rdt1b.yaml",
+    ) == "b0"
+    assert resolve_qwen_extraction_mode(
+        "b2",
+        checkpoint="arbitrary",
+        config="arbitrary",
+    ) == "b2"
 
 
 def test_worker_socket_path_stays_below_linux_limit(monkeypatch, tmp_path):
