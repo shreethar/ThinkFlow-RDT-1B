@@ -39,6 +39,33 @@ object poses, reward, termination, simulator info, and policy timings.
 
 ## Commands
 
+### One-line native-Linux setup
+
+From the ThinkFlow repository root, run:
+
+```bash
+bash scripts/setup_simpler_env_native_linux.sh
+```
+
+The script installs Ubuntu Vulkan/EGL prerequisites, verifies the NVIDIA
+driver, synchronizes ThinkFlow from `uv.lock`, checks out a known-good
+SimplerEnv revision with submodules and LFS assets, creates a separate Python
+3.11 simulator environment, pins NumPy/SAPIEN-compatible dependencies, and
+runs import, action-contract, Vulkan, and headless-render checks. It is
+idempotent and does not mix SimplerEnv packages into ThinkFlow's `.venv`.
+
+Common overrides include:
+
+```bash
+SIMPLER_ROOT=/workspace/SimplerEnv \
+THINKFLOW_ROOT=/workspace/ThinkFlow-RDT-1B \
+bash scripts/setup_simpler_env_native_linux.sh
+```
+
+Set `SKIP_SYSTEM_PACKAGES=1` only when the system dependencies are already
+installed, or `SKIP_RENDER_TEST=1` when preparing an image on a machine that
+does not currently expose the final NVIDIA/Vulkan device.
+
 Run the deterministic conversion tests:
 
 ```bash
