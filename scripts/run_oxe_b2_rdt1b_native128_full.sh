@@ -4,16 +4,29 @@ set -euo pipefail
 # Full Fast-ThinkAct B2 post-training from cached five-spatial-token Qwen KV.
 # B2_CACHE_ROOT must contain train/ and validation/ episode-pack directories.
 
-CONFIG=${CONFIG:-configs/part3_rdt1b.yaml}
+CONFIG=${CONFIG:-configs/oxe_b2_rdt1b_native128_full.yaml}
 B2_CACHE_ROOT=${B2_CACHE_ROOT:-cache_features}
-OUTPUT_DIR=${OUTPUT_DIR:-output_2/b2_oxe_native128_full}
+OUTPUT_DIR=${OUTPUT_DIR:-output_2/b2_oxe_native128_full_state_qwen_crosskv}
 SIGLIP_MODEL_ID=${SIGLIP_MODEL_ID:-/home/ubuntu/models/siglip-so400m-patch14-384}
 SIGLIP_FALLBACK_MODEL_ID=${SIGLIP_FALLBACK_MODEL_ID:-google/siglip-so400m-patch14-384}
 WANDB_PROJECT=${WANDB_PROJECT:-"ThinkLite B2 OXE"}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-oxe-b2-rdt1b-native128-fastthinkact-full}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-oxe-b2-state-qwen-crosskv-rdt1b-full-20k}
 WANDB_ENTITY=${WANDB_ENTITY:-}
 RESUME_FROM=${RESUME_FROM:-}
 SKIP_CACHE_PREFLIGHT=${SKIP_CACHE_PREFLIGHT:-0}
+PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0}
+MAX_STEPS=${MAX_STEPS:-20000}
+LEARNING_RATE=${LEARNING_RATE:-1e-4}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-8}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
+VALIDATE_EVERY=${VALIDATE_EVERY:-500}
+VALIDATION_BATCH_SIZE=${VALIDATION_BATCH_SIZE:-32}
+VALIDATION_SAMPLES=${VALIDATION_SAMPLES:-256}
+SAVE_EVERY=${SAVE_EVERY:-1000}
+QUALITATIVE_VALIDATION_EXAMPLES=${QUALITATIVE_VALIDATION_EXAMPLES:-32}
+NUM_WORKERS=${NUM_WORKERS:-4}
+QWEN_FUSION_LOSS_WEIGHT=${QWEN_FUSION_LOSS_WEIGHT:-0.5}
+QWEN_FUSION_LOSS_MARGIN=${QWEN_FUSION_LOSS_MARGIN:-0.002}
 
 resolve_split_manifest() {
   local split_name=$1
@@ -133,6 +146,11 @@ inspect_manifest(sys.argv[2])
 PY
 fi
 
+if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
+  echo "B2 cache preflight completed; PREFLIGHT_ONLY=1, so training will not start."
+  exit 0
+fi
+
 if [[ -n "$WANDB_ENTITY" ]]; then
   export WANDB_ENTITY
 fi
@@ -151,17 +169,21 @@ uv run --no-sync python scripts/train_b0_cached_features.py \
   --online-siglip \
   --siglip-model-id "$SIGLIP_MODEL_ID" \
   --siglip-fallback-model-id "$SIGLIP_FALLBACK_MODEL_ID" \
-  --learning-rate 1e-4 \
-  --max-steps 20000 \
-  --micro-batch-size 8 \
-  --gradient-accumulation-steps 4 \
-  --global-batch-size 32 \
-  --validate-every 500 \
-  --validation-batch-size 32 \
-  --validation-samples 256 \
-  --save-every 1000 \
+  --learning-rate "$LEARNING_RATE" \
+  --max-steps "$MAX_STEPS" \
+  --micro-batch-size "$MICRO_BATCH_SIZE" \
+  --global-batch-size "$GLOBAL_BATCH_SIZE" \
+  --validate-every "$VALIDATE_EVERY" \
+  --validation-batch-size "$VALIDATION_BATCH_SIZE" \
+  --validation-samples "$VALIDATION_SAMPLES" \
+  --save-every "$SAVE_EVERY" \
   --sample-validation-batches 1 \
-  --qualitative-validation-examples 32 \
+  --qualitative-validation-examples "$QUALITATIVE_VALIDATION_EXAMPLES" \
+  --num-workers "$NUM_WORKERS" \
+  --pin-memory \
+  --persistent-workers \
+  --qwen-fusion-loss-weight "$QWEN_FUSION_LOSS_WEIGHT" \
+  --qwen-fusion-loss-margin "$QWEN_FUSION_LOSS_MARGIN" \
   --skip-nonfinite-updates \
   --log-gradient-stats \
   --report-to wandb \
