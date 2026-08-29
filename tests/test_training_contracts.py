@@ -1,14 +1,36 @@
+import io
 from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 
 from thinkflow_rdt.train import (
     _binary_transition_events,
     _match_binary_transition_events,
+    _validation_observation_grid,
     resolve_validation_batch_limit,
     validate,
 )
+
+
+def _jpeg(rgb: tuple[int, int, int]) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 3), rgb).save(buffer, format="JPEG", quality=100)
+    return buffer.getvalue()
+
+
+def test_validation_observation_grid_uses_only_valid_image_slots() -> None:
+    placeholders = [_jpeg((0, 0, 0)) for _ in range(3)]
+    actual = _jpeg((200, 50, 25))
+    grid = _validation_observation_grid(
+        [*placeholders, actual, _jpeg((0, 0, 0)), _jpeg((0, 0, 0))],
+        torch.tensor([False, False, False, True, False, False]),
+    )
+    assert grid is not None
+    pixel = grid.getpixel((0, 0))
+    assert pixel[0] > 150
+    assert pixel[1] < 100
 
 
 def _config(*, validation_samples: int | None, validation_batches: int = 17):

@@ -45,8 +45,16 @@ LIBERO_SUITE_IDS = (
     "libero_10",
     "libero_90",
 )
+LIBERO_RECOVERY_SUITE_IDS = (
+    "libero_spatial_recovery",
+    "libero_object_recovery",
+    "libero_goal_recovery",
+    "libero_10_recovery",
+)
 OXE_DATASET_IDS = ("bc_z", "bridge", "droid", "fractal", "kuka")
-VALIDATION_DATASET_IDS = LIBERO_SUITE_IDS + OXE_DATASET_IDS
+VALIDATION_DATASET_IDS = (
+    LIBERO_SUITE_IDS + LIBERO_RECOVERY_SUITE_IDS + OXE_DATASET_IDS
+)
 
 LIBERO_RAW_ACTION_NAMES = (
     "dx",
@@ -173,8 +181,20 @@ def _add_binary_confusion_metrics(
     result[f"{prefix}/tn"] = float(tn.cpu())
 
 
-def _validation_observation_grid(payloads: list[bytes]) -> Image.Image | None:
-    images = [decode_cached_image(payload) for payload in payloads[:3]]
+def _validation_observation_grid(
+    payloads: list[bytes],
+    slot_mask: torch.Tensor | list[bool] | None = None,
+) -> Image.Image | None:
+    if slot_mask is None:
+        selected = payloads[:3]
+    else:
+        mask = torch.as_tensor(slot_mask, dtype=torch.bool).flatten().tolist()
+        selected = [
+            payload
+            for payload, valid in zip(payloads, mask, strict=False)
+            if valid
+        ][:3]
+    images = [decode_cached_image(payload) for payload in selected]
     if not images:
         return None
     height = max(image.height for image in images)
@@ -525,6 +545,71 @@ def add_online_siglip_features(
     return batch
 
 
+@torch.no_grad()
+def verify_online_siglip_conditioning(
+    dataloader: DataLoader,
+    *,
+    processor: SiglipImageProcessor,
+    encoder: SiglipVisionModel,
+    cfg: ExperimentConfig,
+    device: torch.device,
+    examples: int = 8,
+) -> dict[str, float]:
+    """Fail fast if cached observations do not become usable SigLIP tokens."""
+    dataset = dataloader.dataset
+    collate_fn = dataloader.collate_fn
+    if collate_fn is None or len(dataset) == 0:
+        raise RuntimeError("Cannot verify online SigLIP with an empty dataloader")
+    count = min(int(examples), len(dataset))
+    batch = collate_fn([dataset[index] for index in range(count)])
+    raw_mask = batch.get("image_slot_mask")
+    if not isinstance(raw_mask, torch.Tensor) or raw_mask.ndim != 2:
+        raise RuntimeError("Online SigLIP batch is missing a 2-D image_slot_mask")
+    valid_slots = raw_mask.bool().sum(dim=1)
+    if bool((valid_slots == 0).any()):
+        bad = torch.nonzero(valid_slots == 0, as_tuple=False).flatten().tolist()
+        raise RuntimeError(
+            f"Online SigLIP preflight found samples without observations: {bad}"
+        )
+    batch = add_online_siglip_features(
+        batch,
+        processor=processor,
+        encoder=encoder,
+        cfg=cfg,
+        device=device,
+    )
+    tokens = batch.get("img_tokens")
+    token_mask = batch.get("img_mask")
+    if not isinstance(tokens, torch.Tensor) or not isinstance(token_mask, torch.Tensor):
+        raise RuntimeError("Online SigLIP did not produce img_tokens and img_mask")
+    if tuple(tokens.shape[:2]) != tuple(token_mask.shape):
+        raise RuntimeError(
+            "Online SigLIP token/mask shape mismatch: "
+            f"{tuple(tokens.shape)} vs {tuple(token_mask.shape)}"
+        )
+    if bool((token_mask.bool().sum(dim=1) == 0).any()):
+        raise RuntimeError("Online SigLIP produced no valid image tokens")
+    valid_tokens = tokens[token_mask.bool()]
+    if not bool(torch.isfinite(valid_tokens.float()).all()):
+        raise RuntimeError("Online SigLIP produced non-finite image tokens")
+    mean_abs = float(valid_tokens.float().abs().mean().cpu())
+    std = float(valid_tokens.float().std().cpu())
+    if mean_abs <= 1e-8 or std <= 1e-8:
+        raise RuntimeError(
+            "Online SigLIP produced degenerate image tokens: "
+            f"mean_abs={mean_abs}, std={std}"
+        )
+    diagnostics = {
+        "examples": float(count),
+        "valid_image_slots": float(valid_slots.sum().item()),
+        "valid_image_tokens": float(token_mask.bool().sum().item()),
+        "token_mean_abs": mean_abs,
+        "token_std": std,
+    }
+    print(f"Online SigLIP conditioning verified: {diagnostics}")
+    return diagnostics
+
+
 def create_optimizer(model: SFTConditionedRDT, cfg: ExperimentConfig):
     if cfg.model.freeze_state_adaptor and any(
         parameter.requires_grad
@@ -842,6 +927,8 @@ def attach_training_objective(
     gripper_bce_weight: float,
     gripper_bce_logit_scale: float,
     rotation_geodesic_weight: float,
+    qwen_fusion_loss_weight: float = 0.0,
+    qwen_fusion_loss_margin: float = 0.0,
 ) -> None:
     """Attach device/dtype-correct loss controls to a collated batch."""
     actions = batch["actions"]
@@ -856,6 +943,12 @@ def attach_training_objective(
     )
     batch["rotation_geodesic_weight"] = actions.new_tensor(
         rotation_geodesic_weight
+    )
+    batch["qwen_fusion_loss_weight"] = actions.new_tensor(
+        qwen_fusion_loss_weight
+    )
+    batch["qwen_fusion_loss_margin"] = actions.new_tensor(
+        qwen_fusion_loss_margin
     )
 
 
@@ -956,6 +1049,14 @@ def validate(
     qwen_ablation_prediction_delta_count = torch.zeros_like(
         qwen_ablation_loss_sum
     )
+    image_reference_loss_sum = torch.zeros_like(loss_sum)
+    image_reference_valid_count = torch.zeros_like(loss_sum)
+    image_zero_loss_sum = torch.zeros_like(loss_sum)
+    image_zero_valid_count = torch.zeros_like(loss_sum)
+    image_zero_sample_error_sum = torch.zeros_like(loss_sum)
+    image_zero_sample_valid_count = torch.zeros_like(loss_sum)
+    image_zero_prediction_delta_squared_error = torch.zeros_like(loss_sum)
+    image_zero_prediction_delta_count = torch.zeros_like(loss_sum)
     # Per decoded dimension: sum(pred), sum(target), sum(pred^2),
     # sum(target^2), sum(pred*target), count.
     sampled_dimension_stats = torch.zeros(
@@ -1037,10 +1138,16 @@ def validate(
                 and isinstance(batch.get("qwen_kv"), torch.Tensor)
                 and isinstance(batch.get("actions"), torch.Tensor)
             )
+            run_image_ablation = (
+                index < cfg.training.sample_validation_batches
+                and isinstance(batch.get("img_tokens"), torch.Tensor)
+                and isinstance(batch.get("img_mask"), torch.Tensor)
+                and isinstance(batch.get("actions"), torch.Tensor)
+            )
             qwen_ablation_batches: list[dict[str, object]] = []
-            if run_qwen_ablation:
+            if run_qwen_ablation or run_image_ablation:
                 # Pin the one-step denoising inputs so the reference, zeroed,
-                # and shuffled conditions differ only in their Qwen KV.
+                # and shuffled conditions differ only in the ablated modality.
                 batch = dict(batch)
                 actions = batch["actions"]
                 assert isinstance(actions, torch.Tensor)
@@ -1052,6 +1159,7 @@ def validate(
                     device=actions.device,
                     dtype=torch.long,
                 )
+            if run_qwen_ablation:
                 qwen_kv = batch["qwen_kv"]
                 assert isinstance(qwen_kv, torch.Tensor)
                 zero_batch = dict(batch)
@@ -1059,6 +1167,14 @@ def validate(
                 shuffled_batch = dict(batch)
                 shuffled_batch["qwen_kv"] = qwen_kv.roll(1, dims=0)
                 qwen_ablation_batches = [zero_batch, shuffled_batch]
+            image_zero_batch: dict[str, object] | None = None
+            if run_image_ablation:
+                image_tokens = batch["img_tokens"]
+                assert isinstance(image_tokens, torch.Tensor)
+                image_zero_batch = dict(batch)
+                # Keep the mask unchanged so this isolates visual content from
+                # the number/position of condition tokens.
+                image_zero_batch["img_tokens"] = torch.zeros_like(image_tokens)
             metrics = model(batch)
             if run_qwen_ablation:
                 qwen_reference_loss_sum += metrics["loss_sum"].double()
@@ -1073,6 +1189,12 @@ def validate(
                     qwen_ablation_valid_count[ablation_index] += (
                         ablation_metrics["valid_count"].double()
                     )
+            if image_zero_batch is not None:
+                image_reference_loss_sum += metrics["loss_sum"].double()
+                image_reference_valid_count += metrics["valid_count"].double()
+                image_zero_metrics = model(image_zero_batch)
+                image_zero_loss_sum += image_zero_metrics["loss_sum"].double()
+                image_zero_valid_count += image_zero_metrics["valid_count"].double()
             dataset_ids = list(batch.get("dataset_id", []))
             if len(dataset_ids) != int(metrics["sample_is_valid"].shape[0]):
                 raise ValueError(
@@ -1194,6 +1316,15 @@ def validate(
                         qwen_ablation_predictions.append(
                             model(ablation_batch, sample=True)
                         )
+                image_zero_prediction: torch.Tensor | None = None
+                if image_zero_batch is not None:
+                    torch.random.set_rng_state(cpu_rng_state)
+                    if cuda_rng_state is not None:
+                        torch.cuda.set_rng_state(
+                            cuda_rng_state,
+                            device=accelerator.device,
+                        )
+                    image_zero_prediction = model(image_zero_batch, sample=True)
                 target = batch["actions"].to(
                     device=prediction.device,
                     dtype=prediction.dtype,
@@ -1259,6 +1390,28 @@ def validate(
                     qwen_ablation_sample_valid_count[ablation_index] += (
                         per_sample_valid.sum().double()
                     )
+                if image_zero_prediction is not None:
+                    image_zero_diff = image_zero_prediction - target
+                    if action_encoder_layout == "rdt_eef":
+                        image_zero_diff = torch.cat(
+                            [
+                                image_zero_diff[..., :3],
+                                torch.atan2(
+                                    torch.sin(image_zero_diff[..., 3:6]),
+                                    torch.cos(image_zero_diff[..., 3:6]),
+                                ),
+                                image_zero_diff[..., 6:],
+                            ],
+                            dim=-1,
+                        )
+                    image_zero_per_sample_error = (
+                        (image_zero_diff.pow(2) * valid).sum(dim=(1, 2))
+                        / per_sample_count.clamp_min(1.0)
+                    )
+                    image_zero_sample_error_sum += (
+                        image_zero_per_sample_error * per_sample_valid
+                    ).sum().double()
+                    image_zero_sample_valid_count += per_sample_valid.sum().double()
                 if action_encoder_layout == "rdt_native_128":
                     prediction_10d = native_rdt_action_to_10d(prediction)
                     target_10d = native_rdt_action_to_10d(target)
@@ -1424,6 +1577,22 @@ def validate(
                             qwen_ablation_native10_count[
                                 ablation_index, horizon_slot
                             ] += horizon_valid.sum().double() * 10
+                    if image_zero_prediction is not None:
+                        image_zero_prediction_10d = native_rdt_action_to_10d(
+                            image_zero_prediction
+                        )
+                        image_prediction_delta = (
+                            image_zero_prediction_10d - prediction_10d
+                        )
+                        image_zero_prediction_delta_squared_error += (
+                            image_prediction_delta.square()
+                            * raw_time_mask.unsqueeze(-1).to(
+                                image_prediction_delta.dtype
+                            )
+                        ).sum().double()
+                        image_zero_prediction_delta_count += (
+                            raw_time_mask.sum().double() * 10
+                        )
 
                     if (
                         accelerator.is_main_process
@@ -1440,7 +1609,17 @@ def validate(
                         )
                         for row in range(min(prediction.shape[0], remaining)):
                             payloads = list(batch.get("image_slot_jpegs", [[]])[row])
-                            observation = _validation_observation_grid(payloads)
+                            slot_masks = batch.get("image_slot_mask")
+                            slot_mask = (
+                                slot_masks[row]
+                                if isinstance(slot_masks, (torch.Tensor, list, tuple))
+                                and len(slot_masks) > row
+                                else None
+                            )
+                            observation = _validation_observation_grid(
+                                payloads,
+                                slot_mask,
+                            )
                             figure = _trajectory_comparison_figure(
                                 prediction[row],
                                 target[row],
@@ -1697,6 +1876,30 @@ def validate(
     qwen_ablation_prediction_delta_count = accelerator.reduce(
         qwen_ablation_prediction_delta_count, reduction="sum"
     )
+    image_reference_loss_sum = accelerator.reduce(
+        image_reference_loss_sum, reduction="sum"
+    )
+    image_reference_valid_count = accelerator.reduce(
+        image_reference_valid_count, reduction="sum"
+    )
+    image_zero_loss_sum = accelerator.reduce(
+        image_zero_loss_sum, reduction="sum"
+    )
+    image_zero_valid_count = accelerator.reduce(
+        image_zero_valid_count, reduction="sum"
+    )
+    image_zero_sample_error_sum = accelerator.reduce(
+        image_zero_sample_error_sum, reduction="sum"
+    )
+    image_zero_sample_valid_count = accelerator.reduce(
+        image_zero_sample_valid_count, reduction="sum"
+    )
+    image_zero_prediction_delta_squared_error = accelerator.reduce(
+        image_zero_prediction_delta_squared_error, reduction="sum"
+    )
+    image_zero_prediction_delta_count = accelerator.reduce(
+        image_zero_prediction_delta_count, reduction="sum"
+    )
     sampled_dimension_stats = accelerator.reduce(
         sampled_dimension_stats, reduction="sum"
     )
@@ -1809,6 +2012,37 @@ def validate(
                     ].clamp_min(1.0)
                 ).cpu()
             )
+    if image_reference_valid_count.item() > 0:
+        image_reference_loss = image_reference_loss_sum / (
+            image_reference_valid_count.clamp_min(1.0)
+        )
+        image_zero_loss = image_zero_loss_sum / (
+            image_zero_valid_count.clamp_min(1.0)
+        )
+        image_zero_sample_mse = image_zero_sample_error_sum / (
+            image_zero_sample_valid_count.clamp_min(1.0)
+        )
+        result["val/image_ablation/reference/denoising_loss"] = float(
+            image_reference_loss.cpu()
+        )
+        result["val/image_ablation/zero/denoising_loss"] = float(
+            image_zero_loss.cpu()
+        )
+        result["val/image_ablation/zero/denoising_loss_delta"] = float(
+            (image_zero_loss - image_reference_loss).cpu()
+        )
+        result["val/image_ablation/zero/sample_mse"] = float(
+            image_zero_sample_mse.cpu()
+        )
+        result["val/image_ablation/zero/sample_mse_delta"] = float(
+            image_zero_sample_mse - result["val/sample_mse"]
+        )
+        result["val/image_ablation/zero/prediction_delta_rmse_native10"] = float(
+            torch.sqrt(
+                image_zero_prediction_delta_squared_error
+                / image_zero_prediction_delta_count.clamp_min(1.0)
+            ).cpu()
+        )
     if action_encoder_layout == "rdt_native_128":
         for slot, horizon in enumerate(sampled_horizons):
             horizon_prefix = f"val/sampled_native10/horizon_{horizon}"
@@ -2068,6 +2302,8 @@ def train(
     gripper_bce_weight: float = 0.0,
     gripper_bce_logit_scale: float = 1.0,
     rotation_geodesic_weight: float = 0.0,
+    qwen_fusion_loss_weight: float = 0.0,
+    qwen_fusion_loss_margin: float = 0.0,
 ) -> None:
     if init_artifact is not None and resume_from is not None:
         raise ValueError(
@@ -2150,6 +2386,8 @@ def train(
             "gripper_bce_weight": float(gripper_bce_weight),
             "gripper_bce_logit_scale": float(gripper_bce_logit_scale),
             "rotation_geodesic_weight": float(rotation_geodesic_weight),
+            "qwen_fusion_loss_weight": float(qwen_fusion_loss_weight),
+            "qwen_fusion_loss_margin": float(qwen_fusion_loss_margin),
         }
         if report_to.lower() == "tensorboard":
             tracker_config = _tensorboard_hparams(tracker_config)
@@ -2173,6 +2411,8 @@ def train(
         ("gripper_bce_weight", gripper_bce_weight, False),
         ("gripper_bce_logit_scale", gripper_bce_logit_scale, True),
         ("rotation_geodesic_weight", rotation_geodesic_weight, False),
+        ("qwen_fusion_loss_weight", qwen_fusion_loss_weight, False),
+        ("qwen_fusion_loss_margin", qwen_fusion_loss_margin, False),
     ):
         if not math.isfinite(value) or (value <= 0 if strictly_positive else value < 0):
             qualifier = "positive" if strictly_positive else "non-negative"
@@ -2209,12 +2449,21 @@ def train(
         "gripper_bce_weight": float(gripper_bce_weight),
         "gripper_bce_logit_scale": float(gripper_bce_logit_scale),
         "rotation_geodesic_weight": float(rotation_geodesic_weight),
+        "qwen_fusion_loss_weight": float(qwen_fusion_loss_weight),
+        "qwen_fusion_loss_margin": float(qwen_fusion_loss_margin),
     }
     online_siglip = None
     if use_online_siglip:
         online_siglip = load_online_siglip(
             model_id=online_siglip_model_id,
             fallback_model_id=online_siglip_fallback_model_id,
+            cfg=cfg,
+            device=accelerator.device,
+        )
+        verify_online_siglip_conditioning(
+            val_loader,
+            processor=online_siglip[0],
+            encoder=online_siglip[1],
             cfg=cfg,
             device=accelerator.device,
         )
@@ -2305,6 +2554,9 @@ def train(
     running_xyz_auxiliary_loss = 0.0
     running_gripper_bce_loss = 0.0
     running_rotation_geodesic_loss = 0.0
+    running_qwen_fusion_loss = 0.0
+    running_qwen_shuffled_imitation_loss = 0.0
+    running_qwen_fusion_margin_satisfied = 0.0
     running_mae = 0.0
     running_xyz_loss = 0.0
     running_rot_loss = 0.0
@@ -2316,6 +2568,9 @@ def train(
     pending_xyz_auxiliary_loss = 0.0
     pending_gripper_bce_loss = 0.0
     pending_rotation_geodesic_loss = 0.0
+    pending_qwen_fusion_loss = 0.0
+    pending_qwen_shuffled_imitation_loss = 0.0
+    pending_qwen_fusion_margin_satisfied = 0.0
     pending_mae = 0.0
     pending_xyz_loss_sum = 0.0
     pending_xyz_valid_count = 0.0
@@ -2366,6 +2621,15 @@ def train(
         running_rotation_geodesic_loss = float(
             logging_accumulators.get("rotation_geodesic_loss", 0.0)
         )
+        running_qwen_fusion_loss = float(
+            logging_accumulators.get("qwen_fusion_loss", 0.0)
+        )
+        running_qwen_shuffled_imitation_loss = float(
+            logging_accumulators.get("qwen_shuffled_imitation_loss", 0.0)
+        )
+        running_qwen_fusion_margin_satisfied = float(
+            logging_accumulators.get("qwen_fusion_margin_satisfied", 0.0)
+        )
         running_mae = float(logging_accumulators.get("mae", 0.0))
         running_xyz_loss = float(logging_accumulators.get("xyz_loss", 0.0))
         running_rot_loss = float(logging_accumulators.get("rot_loss", 0.0))
@@ -2411,6 +2675,13 @@ def train(
                 "xyz_auxiliary_loss": running_xyz_auxiliary_loss,
                 "gripper_bce_loss": running_gripper_bce_loss,
                 "rotation_geodesic_loss": running_rotation_geodesic_loss,
+                "qwen_fusion_loss": running_qwen_fusion_loss,
+                "qwen_shuffled_imitation_loss": (
+                    running_qwen_shuffled_imitation_loss
+                ),
+                "qwen_fusion_margin_satisfied": (
+                    running_qwen_fusion_margin_satisfied
+                ),
                 "mae": running_mae,
                 "xyz_loss": running_xyz_loss,
                 "rot_loss": running_rot_loss,
@@ -2467,6 +2738,8 @@ def train(
                 gripper_bce_weight=gripper_bce_weight,
                 gripper_bce_logit_scale=gripper_bce_logit_scale,
                 rotation_geodesic_weight=rotation_geodesic_weight,
+                qwen_fusion_loss_weight=qwen_fusion_loss_weight,
+                qwen_fusion_loss_margin=qwen_fusion_loss_margin,
             )
             with accelerator.accumulate(model):
                 metrics = model(batch)
@@ -2574,6 +2847,15 @@ def train(
             pending_rotation_geodesic_loss += float(
                 metrics["rotation_geodesic_loss"].detach()
             )
+            pending_qwen_fusion_loss += float(
+                metrics["qwen_fusion_loss"].detach()
+            )
+            pending_qwen_shuffled_imitation_loss += float(
+                metrics["qwen_shuffled_imitation_loss"].detach()
+            )
+            pending_qwen_fusion_margin_satisfied += float(
+                metrics["qwen_fusion_margin_satisfied"].detach()
+            )
             pending_mae += float(metrics["train_target_mae"].detach())
             pending_xyz_loss_sum += float(metrics["xyz_loss_sum"].detach())
             pending_xyz_valid_count += float(metrics["xyz_valid_count"].detach())
@@ -2594,6 +2876,9 @@ def train(
                 pending_xyz_auxiliary_loss = 0.0
                 pending_gripper_bce_loss = 0.0
                 pending_rotation_geodesic_loss = 0.0
+                pending_qwen_fusion_loss = 0.0
+                pending_qwen_shuffled_imitation_loss = 0.0
+                pending_qwen_fusion_margin_satisfied = 0.0
                 pending_mae = 0.0
                 pending_xyz_loss_sum = 0.0
                 pending_xyz_valid_count = 0.0
@@ -2628,6 +2913,11 @@ def train(
                     pending_gripper_bce_loss / max(pending_microbatches, 1),
                     pending_rotation_geodesic_loss
                     / max(pending_microbatches, 1),
+                    pending_qwen_fusion_loss / max(pending_microbatches, 1),
+                    pending_qwen_shuffled_imitation_loss
+                    / max(pending_microbatches, 1),
+                    pending_qwen_fusion_margin_satisfied
+                    / max(pending_microbatches, 1),
                     pending_mae / max(pending_microbatches, 1),
                     pending_xyz_loss_sum / max(pending_xyz_valid_count, 1.0),
                     pending_rot_loss_sum / max(pending_rot_valid_count, 1.0),
@@ -2643,10 +2933,13 @@ def train(
             running_xyz_auxiliary_loss += float(step_metrics[2].cpu())
             running_gripper_bce_loss += float(step_metrics[3].cpu())
             running_rotation_geodesic_loss += float(step_metrics[4].cpu())
-            running_mae += float(step_metrics[5].cpu())
-            running_xyz_loss += float(step_metrics[6].cpu())
-            running_rot_loss += float(step_metrics[7].cpu())
-            running_gripper_loss += float(step_metrics[8].cpu())
+            running_qwen_fusion_loss += float(step_metrics[5].cpu())
+            running_qwen_shuffled_imitation_loss += float(step_metrics[6].cpu())
+            running_qwen_fusion_margin_satisfied += float(step_metrics[7].cpu())
+            running_mae += float(step_metrics[8].cpu())
+            running_xyz_loss += float(step_metrics[9].cpu())
+            running_rot_loss += float(step_metrics[10].cpu())
+            running_gripper_loss += float(step_metrics[11].cpu())
             running_step_time += step_time
             running_steps += 1
             pending_loss = 0.0
@@ -2654,6 +2947,9 @@ def train(
             pending_xyz_auxiliary_loss = 0.0
             pending_gripper_bce_loss = 0.0
             pending_rotation_geodesic_loss = 0.0
+            pending_qwen_fusion_loss = 0.0
+            pending_qwen_shuffled_imitation_loss = 0.0
+            pending_qwen_fusion_margin_satisfied = 0.0
             pending_mae = 0.0
             pending_xyz_loss_sum = 0.0
             pending_xyz_valid_count = 0.0
@@ -2680,6 +2976,27 @@ def train(
                     ),
                     "train/rotation_geodesic_loss": (
                         running_rotation_geodesic_loss / max(running_steps, 1)
+                    ),
+                    "train/qwen_fusion_loss": (
+                        running_qwen_fusion_loss / max(running_steps, 1)
+                    ),
+                    "train/qwen_fusion_loss_weight": float(
+                        qwen_fusion_loss_weight
+                    ),
+                    "train/qwen_fusion_loss_margin": float(
+                        qwen_fusion_loss_margin
+                    ),
+                    "train/qwen_shuffled_imitation_loss": (
+                        running_qwen_shuffled_imitation_loss
+                        / max(running_steps, 1)
+                    ),
+                    "train/qwen_matched_vs_shuffled_loss_delta": (
+                        running_qwen_shuffled_imitation_loss
+                        - running_imitation_loss
+                    ) / max(running_steps, 1),
+                    "train/qwen_fusion_margin_satisfied_fraction": (
+                        running_qwen_fusion_margin_satisfied
+                        / max(running_steps, 1)
                     ),
                     "train/loss_xyz": running_xyz_loss / max(running_steps, 1),
                     "train/loss_rot": running_rot_loss / max(running_steps, 1),
@@ -2726,6 +3043,9 @@ def train(
                 running_xyz_auxiliary_loss = 0.0
                 running_gripper_bce_loss = 0.0
                 running_rotation_geodesic_loss = 0.0
+                running_qwen_fusion_loss = 0.0
+                running_qwen_shuffled_imitation_loss = 0.0
+                running_qwen_fusion_margin_satisfied = 0.0
                 running_mae = 0.0
                 running_xyz_loss = 0.0
                 running_rot_loss = 0.0

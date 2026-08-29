@@ -268,6 +268,18 @@ def build_config(args: argparse.Namespace):
             args.validation_batch_size,
             cfg.training.validation_batch_size,
         ),
+        qwen_fusion_loss_weight=float(
+            optional_override(
+                args.qwen_fusion_loss_weight,
+                cfg.training.qwen_fusion_loss_weight,
+            )
+        ),
+        qwen_fusion_loss_margin=float(
+            optional_override(
+                args.qwen_fusion_loss_margin,
+                cfg.training.qwen_fusion_loss_margin,
+            )
+        ),
     )
     model_cfg = cfg.model
     if args.no_gradient_checkpointing:
@@ -493,6 +505,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--rotation-geodesic-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--qwen-fusion-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Experimental counterfactual ranking-loss weight. Requires the "
+            "matched Qwen KV to beat a batch-shuffled Qwen KV condition."
+        ),
+    )
+    parser.add_argument(
+        "--qwen-fusion-loss-margin",
+        type=float,
+        default=None,
+        help="Required matched-vs-shuffled denoising-loss margin.",
+    )
     return parser.parse_args()
 
 
@@ -520,6 +547,8 @@ def main() -> None:
         gripper_bce_weight=args.gripper_bce_weight,
         gripper_bce_logit_scale=args.gripper_bce_logit_scale,
         rotation_geodesic_weight=args.rotation_geodesic_weight,
+        qwen_fusion_loss_weight=cfg.training.qwen_fusion_loss_weight,
+        qwen_fusion_loss_margin=cfg.training.qwen_fusion_loss_margin,
     )
 
 

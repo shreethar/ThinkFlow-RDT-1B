@@ -39,6 +39,10 @@ class ModelConfig:
     # the state/action stream, with no second projection of the Qwen pair.
     # ``cross_attention_kv`` projects cached Qwen K/V directly to native RDT K/V
     # and appends them after each cross-attention block's condition projection.
+    # ``fastthinkact_cross_attention_kv`` additionally places the native state
+    # encoder token in every cross-attention context. Each block projects that
+    # state token to K/V, then directly appends the adapted Qwen K/V without a
+    # second attention projection.
     # ``language`` is retained for backward compatibility with older artifacts.
     qwen_fusion: str = "language"
     # The official pretrained RDT state adaptor consumes a unified 128-D state.
@@ -173,6 +177,12 @@ class TrainingConfig:
     # Diffusion-sampled trajectory metrics are expensive. Keep this explicit so
     # experiments can evaluate only the deployed replanning horizon (LIBERO: 10).
     sampled_validation_horizons: tuple[int, ...] | list[int] = (1, 4, 8, 10, 64)
+    # Optional counterfactual ranking objective for the action-model stage.
+    # The Fast-ThinkAct paper itself uses only imitation loss here; this
+    # experimental term requires the matched Qwen KV to outperform a shuffled
+    # sample's KV by at least ``qwen_fusion_loss_margin``.
+    qwen_fusion_loss_weight: float = 0.0
+    qwen_fusion_loss_margin: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -209,12 +219,13 @@ class ExperimentConfig:
             "self_attention_kv",
             "fastthinkact_state_kv",
             "cross_attention_kv",
+            "fastthinkact_cross_attention_kv",
             "unified_cross_attention",
         }:
             raise ValueError(
                 "model.qwen_fusion must be 'none', 'language', "
                 "'self_attention_kv', 'fastthinkact_state_kv', "
-                "'cross_attention_kv', or "
+                "'cross_attention_kv', 'fastthinkact_cross_attention_kv', or "
                 "'unified_cross_attention'"
             )
         if self.model.pretrained_copy_mode not in {"selected", "compatible"}:
@@ -338,6 +349,17 @@ class ExperimentConfig:
         if any(horizon <= 0 for horizon in sampled_horizons):
             raise ValueError(
                 "training.sampled_validation_horizons must contain positive values"
+            )
+        if self.training.qwen_fusion_loss_weight < 0:
+            raise ValueError("training.qwen_fusion_loss_weight must be non-negative")
+        if self.training.qwen_fusion_loss_margin < 0:
+            raise ValueError("training.qwen_fusion_loss_margin must be non-negative")
+        if (
+            self.training.qwen_fusion_loss_weight > 0
+            and self.model.qwen_fusion == "none"
+        ):
+            raise ValueError(
+                "qwen_fusion_loss_weight requires a non-'none' Qwen fusion mode"
             )
 
 

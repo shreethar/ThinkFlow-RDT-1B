@@ -123,6 +123,106 @@ def test_direct_cross_attention_model_supports_five_spatial_kv_tokens():
     assert metrics["loss"].isfinite()
 
 
+def test_fastthinkact_cross_attention_projects_state_but_bypasses_qwen_kv():
+    base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
+    model_config = replace(
+        base.model,
+        finetune_mode="full",
+        qwen_fusion="fastthinkact_cross_attention_kv",
+    )
+    cfg = replace(base, model=model_config)
+    cfg.validate()
+    model = SFTConditionedRDT(cfg, load_pretrained=False)
+    torch.nn.init.normal_(
+        model.runner.model.final_layer.ffn_final.fc2.weight,
+        std=0.02,
+    )
+    projected_condition_lengths: list[int] = []
+    hooks = [
+        block.cross_attn.kv.register_forward_pre_hook(
+            lambda _module, inputs: projected_condition_lengths.append(
+                int(inputs[0].shape[1])
+            )
+        )
+        for block in model.runner.model.blocks
+    ]
+    batch_size = 2
+    batch = {
+        "lang_tokens": torch.randn(batch_size, 12, 64),
+        "lang_mask": torch.ones(batch_size, 12, dtype=torch.bool),
+        "img_tokens": torch.randn(batch_size, 16, 64),
+        "img_mask": torch.ones(batch_size, 16, dtype=torch.bool),
+        "qwen_kv": torch.randn(batch_size, 5, 64),
+        "state": torch.randn(batch_size, 7),
+        "actions": torch.randn(batch_size, 16, 7),
+        "action_time_mask": torch.ones(batch_size, 16, dtype=torch.bool),
+        "action_dim_mask": torch.ones(batch_size, 7),
+        "ctrl_freq": torch.full((batch_size,), 10.0),
+    }
+
+    metrics = model(batch)
+    for hook in hooks:
+        hook.remove()
+    metrics["loss"].backward()
+
+    # Block 0 receives 12 language + 1 native state token. Block 1 receives
+    # 16 image + 1 native state token. The five Qwen tokens do not appear in
+    # these lengths because they bypass cross_attn.kv and are appended later.
+    assert projected_condition_lengths == [13, 17]
+    assert model.qwen_adaptor[-1].out_features == 2 * model_config.hidden_size
+    qwen_gradient = model.qwen_adaptor[-1].weight.grad
+    assert qwen_gradient is not None
+    assert float(qwen_gradient.norm()) > 0.0
+    state_gradient = model.unified_cross_extra_pos_embed.grad
+    assert state_gradient is not None
+    assert float(state_gradient[:, 0:1].norm()) > 0.0
+    assert metrics["loss"].isfinite()
+    sampled = model.sample_actions(batch)
+    assert sampled.shape == batch["actions"].shape
+    assert torch.isfinite(sampled).all()
+
+
+def test_qwen_fusion_ranking_loss_uses_matched_and_shuffled_conditions():
+    base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
+    model_config = replace(
+        base.model,
+        finetune_mode="full",
+        qwen_fusion="fastthinkact_state_kv",
+    )
+    model = SFTConditionedRDT(replace(base, model=model_config), load_pretrained=False)
+    torch.nn.init.normal_(
+        model.runner.model.final_layer.ffn_final.fc2.weight,
+        std=0.02,
+    )
+    batch_size = 3
+    batch = {
+        "lang_tokens": torch.randn(batch_size, 12, 64),
+        "lang_mask": torch.ones(batch_size, 12, dtype=torch.bool),
+        "img_tokens": torch.randn(batch_size, 16, 64),
+        "img_mask": torch.ones(batch_size, 16, dtype=torch.bool),
+        "qwen_kv": torch.randn(batch_size, 5, 64),
+        "state": torch.randn(batch_size, 7),
+        "actions": torch.randn(batch_size, 16, 7),
+        "action_time_mask": torch.ones(batch_size, 16, dtype=torch.bool),
+        "action_dim_mask": torch.ones(batch_size, 7),
+        "ctrl_freq": torch.full((batch_size,), 10.0),
+        "qwen_fusion_loss_weight": torch.tensor(0.5),
+        "qwen_fusion_loss_margin": torch.tensor(0.01),
+    }
+
+    metrics = model(batch)
+    expected = metrics["imitation_loss"] + 0.5 * metrics["qwen_fusion_loss"]
+    assert torch.allclose(metrics["loss"].detach(), expected, atol=1e-5)
+    assert float(metrics["qwen_fusion_loss"]) >= 0.0
+    assert torch.isfinite(metrics["qwen_shuffled_imitation_loss"])
+    assert 0.0 <= float(metrics["qwen_fusion_margin_satisfied"]) <= 1.0
+
+    metrics["loss"].backward()
+    gradient = model.qwen_adaptor[-1].weight.grad
+    assert gradient is not None
+    assert float(gradient.norm()) > 0.0
+
+
 def test_full_kv_model_uses_128d_frozen_state_interface():
     base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
     model_config = replace(

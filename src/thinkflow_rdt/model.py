@@ -293,8 +293,41 @@ def install_kv_aware_forward(
             conditions = (unified_condition, unified_condition)
             masks = (unified_mask, unified_mask)
         else:
-            conditions = (lang_c, img_c)
-            masks = (lang_mask, img_mask)
+            if extra_cross_cond is None:
+                conditions = (lang_c, img_c)
+                masks = (lang_mask, img_mask)
+            else:
+                if extra_cross_mask is None:
+                    extra_cross_mask = torch.ones(
+                        extra_cross_cond.shape[:2],
+                        dtype=torch.bool,
+                        device=extra_cross_cond.device,
+                    )
+                if lang_mask is None:
+                    lang_mask = torch.ones(
+                        lang_c.shape[:2],
+                        dtype=torch.bool,
+                        device=lang_c.device,
+                    )
+                if img_mask is None:
+                    img_mask = torch.ones(
+                        img_c.shape[:2],
+                        dtype=torch.bool,
+                        device=img_c.device,
+                    )
+                # Preserve RDT's alternating language/image blocks, but append
+                # the same native proprioceptive state token to both contexts.
+                # Qwen K/V is appended separately in
+                # _cross_attention_with_external_kv after these native tokens
+                # have passed through each block's condition projection.
+                conditions = (
+                    torch.cat([lang_c, extra_cross_cond], dim=1),
+                    torch.cat([img_c, extra_cross_cond], dim=1),
+                )
+                masks = (
+                    torch.cat([lang_mask, extra_cross_mask], dim=1),
+                    torch.cat([img_mask, extra_cross_mask], dim=1),
+                )
         for index, block in enumerate(self.blocks):
             condition = conditions[index % 2]
             mask = masks[index % 2]
@@ -451,6 +484,7 @@ class SFTConditionedRDT(nn.Module):
             "self_attention_kv",
             "fastthinkact_state_kv",
             "cross_attention_kv",
+            "fastthinkact_cross_attention_kv",
         }:
             projector_width *= 2
         self.qwen_adaptor = nn.Sequential(
@@ -561,7 +595,11 @@ class SFTConditionedRDT(nn.Module):
             self.action_adaptor.requires_grad_(True)
         self.qwen_adaptor.requires_grad_(True)
         self.unified_cross_extra_pos_embed.requires_grad_(
-            cfg.model.qwen_fusion == "unified_cross_attention"
+            cfg.model.qwen_fusion
+            in {
+                "unified_cross_attention",
+                "fastthinkact_cross_attention_kv",
+            }
         )
 
     @property
@@ -635,6 +673,8 @@ class SFTConditionedRDT(nn.Module):
             "gripper_bce_logit_scale",
             "xyz_loss_weight",
             "rotation_geodesic_weight",
+            "qwen_fusion_loss_weight",
+            "qwen_fusion_loss_margin",
             "diffusion_noise",
             "ctrl_freq",
         }
@@ -831,6 +871,25 @@ class SFTConditionedRDT(nn.Module):
             # appends it after projecting its ordinary language/image context,
             # so the cached Qwen KV is not passed through attention.kv again.
             external_cross_kv = self.qwen_adaptor(batch["qwen_kv"])
+        elif self.cfg.model.qwen_fusion == "fastthinkact_cross_attention_kv":
+            if state_cond is None:
+                raise ValueError(
+                    "fastthinkact_cross_attention_kv requires state_cond"
+                )
+            # The native state token remains an ordinary condition and is
+            # projected by each RDT cross-attention block's `kv` layer. Qwen's
+            # cached K/V is adapted directly to [K; V] and appended afterwards,
+            # bypassing that layer. This forms [native modality KV, state KV,
+            # Qwen KV] for every action-query cross-attention operation.
+            external_cross_kv = self.qwen_adaptor(batch["qwen_kv"])
+            extra_cross_cond = (
+                state_cond + self.unified_cross_extra_pos_embed[:, 0:1]
+            )
+            extra_cross_mask = torch.ones(
+                state_cond.shape[:2],
+                dtype=torch.bool,
+                device=state_cond.device,
+            )
         elif self.cfg.model.qwen_fusion == "unified_cross_attention":
             projected_qwen = self.qwen_adaptor(batch["qwen_kv"])
             extra_parts = []
@@ -1149,6 +1208,123 @@ class SFTConditionedRDT(nn.Module):
         valid_count = sample_is_valid.sum()
         imitation_loss = loss_sum / valid_count.clamp_min(1.0)
 
+        # Optional counterfactual Qwen-conditioning objective. The ordinary
+        # imitation objective can be minimized while treating Qwen KV as a
+        # sample-independent bias. Re-run the exact same noisy action,
+        # timestep, image, language, and state context with Qwen KV rolled
+        # across the microbatch, then require the matched context to achieve a
+        # lower per-sample denoising loss by a configured margin. Using the
+        # same diffusion noise/timestep isolates Qwen identity as the changed
+        # variable. The hinge stops rewarding arbitrary degradation after the
+        # requested separation has been reached.
+        qwen_fusion_loss_weight = batch.get("qwen_fusion_loss_weight")
+        if qwen_fusion_loss_weight is None:
+            qwen_fusion_loss_weight = prediction.new_tensor(0.0)
+        qwen_fusion_loss_margin = batch.get("qwen_fusion_loss_margin")
+        if qwen_fusion_loss_margin is None:
+            qwen_fusion_loss_margin = prediction.new_tensor(0.0)
+        for name, value in (
+            ("qwen_fusion_loss_weight", qwen_fusion_loss_weight),
+            ("qwen_fusion_loss_margin", qwen_fusion_loss_margin),
+        ):
+            if value.numel() != 1 or not bool(torch.isfinite(value).all()) or bool(
+                (value < 0).any()
+            ):
+                raise ValueError(f"{name} must be one finite non-negative scalar")
+
+        qwen_fusion_loss = prediction.new_tensor(0.0)
+        shuffled_qwen_imitation_loss = imitation_loss.detach()
+        qwen_fusion_margin_satisfied = prediction.new_tensor(1.0)
+        if bool((qwen_fusion_loss_weight > 0).item()):
+            if self.cfg.model.qwen_fusion == "none":
+                raise ValueError("Qwen fusion loss requires Qwen conditioning")
+            if batch_size < 2:
+                raise ValueError(
+                    "Qwen fusion loss requires micro_batch_size >= 2 for shuffling"
+                )
+            shuffled_batch = dict(batch)
+            # Prefer negatives from the same source dataset so the hinge
+            # cannot be satisfied merely by learning OXE dataset identity.
+            permutation = torch.roll(
+                torch.arange(batch_size, device=prediction.device),
+                shifts=1,
+                dims=0,
+            )
+            dataset_ids = batch.get("dataset_id")
+            if isinstance(dataset_ids, (list, tuple)) and len(dataset_ids) == batch_size:
+                buckets: dict[str, list[int]] = {}
+                for sample_index, dataset_id in enumerate(dataset_ids):
+                    buckets.setdefault(str(dataset_id), []).append(sample_index)
+                for indices in buckets.values():
+                    if len(indices) < 2:
+                        continue
+                    for offset, sample_index in enumerate(indices):
+                        permutation[sample_index] = indices[(offset + 1) % len(indices)]
+            shuffled_batch["qwen_kv"] = batch["qwen_kv"][permutation]
+            (
+                shuffled_lang_cond,
+                shuffled_img_cond,
+                shuffled_lang_mask,
+                shuffled_external_kv,
+                shuffled_external_cross_kv,
+                shuffled_extra_cross_cond,
+                shuffled_extra_cross_mask,
+            ) = self._adapt_static_conditions(
+                shuffled_batch,
+                state_cond=state_cond,
+            )
+            shuffled_prediction = self.runner.model(
+                state_action_cond,
+                batch["ctrl_freq"],
+                timesteps,
+                shuffled_lang_cond,
+                shuffled_img_cond,
+                lang_mask=shuffled_lang_mask,
+                img_mask=batch["img_mask"].bool(),
+                external_kv=shuffled_external_kv,
+                external_cross_kv=shuffled_external_cross_kv,
+                extra_cross_cond=shuffled_extra_cross_cond,
+                extra_cross_mask=shuffled_extra_cross_mask,
+                unified_cross_attention=(
+                    self.cfg.model.qwen_fusion == "unified_cross_attention"
+                ),
+            )
+            shuffled_diff = shuffled_prediction - target
+            if self.cfg.model.action_encoder_layout == "rdt_eef":
+                shuffled_diff = torch.cat(
+                    [
+                        shuffled_diff[..., :3],
+                        torch.atan2(
+                            torch.sin(shuffled_diff[..., 3:6]),
+                            torch.cos(shuffled_diff[..., 3:6]),
+                        ),
+                        shuffled_diff[..., 6:],
+                    ],
+                    dim=-1,
+                )
+            sample_shuffled_imitation_loss = (
+                (shuffled_diff.pow(2) * objective_valid).sum(dim=(1, 2))
+                / objective_count.clamp_min(1.0)
+            )
+            shuffled_qwen_imitation_loss = (
+                sample_shuffled_imitation_loss * sample_is_valid
+            ).sum() / valid_count.clamp_min(1.0)
+            sample_fusion_hinge = F.relu(
+                qwen_fusion_loss_margin
+                + sample_imitation_loss
+                - sample_shuffled_imitation_loss
+            )
+            qwen_fusion_loss = (
+                sample_fusion_hinge * sample_is_valid
+            ).sum() / valid_count.clamp_min(1.0)
+            qwen_fusion_margin_satisfied = (
+                (
+                    sample_shuffled_imitation_loss - sample_imitation_loss
+                    >= qwen_fusion_loss_margin
+                ).to(prediction.dtype)
+                * sample_is_valid
+            ).sum() / valid_count.clamp_min(1.0)
+
         # prediction_type="sample" means the RDT predicts the clean x0 action
         # chunk at each denoising call. Apply sign classification directly to
         # its existing gripper scalar; this adds no parameters or output head.
@@ -1231,6 +1407,7 @@ class SFTConditionedRDT(nn.Module):
             + xyz_loss_weight * xyz_auxiliary_loss
             + gripper_bce_weight * gripper_bce_loss
             + rotation_geodesic_weight.float() * rotation_geodesic_loss
+            + qwen_fusion_loss_weight.float() * qwen_fusion_loss
         )
         result = {
             "loss": total_loss,
@@ -1241,6 +1418,15 @@ class SFTConditionedRDT(nn.Module):
             "gripper_bce_weight": gripper_bce_weight.detach(),
             "rotation_geodesic_loss": rotation_geodesic_loss.detach(),
             "rotation_geodesic_weight": rotation_geodesic_weight.detach(),
+            "qwen_fusion_loss": qwen_fusion_loss.detach(),
+            "qwen_fusion_loss_weight": qwen_fusion_loss_weight.detach(),
+            "qwen_fusion_loss_margin": qwen_fusion_loss_margin.detach(),
+            "qwen_shuffled_imitation_loss": (
+                shuffled_qwen_imitation_loss.detach()
+            ),
+            "qwen_fusion_margin_satisfied": (
+                qwen_fusion_margin_satisfied.detach()
+            ),
             "train_target_mae": (
                 mae_sum / valid_count.clamp_min(1.0)
             ).detach(),
