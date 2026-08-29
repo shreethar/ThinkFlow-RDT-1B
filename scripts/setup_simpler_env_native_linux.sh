@@ -85,12 +85,15 @@ SIMPLER_PYTHON="$SIMPLER_ROOT/.venv/bin/python"
 
 # Keep simulator dependencies isolated from RDT's Torch/Transformers stack.
 # NumPy 2 breaks SimplerEnv's Pinocchio/IK path; the OpenCV pin avoids pulling it.
+# SAPIEN 2.2.2 imports pkg_resources, which setuptools 81+ no longer ships.
 log "Installing pinned minimal simulator dependencies"
 uv pip install --python "$SIMPLER_PYTHON" --upgrade \
+  "setuptools==80.9.0" \
   "numpy==1.24.4" "scipy==1.11.4" "opencv-python==4.8.1.78"
 uv pip install --python "$SIMPLER_PYTHON" -e "$SIMPLER_ROOT/ManiSkill2_real2sim"
 uv pip install --python "$SIMPLER_PYTHON" -e "$SIMPLER_ROOT"
 uv pip install --python "$SIMPLER_PYTHON" --upgrade \
+  "setuptools==80.9.0" \
   "numpy==1.24.4" "scipy==1.11.4" "opencv-python==4.8.1.78"
 
 log "Checking package and adapter contracts"
