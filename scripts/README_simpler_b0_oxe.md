@@ -162,3 +162,31 @@ bash scripts/run_simpler_fractal_full_eval.sh
 The aggregate report is written to `suite_summary.json`; `suite_results.json`
 contains every trial. Each task/seed directory contains `rollout.mp4`,
 `trajectory.jsonl`, `environment_contract.json`, and `summary.json`.
+
+## Translation diagnostics
+
+Run the controlled chunk-1 versus chunk-4 experiment on identical tasks and
+seeds:
+
+```bash
+CHECKPOINT=/workspace/ThinkFlow-RDT-1B/b0_oxe_5k_fractal_10k \
+bash scripts/run_simpler_fractal_translation_ablation.sh
+```
+
+The default is five seeds across the same five Fractal tasks (25 rollouts per
+chunk). Set `EPISODES_PER_TASK` to change the budget. Each chunk directory gets
+a `translation_diagnostics.json` containing requested-versus-executed clipping,
+requested-versus-achieved per-axis controller slopes and correlations,
+object-direction cosine, distance progress, and per-episode minimum TCP/object
+distance.
+
+Cache-only target analysis does not load the model or simulator:
+
+```bash
+uv run --no-sync python scripts/analyze_fractal_translation.py \
+  --mode cache \
+  --manifest output_2/fractal_b2_from_oxe5k_native128_full_10k/manifests/train_manifest.jsonl \
+  --action-stats dataset/mock_dataset/fractal_dataset/audit.json \
+  --max-packs 2000 \
+  --output output_2/fractal_b2_from_oxe5k_native128_full_10k/fractal_translation_cache_analysis.json
+```

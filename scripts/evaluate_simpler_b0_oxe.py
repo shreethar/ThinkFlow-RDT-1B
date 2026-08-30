@@ -934,6 +934,7 @@ def run_rollout(
                     "state_after_7d": packet["state_7d"],
                     "achieved_tcp_delta_xyz_rpy": achieved_delta,
                     "robot_qpos_after": packet["robot_qpos"],
+                    "object_states_before": before["object_states"],
                     "object_states_after": packet["object_states"],
                     "reward": packet["reward"],
                     "terminated": packet["terminated"],
