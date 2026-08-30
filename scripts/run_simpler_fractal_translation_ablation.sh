@@ -14,6 +14,7 @@ STUDENT_MODEL_ID=${STUDENT_MODEL_ID:-shreethar/LatentStudent-ckpt-400-fixed}
 PROCESSOR_ID=${PROCESSOR_ID:-shreethar/stage1_unsloth}
 LATENT_STUDENT_CODE_DIR=${LATENT_STUDENT_CODE_DIR:-/workspace/VLA-FYP/train/stage2}
 EPISODES_PER_TASK=${EPISODES_PER_TASK:-5}
+CHUNKS=${CHUNKS:-"1 4"}
 BASE_SEED=${BASE_SEED:-42}
 MAX_STEPS=${MAX_STEPS:-300}
 GRIPPER_STICKY_STEPS=${GRIPPER_STICKY_STEPS:-15}
@@ -33,7 +34,11 @@ fi
 export VK_ICD_FILENAMES DISPLAY='' RDT_REPO
 
 cd "$REPO_ROOT"
-for chunk in 1 4; do
+for chunk in $CHUNKS; do
+  [[ "$chunk" == "1" || "$chunk" == "4" ]] || {
+    echo "ERROR: CHUNKS supports only 1 and 4, got $chunk" >&2
+    exit 1
+  }
   output_dir="$OUTPUT_ROOT/chunk_${chunk}"
   uv run --no-sync python scripts/evaluate_simpler_b0_oxe.py \
     --mode suite \

@@ -179,6 +179,8 @@ a `translation_diagnostics.json` containing requested-versus-executed clipping,
 requested-versus-achieved per-axis controller slopes and correlations,
 object-direction cosine, distance progress, and per-episode minimum TCP/object
 distance.
+Set `CHUNKS=1` or `CHUNKS=4` to run only one side when the other chunk has
+already been evaluated.
 
 Cache-only target analysis does not load the model or simulator:
 
