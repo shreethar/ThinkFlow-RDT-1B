@@ -9,11 +9,13 @@ Modes:
   contract  Check state packing and action decoding without loading models.
   probe     Run one policy inference on a supplied/static SimplerEnv image.
   rollout   Run one closed-loop SimplerEnv episode through the isolated worker.
+  suite     Evaluate the five canonical Google/Fractal task families.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import secrets
@@ -56,6 +58,13 @@ B2_TRAJECTORY_PROMPT = (
     "Task: The task is {task}. What is the trajectory that the end effector should take?"
 )
 AF_UNIX_SAFE_PATH_BYTES = 103
+FRACTAL_SUITE_TASKS = (
+    "google_robot_pick_coke_can",
+    "google_robot_move_near",
+    "google_robot_open_drawer",
+    "google_robot_close_drawer",
+    "google_robot_place_apple_in_closed_top_drawer",
+)
 
 
 def resolve_qwen_extraction_mode(
@@ -382,14 +391,9 @@ class PolicyEngine:
             device_map=args.device_map,
             cfg=self.cfg,
         )
-        self.lang_tokens, self.lang_mask = extract_t5_features(
-            {"instructions": [instruction]},
-            self.t5_tokenizer,
-            self.t5,
-            max_lang_tokens=self.cfg.model.max_lang_tokens,
-            expected_dim=self.cfg.model.lang_token_dim,
-            device=t5_device_from_encoder(self.t5, self.device),
-        )
+        self.extract_t5_features = extract_t5_features
+        self.t5_device = t5_device_from_encoder(self.t5, self.device)
+        self.set_instruction(instruction)
         self.qwen = None
         self.latent_student = None
         self.extract_latent_student_spatial_kv = None
@@ -439,6 +443,22 @@ class PolicyEngine:
         self.model = SFTConditionedRDT(self.cfg, load_pretrained=True)
         load_trainable_artifact(self.model, args.checkpoint, trainable=False)
         self.model.to(self.device).eval()
+
+    def set_instruction(self, instruction: str) -> None:
+        """Refresh only language conditioning while retaining loaded models."""
+        if instruction == getattr(self, "instruction", None) and hasattr(
+            self, "lang_tokens"
+        ):
+            return
+        self.instruction = instruction
+        self.lang_tokens, self.lang_mask = self.extract_t5_features(
+            {"instructions": [instruction]},
+            self.t5_tokenizer,
+            self.t5,
+            max_lang_tokens=self.cfg.model.max_lang_tokens,
+            expected_dim=self.cfg.model.lang_token_dim,
+            device=self.t5_device,
+        )
 
     def infer(
         self,
@@ -791,7 +811,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
+def run_rollout(
+    args: argparse.Namespace,
+    *,
+    engine: PolicyEngine | None = None,
+) -> dict[str, Any]:
     dataset = args.dataset or default_dataset(args.task)
     stats = load_stats(args.action_stats or default_stats_path(dataset))
     process, connection, socket_path = start_worker(args)
@@ -825,9 +849,17 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
                 "google_gripper_sticky_steps": args.google_gripper_sticky_steps,
             },
         )
-        # Load 30+ GiB of policy encoders only after the simulator proves it can
-        # initialize.  This makes Vulkan/asset failures fast and unambiguous.
-        engine = PolicyEngine(args, instruction, dataset)
+        if engine is None:
+            # Load the large policy stack only after the simulator proves it can
+            # initialize. This makes Vulkan/asset failures fast and unambiguous.
+            engine = PolicyEngine(args, instruction, dataset)
+        else:
+            if engine.dataset != dataset:
+                raise ValueError(
+                    f"Reusable policy engine dataset {engine.dataset!r} does not "
+                    f"match rollout dataset {dataset!r}"
+                )
+            engine.set_instruction(instruction)
         video_path = args.output_dir / "rollout.mp4"
         video_writer = imageio.get_writer(
             video_path, format="FFMPEG", fps=args.video_fps, codec="libx264", quality=8
@@ -859,6 +891,7 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
                 rotation_scale=args.rotation_scale,
             )
             chunk = min(args.action_chunk, native.shape[0], args.max_steps - step)
+            instruction_changed = False
             for offset in range(chunk):
                 before = packet
                 requested = decoded["environment_action"][offset].copy()
@@ -914,16 +947,26 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
                     annotated_frame(packet["image"], f"step={step} grip_open={float(decoded['gripper_open_binary'][offset]):.0f}")
                 )
                 step += 1
+                next_instruction = str(packet.get("instruction", instruction))
+                if next_instruction != instruction:
+                    instruction = next_instruction
+                    engine.set_instruction(instruction)
+                    instruction_changed = True
                 if packet["terminated"] or packet["truncated"]:
+                    break
+                if instruction_changed:
                     break
             previous_image = np.asarray(packet["image"], dtype=np.uint8).copy()
             plan_index += 1
             if packet["terminated"] or packet["truncated"]:
                 break
+            if instruction_changed:
+                continue
         summary = {
             "status": "completed",
             "success": success,
             "task": args.task,
+            "seed": args.seed,
             "dataset": dataset,
             "instruction": instruction,
             "steps": step,
@@ -945,9 +988,108 @@ def run_rollout(args: argparse.Namespace) -> dict[str, Any]:
         stop_worker(process, connection, socket_path)
 
 
+def run_fractal_suite(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the canonical five-task Google Robot benchmark with one model load."""
+    if args.dataset not in (None, "fractal"):
+        raise ValueError("Fractal suite evaluation requires --dataset fractal")
+    args.dataset = "fractal"
+    if args.instruction is not None:
+        raise ValueError("Suite evaluation obtains each instruction from SimplerEnv")
+
+    engine = PolicyEngine(args, "initialize Fractal evaluation", "fractal")
+    results: list[dict[str, Any]] = []
+    for task in args.suite_tasks:
+        for episode_index in range(args.episodes_per_task):
+            seed = args.seed + episode_index
+            episode_root = args.output_dir / task / f"seed_{seed:06d}"
+            summary_path = episode_root / "summary.json"
+            if summary_path.is_file():
+                with summary_path.open("r", encoding="utf-8") as handle:
+                    result = json.load(handle)
+                result["resumed_from_existing"] = True
+                results.append(result)
+                print(
+                    f"[suite] reuse {task} seed={seed}: "
+                    f"success={bool(result.get('success', False))}",
+                    flush=True,
+                )
+                continue
+
+            episode_dir = episode_root
+            if episode_root.is_dir() and any(episode_root.iterdir()):
+                attempt_index = 2
+                while (episode_root / f"attempt_{attempt_index:02d}").exists():
+                    attempt_index += 1
+                episode_dir = episode_root / f"attempt_{attempt_index:02d}"
+            episode_dir.mkdir(parents=True, exist_ok=True)
+            episode_args = copy.copy(args)
+            episode_args.mode = "rollout"
+            episode_args.task = task
+            episode_args.seed = seed
+            episode_args.output_dir = episode_dir
+            write_json(episode_dir / "arguments.json", vars(episode_args))
+            try:
+                result = run_rollout(episode_args, engine=engine)
+                result["episode_index"] = episode_index
+                result["error"] = None
+                write_json(summary_path, result)
+            except Exception as error:
+                result = {
+                    "status": "error",
+                    "success": False,
+                    "task": task,
+                    "seed": seed,
+                    "episode_index": episode_index,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                write_json(episode_dir / "suite_error.json", result)
+                print(f"[suite] ERROR {task} seed={seed}: {result['error']}", flush=True)
+                if args.suite_fail_fast:
+                    raise
+            results.append(result)
+            write_json(args.output_dir / "suite_results.json", results)
+
+    per_task: dict[str, dict[str, Any]] = {}
+    for task in args.suite_tasks:
+        task_results = [row for row in results if row.get("task") == task]
+        successes = sum(bool(row.get("success", False)) for row in task_results)
+        per_task[task] = {
+            "successes": successes,
+            "episodes": len(task_results),
+            "success_rate": successes / len(task_results) if task_results else 0.0,
+            "errors": sum(row.get("status") == "error" for row in task_results),
+        }
+    total_successes = sum(bool(row.get("success", False)) for row in results)
+    completed = len(results)
+    task_macro_success_rate = (
+        sum(row["success_rate"] for row in per_task.values()) / len(per_task)
+        if per_task
+        else 0.0
+    )
+    summary = {
+        "status": "completed",
+        "checkpoint": args.checkpoint,
+        "config": args.config,
+        "tasks": list(args.suite_tasks),
+        "episodes_per_task": args.episodes_per_task,
+        "total_successes": total_successes,
+        "total_episodes": completed,
+        "micro_success_rate": total_successes / completed if completed else 0.0,
+        "macro_success_rate": task_macro_success_rate,
+        "errors": sum(row.get("status") == "error" for row in results),
+        "per_task": per_task,
+    }
+    write_json(args.output_dir / "suite_results.json", results)
+    write_json(args.output_dir / "suite_summary.json", summary)
+    print(json.dumps(jsonable(summary), indent=2))
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("contract", "probe", "rollout"), default="rollout")
+    parser.add_argument(
+        "--mode", choices=("contract", "probe", "rollout", "suite"), default="rollout"
+    )
     parser.add_argument("--task", default="google_robot_pick_coke_can")
     parser.add_argument("--dataset", choices=("fractal", "bridge"), default=None)
     parser.add_argument("--instruction", default=None)
@@ -958,6 +1100,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--simpler-root", type=Path, default=DEFAULT_SIMPLER_ROOT)
     parser.add_argument("--simpler-python", type=Path, default=DEFAULT_SIMPLER_PYTHON)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--suite-tasks",
+        nargs="+",
+        default=list(FRACTAL_SUITE_TASKS),
+        help="SimplerEnv task names used by --mode suite.",
+    )
+    parser.add_argument(
+        "--episodes-per-task",
+        type=int,
+        default=10,
+        help="Number of deterministic seeds per task in suite mode.",
+    )
+    parser.add_argument("--suite-fail-fast", action="store_true")
     parser.add_argument("--max-steps", type=int, default=80)
     parser.add_argument("--action-chunk", type=int, default=1)
     parser.add_argument(
@@ -1041,6 +1196,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--action-chunk must be positive")
     if args.max_steps <= 0:
         parser.error("--max-steps must be positive")
+    if args.episodes_per_task <= 0:
+        parser.error("--episodes-per-task must be positive")
     if args.rotation_scale < 0.0:
         parser.error("--rotation-scale must be non-negative")
     if args.google_gripper_sticky_steps < 0:
@@ -1061,6 +1218,8 @@ def main() -> None:
         run_contract(args)
     elif args.mode == "probe":
         run_probe(args)
+    elif args.mode == "suite":
+        run_fractal_suite(args)
     else:
         run_rollout(args)
 

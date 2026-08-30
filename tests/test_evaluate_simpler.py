@@ -7,11 +7,22 @@ import numpy as np
 from scripts.evaluate_simpler_b0_oxe import (
     AF_UNIX_SAFE_PATH_BYTES,
     ActionStats,
+    FRACTAL_SUITE_TASKS,
     GoogleGripperTargetAdapter,
     decode_native_actions,
     resolve_qwen_extraction_mode,
     worker_socket_path,
 )
+
+
+def test_fractal_suite_uses_five_canonical_google_tasks() -> None:
+    assert FRACTAL_SUITE_TASKS == (
+        "google_robot_pick_coke_can",
+        "google_robot_move_near",
+        "google_robot_open_drawer",
+        "google_robot_close_drawer",
+        "google_robot_place_apple_in_closed_top_drawer",
+    )
 
 
 def test_qwen_extraction_mode_auto_detects_b2_artifacts() -> None:

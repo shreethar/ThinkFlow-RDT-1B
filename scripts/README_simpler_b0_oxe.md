@@ -135,3 +135,30 @@ uv run --no-sync python scripts/evaluate_simpler_b0_oxe.py \
   --simpler-python /workspace/SimplerEnv/.venv/bin/python \
   --output-dir output_2/simpler_b2_fractal/google_coke_seed42_chunk4
 ```
+
+## Full Fractal success-rate evaluation
+
+The suite runner evaluates the five canonical Google Robot task families used
+by SimplerEnv's Fractal comparison: pick coke can, move near, open drawer,
+close drawer, and place an apple in the closed top drawer. By default it runs
+10 deterministic seeds per task (50 rollouts), saves every video and action
+trajectory, and reports both pooled (micro) and equal-task-weighted (macro)
+success rates. The policy models remain loaded between episodes, and a rerun
+reuses completed episode summaries.
+
+```bash
+bash scripts/run_simpler_fractal_full_eval.sh
+```
+
+Common overrides are environment variables:
+
+```bash
+CHECKPOINT=output_2/fractal_b2_from_oxe5k_native128_full_10k/checkpoint-5000 \
+EPISODES_PER_TASK=20 ACTION_CHUNK=4 MAX_STEPS=300 \
+OUTPUT_DIR=output_2/simpler_b2_fractal/full_eval_checkpoint5000 \
+bash scripts/run_simpler_fractal_full_eval.sh
+```
+
+The aggregate report is written to `suite_summary.json`; `suite_results.json`
+contains every trial. Each task/seed directory contains `rollout.mp4`,
+`trajectory.jsonl`, `environment_contract.json`, and `summary.json`.
