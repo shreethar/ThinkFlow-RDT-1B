@@ -321,10 +321,11 @@ def extract_latent_student_spatial_kv_chunked(
     spatial_token_count: int,
     prompt_template: str,
     batch_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Honor --batch-size while retaining one output pack per episode."""
     total = len(batch["metadata"])
     kv_chunks: list[torch.Tensor] = []
+    hidden_state_chunks: list[torch.Tensor] = []
     waypoint_chunks: list[torch.Tensor] = []
     for start in range(0, total, batch_size):
         stop = min(total, start + batch_size)
@@ -332,7 +333,7 @@ def extract_latent_student_spatial_kv_chunked(
             "instructions": batch["instructions"][start:stop],
             "qwen_images": batch["qwen_images"][start:stop],
         }
-        spatial_kv, latent_waypoints = extract_latent_student_spatial_kv(
+        spatial_kv, spatial_hidden_states, latent_waypoints = extract_latent_student_spatial_kv(
             chunk,
             student=student,
             processor=processor,
@@ -343,8 +344,13 @@ def extract_latent_student_spatial_kv_chunked(
             prompt_template=prompt_template,
         )
         kv_chunks.append(spatial_kv.cpu())
+        hidden_state_chunks.append(spatial_hidden_states.cpu())
         waypoint_chunks.append(latent_waypoints.cpu())
-    return torch.cat(kv_chunks, dim=0), torch.cat(waypoint_chunks, dim=0)
+    return (
+        torch.cat(kv_chunks, dim=0),
+        torch.cat(hidden_state_chunks, dim=0),
+        torch.cat(waypoint_chunks, dim=0),
+    )
 
 
 def validate_dataset_configs(
@@ -484,6 +490,7 @@ def validate_student_runtime_contract(
         "layer_index": int(args.layer_index),
         "layer_type": layer_type or "full_attention_assumed",
         "flattened_kv_dim": computed_kv_dim,
+        "final_hidden_state_dim": hidden_size,
         "latent_count": int(args.latent_count),
         "spatial_token_count": int(args.spatial_token_count),
         "end_think_token_id": actual_end_think_id,
@@ -513,6 +520,7 @@ def save_episode_pack(
     sample_start_index: int,
     batch: dict[str, Any],
     spatial_kv: torch.Tensor,
+    spatial_hidden_states: torch.Tensor,
     latent_waypoints: torch.Tensor,
     lang_tokens: torch.Tensor,
     lang_mask: torch.Tensor,
@@ -530,10 +538,21 @@ def save_episode_pack(
             "Expected latent waypoints [samples, spatial_tokens, dim], got "
             f"{tuple(latent_waypoints.shape)}"
         )
+    if spatial_hidden_states.shape[:2] != (batch_size, args.spatial_token_count):
+        raise ValueError(
+            "Expected raw spatial hidden states [samples, spatial_tokens, dim], got "
+            f"{tuple(spatial_hidden_states.shape)}"
+        )
     if spatial_kv.ndim != 3 or int(spatial_kv.shape[2]) <= 0:
         raise ValueError(f"Invalid spatial KV shape {tuple(spatial_kv.shape)}")
     if not bool(torch.isfinite(spatial_kv.float()).all()):
         raise ValueError("Refusing to save spatial KV containing NaN or Inf")
+    if spatial_hidden_states.ndim != 3 or int(spatial_hidden_states.shape[2]) <= 0:
+        raise ValueError(
+            f"Invalid raw spatial hidden-state shape {tuple(spatial_hidden_states.shape)}"
+        )
+    if not bool(torch.isfinite(spatial_hidden_states.float()).all()):
+        raise ValueError("Refusing to save raw spatial hidden states containing NaN or Inf")
     if not bool(torch.isfinite(latent_waypoints.float()).all()):
         raise ValueError("Refusing to save latent waypoints containing NaN or Inf")
     if not bool(torch.isfinite(lang_tokens.float()).all()):
@@ -578,6 +597,7 @@ def save_episode_pack(
         "sample_anchor_index": torch.arange(batch_size, dtype=torch.long),
         "qwen_cache_scope": "per_sample",
         "qwen_anchor_kv": spatial_kv.cpu(),
+        "qwen_anchor_hidden_states": spatial_hidden_states.cpu(),
         "qwen_anchor_step_idx": step_indices,
         "qwen_anchor_kind": ["per_sample"] * batch_size,
         "latent_waypoints": latent_waypoints.cpu(),
@@ -625,11 +645,13 @@ def save_episode_pack(
             "qwen_anchor_count": batch_size,
             "qwen_token_count": int(spatial_kv.shape[1]),
             "qwen_kv_dim": int(spatial_kv.shape[2]),
+            "qwen_hidden_state_dim": int(spatial_hidden_states.shape[2]),
             "image_pool_count": len(image_pool),
             "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
             "has_img_tokens": False,
             "has_image_slots": True,
             "has_latent_waypoints": True,
+            "has_qwen_hidden_states": True,
             "qwen_cache_scope": "per_sample",
             "actions_normalized": bool(actions_normalized),
             "instruction": unique_instructions[0] if len(unique_instructions) == 1 else None,
@@ -938,16 +960,18 @@ def precompute_split(
                     "layout stores one shared T5 embedding."
                 )
 
-            spatial_kv, latent_waypoints = extract_latent_student_spatial_kv_chunked(
-                batch,
-                student=student,
-                processor=processor,
-                device=device,
-                layer_index=args.layer_index,
-                expected_dim=cfg.model.qwen_kv_dim,
-                spatial_token_count=args.spatial_token_count,
-                prompt_template=args.prompt_template,
-                batch_size=args.batch_size,
+            spatial_kv, spatial_hidden_states, latent_waypoints = (
+                extract_latent_student_spatial_kv_chunked(
+                    batch,
+                    student=student,
+                    processor=processor,
+                    device=device,
+                    layer_index=args.layer_index,
+                    expected_dim=cfg.model.qwen_kv_dim,
+                    spatial_token_count=args.spatial_token_count,
+                    prompt_template=args.prompt_template,
+                    batch_size=args.batch_size,
+                )
             )
 
             # Match the B0 episode-pack layout: language is shared at episode level.
@@ -966,6 +990,7 @@ def precompute_split(
                 sample_start_index=sample_count,
                 batch=batch,
                 spatial_kv=spatial_kv,
+                spatial_hidden_states=spatial_hidden_states,
                 latent_waypoints=latent_waypoints,
                 lang_tokens=lang_tokens,
                 lang_mask=lang_mask,
@@ -1121,6 +1146,8 @@ def main() -> None:
         "latent_student_contract": student_contract,
         "prompt_template": args.prompt_template,
         "qwen_kv_dim": cfg.model.qwen_kv_dim,
+        "qwen_hidden_state_dim": cfg.model.qwen_hidden_size,
+        "qwen_hidden_state_granularity": "five_final_layer_spatial_tokens_per_sample_step",
         "qwen_batch_size": args.batch_size,
         "qwen_cache_scope": "per_sample",
         "qwen_kv_granularity": "five_spatial_tokens_per_sample_step",

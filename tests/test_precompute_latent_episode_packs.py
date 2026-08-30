@@ -49,7 +49,11 @@ def test_qwen_batch_size_is_honored(monkeypatch) -> None:
     def fake_extract(batch, **_kwargs):
         size = len(batch["instructions"])
         calls.append(size)
-        return torch.zeros(size, 5, 2048), torch.zeros(size, 5, 2)
+        return (
+            torch.zeros(size, 5, 2048),
+            torch.zeros(size, 5, 2560, dtype=torch.bfloat16),
+            torch.zeros(size, 5, 2),
+        )
 
     monkeypatch.setattr(extractor, "extract_latent_student_spatial_kv", fake_extract)
     batch = {
@@ -58,7 +62,7 @@ def test_qwen_batch_size_is_honored(monkeypatch) -> None:
         "qwen_images": [[object()]] * 5,
     }
 
-    spatial_kv, waypoints = extractor.extract_latent_student_spatial_kv_chunked(
+    spatial_kv, hidden_states, waypoints = extractor.extract_latent_student_spatial_kv_chunked(
         batch,
         student=object(),
         processor=object(),
@@ -72,6 +76,8 @@ def test_qwen_batch_size_is_honored(monkeypatch) -> None:
 
     assert calls == [2, 2, 1]
     assert spatial_kv.shape == (5, 5, 2048)
+    assert hidden_states.shape == (5, 5, 2560)
+    assert hidden_states.dtype == torch.bfloat16
     assert waypoints.shape == (5, 5, 2)
 
 

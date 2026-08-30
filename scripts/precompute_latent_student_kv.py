@@ -312,7 +312,7 @@ def extract_latent_student_spatial_kv(
     expected_dim: int,
     spatial_token_count: int,
     prompt_template: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     inputs = batch_to_latent_student_inputs(
         batch,
         processor,
@@ -403,9 +403,12 @@ def extract_latent_student_spatial_kv(
         spatial_token_count=spatial_token_count,
         expected_dim=expected_dim,
     )
-    spatial_hidden = final_out.last_hidden_state[:, -spatial_token_count:, :]
+    # Preserve the final-layer spatial-token representations exactly as emitted
+    # by Qwen.  These are raw hidden states: no KV flattening, projection, MLP,
+    # or dtype conversion is applied.
+    spatial_hidden = final_out.last_hidden_state[:, -spatial_token_count:, :].contiguous()
     waypoints = student.spatial_mlp(spatial_hidden).to(torch.float32)
-    return spatial_kv, waypoints
+    return spatial_kv, spatial_hidden, waypoints
 
 
 def unique_instruction_indices(instructions: list[str]) -> tuple[list[str], torch.Tensor]:
@@ -516,6 +519,7 @@ def save_sample_shard(
     sample_start_index: int,
     batch: dict[str, Any],
     latent_kv: torch.Tensor,
+    spatial_hidden_states: torch.Tensor,
     waypoints: torch.Tensor,
     lang_tokens: torch.Tensor | None,
     lang_mask: torch.Tensor | None,
@@ -528,6 +532,13 @@ def save_sample_shard(
     image_storage: str,
 ) -> tuple[int, str]:
     batch_size = int(latent_kv.shape[0])
+    if spatial_hidden_states.ndim != 3 or spatial_hidden_states.shape[:2] != latent_kv.shape[:2]:
+        raise ValueError(
+            "Raw spatial hidden states must match the KV sample/token axes, got "
+            f"{tuple(spatial_hidden_states.shape)} versus {tuple(latent_kv.shape)}"
+        )
+    if not bool(torch.isfinite(spatial_hidden_states.float()).all()):
+        raise ValueError("Refusing to save raw spatial hidden states containing NaN or Inf")
     filename = f"shard_{shard_index:09d}.pt"
     path = split_dir / filename
 
@@ -563,6 +574,7 @@ def save_sample_shard(
         "sample_start_index": sample_start_index,
         "sample_stop_index": sample_start_index + batch_size,
         "qwen_kv": latent_kv.cpu(),
+        "qwen_hidden_states": spatial_hidden_states.cpu(),
         "latent_waypoints": waypoints.cpu(),
         "proprioception_schema": proprioception_schema,
         "state": cached_state.cpu(),
@@ -628,6 +640,8 @@ def save_sample_shard(
                 "last_step_idx": last_metadata["step_idx"],
                 "qwen_token_count": int(latent_kv.shape[1]),
                 "qwen_kv_dim": int(latent_kv.shape[2]),
+                "qwen_hidden_state_dim": int(spatial_hidden_states.shape[2]),
+                "has_qwen_hidden_states": True,
                 "has_lang_tokens": lang_tokens is not None,
                 "has_image_slots": cache_image_slots,
                 "has_joint_states": "joint_states" in record,
@@ -716,7 +730,7 @@ def precompute_split(
             dataset_label = batch_dataset_label(batch)
             skipped_no_image += int(batch.get("skipped_no_image", 0))
             kv_start = time.perf_counter()
-            latent_kv, waypoints = extract_latent_student_spatial_kv(
+            latent_kv, spatial_hidden_states, waypoints = extract_latent_student_spatial_kv(
                 batch,
                 student=student,
                 processor=processor,
@@ -757,6 +771,7 @@ def precompute_split(
                 sample_start_index=sample_count,
                 batch=batch,
                 latent_kv=latent_kv,
+                spatial_hidden_states=spatial_hidden_states,
                 waypoints=waypoints,
                 lang_tokens=lang_tokens,
                 lang_mask=lang_mask,

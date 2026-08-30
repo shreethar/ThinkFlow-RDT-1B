@@ -495,15 +495,17 @@ class PolicyEngine:
         if self.qwen_extraction_mode == "b2":
             assert self.extract_latent_student_spatial_kv is not None
             assert self.latent_student is not None
-            qwen_kv, _latent_waypoints = self.extract_latent_student_spatial_kv(
-                encoded,
-                student=self.latent_student,
-                processor=self.qwen_processor,
-                device=self.device,
-                layer_index=self.args.qwen_layer_index,
-                expected_dim=self.cfg.model.qwen_kv_dim,
-                spatial_token_count=self.args.spatial_token_count,
-                prompt_template=self.args.b2_prompt_template,
+            qwen_kv, _spatial_hidden_states, _latent_waypoints = (
+                self.extract_latent_student_spatial_kv(
+                    encoded,
+                    student=self.latent_student,
+                    processor=self.qwen_processor,
+                    device=self.device,
+                    layer_index=self.args.qwen_layer_index,
+                    expected_dim=self.cfg.model.qwen_kv_dim,
+                    spatial_token_count=self.args.spatial_token_count,
+                    prompt_template=self.args.b2_prompt_template,
+                )
             )
         else:
             assert self.qwen is not None
