@@ -26,6 +26,7 @@ ROLLOUT_ROOT=${ROLLOUT_ROOT:-$OUTPUT_DIR/rollout_evaluations}
 EPISODES_PER_TASK=${EPISODES_PER_TASK:-2}
 ENV_BATCH_SIZE=${ENV_BATCH_SIZE:-2}
 TASK_IDS=${TASK_IDS:-"0 2 4 6 8"}
+SUITES=${SUITES:-"libero_spatial libero_object libero_goal libero_10"}
 ACTION_CHUNK=${ACTION_CHUNK:-10}
 MAX_ROLLOUT_STEPS=${MAX_ROLLOUT_STEPS:-600}
 POLL_SECONDS=${POLL_SECONDS:-60}
@@ -66,8 +67,31 @@ if (( task_count == 0 )); then
   echo "TASK_IDS must contain at least one task ID" >&2
   exit 2
 fi
-expected_rollouts=$((4 * task_count * EPISODES_PER_TASK))
-echo "Online-Qwen rollout grid: $EPISODES_PER_TASK initial states x $task_count tasks x 4 suites = $expected_rollouts rollouts/checkpoint"
+suite_args=()
+declare -A seen_suites=()
+suite_count=0
+for suite in $SUITES; do
+  case "$suite" in
+    libero_spatial|libero_object|libero_goal|libero_10) ;;
+    *)
+      echo "Invalid LIBERO suite '$suite'" >&2
+      exit 2
+      ;;
+  esac
+  if [[ -n "${seen_suites[$suite]:-}" ]]; then
+    echo "Duplicate LIBERO suite '$suite' in SUITES='$SUITES'" >&2
+    exit 2
+  fi
+  seen_suites[$suite]=1
+  suite_args+=(--suite "$suite")
+  ((suite_count += 1))
+done
+if (( suite_count == 0 )); then
+  echo "SUITES must contain at least one suite" >&2
+  exit 2
+fi
+expected_rollouts=$((suite_count * task_count * EPISODES_PER_TASK))
+echo "Online-Qwen rollout grid: $EPISODES_PER_TASK initial states x $task_count tasks x $suite_count suites = $expected_rollouts rollouts/checkpoint"
 
 for ((step=EVAL_EVERY; step<=MAX_STEPS; step+=EVAL_EVERY)); do
   checkpoint="$OUTPUT_DIR/checkpoint-$step"
@@ -103,6 +127,7 @@ for ((step=EVAL_EVERY; step<=MAX_STEPS; step+=EVAL_EVERY)); do
       --max-steps "$MAX_ROLLOUT_STEPS" \
       --siglip-model-id "$SIGLIP_MODEL_ID" \
       --siglip-fallback-model-id "$SIGLIP_FALLBACK_MODEL_ID" \
+      "${suite_args[@]}" \
       "${task_args[@]}" \
       --wandb-project "$WANDB_PROJECT" \
       --wandb-run-name "$WANDB_RUN_NAME" \
