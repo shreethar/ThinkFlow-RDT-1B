@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Full Fast-ThinkAct B2 post-training from cached five-spatial-token Qwen KV.
+# Full B2 post-training from cached five-token hidden states + 2D waypoints.
+# The matching Qwen KV is retained in each cache shard for diagnostics only.
 # B2_CACHE_ROOT must contain train/ and validation/ episode-pack directories.
 
 CONFIG=${CONFIG:-configs/oxe_b2_rdt1b_native128_full.yaml}
 B2_CACHE_ROOT=${B2_CACHE_ROOT:-cache_features}
-OUTPUT_DIR=${OUTPUT_DIR:-output_2/b2_oxe_native128_full_state_qwen_crosskv}
+OUTPUT_DIR=${OUTPUT_DIR:-output_2/b2_oxe_native128_full_hidden_waypoint}
 SIGLIP_MODEL_ID=${SIGLIP_MODEL_ID:-/home/ubuntu/models/siglip-so400m-patch14-384}
 SIGLIP_FALLBACK_MODEL_ID=${SIGLIP_FALLBACK_MODEL_ID:-google/siglip-so400m-patch14-384}
 WANDB_PROJECT=${WANDB_PROJECT:-"ThinkLite B2 OXE"}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-oxe-b2-state-qwen-crosskv-rdt1b-full-20k}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-oxe-b2-hidden-waypoint-rdt1b-full-20k}
 WANDB_ENTITY=${WANDB_ENTITY:-}
 RESUME_FROM=${RESUME_FROM:-}
 SKIP_CACHE_PREFLIGHT=${SKIP_CACHE_PREFLIGHT:-0}
@@ -97,6 +98,14 @@ def inspect_manifest(raw_path: str) -> tuple[int, int, Counter[str]]:
             raise ValueError(f"{manifest}:{line_number} does not contain five Qwen tokens")
         if int(item.get("qwen_kv_dim", -1)) != 2048:
             raise ValueError(f"{manifest}:{line_number} has the wrong Qwen KV width")
+        if int(item.get("qwen_hidden_state_dim", -1)) != 2560:
+            raise ValueError(
+                f"{manifest}:{line_number} is missing 2560-D spatial hidden states"
+            )
+        if item.get("has_qwen_hidden_states") is not True:
+            raise ValueError(f"{manifest}:{line_number} is an old KV-only cache")
+        if item.get("has_latent_waypoints") is not True:
+            raise ValueError(f"{manifest}:{line_number} has no latent waypoints")
         if item.get("qwen_cache_scope") != "per_sample":
             raise ValueError(f"{manifest}:{line_number} is not per-sample Qwen KV")
 
@@ -128,6 +137,22 @@ def inspect_manifest(raw_path: str) -> tuple[int, int, Counter[str]]:
             raise ValueError(f"{path} Qwen KV is {qwen_kv.dtype}, expected bfloat16")
         if not torch.isfinite(qwen_kv.float()).all():
             raise ValueError(f"{path} contains non-finite Qwen KV")
+        hidden = torch.as_tensor(pack["qwen_anchor_hidden_states"])
+        waypoints = torch.as_tensor(pack["latent_waypoints"])
+        if tuple(hidden.shape) != (num_samples, 5, 2560):
+            raise ValueError(
+                f"{path} has hidden states {tuple(hidden.shape)}, expected "
+                f"({num_samples}, 5, 2560)"
+            )
+        if tuple(waypoints.shape) != (num_samples, 5, 2):
+            raise ValueError(
+                f"{path} has waypoints {tuple(waypoints.shape)}, expected "
+                f"({num_samples}, 5, 2)"
+            )
+        if not torch.isfinite(hidden.float()).all():
+            raise ValueError(f"{path} contains non-finite hidden states")
+        if not torch.isfinite(waypoints.float()).all():
+            raise ValueError(f"{path} contains non-finite waypoints")
         anchors = torch.as_tensor(pack["sample_anchor_index"], dtype=torch.long)
         if tuple(anchors.shape) != (num_samples,):
             raise ValueError(f"{path} has invalid sample_anchor_index shape")

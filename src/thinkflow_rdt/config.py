@@ -44,7 +44,18 @@ class ModelConfig:
     # state token to K/V, then directly appends the adapted Qwen K/V without a
     # second attention projection.
     # ``language`` is retained for backward compatibility with older artifacts.
+    # ``hidden_waypoint_cross_attention`` adapts each raw spatial-token hidden
+    # state plus its decoded 2-D waypoint to one native 2048-D RDT condition
+    # token. Each RDT block then applies its own pretrained cross-attention K/V
+    # projection. The cached Qwen K/V remains in the batch for diagnostics but
+    # is deliberately not consumed by this mode.
     qwen_fusion: str = "language"
+    # Identifies which LatentStudent supervision produced an otherwise shared
+    # hidden+waypoint interface. It is provenance, not an architecture switch.
+    conditioning_variant: str | None = None
+    spatial_token_count: int = 5
+    waypoint_dim: int = 2
+    waypoint_embed_dim: int = 64
     # The official pretrained RDT state adaptor consumes a unified 128-D state.
     # Delta actions can remain 7-D by using the separate action adaptor.
     rdt_state_dim: int | None = None
@@ -62,6 +73,11 @@ class ModelConfig:
     # ``rdt_eef`` treats action targets as absolute target states and encodes
     # them through the same native RDT EEF slots as current state observations.
     action_encoder_layout: str = "raw"
+    # Packing inside the unified 128-D vector. ``eef_pose_ortho6d`` preserves
+    # this project's older absolute-pose experiment. ``libero_joint_eef_delta``
+    # matches Libero_RDT: state joints [0:7] + normalized fingers [10:12], and
+    # action EEF delta [39:45] + gripper [10].
+    native_rdt_128_mapping: str = "eef_pose_ortho6d"
     # Compatibility switch for old caches that store binary gripper_closed in
     # dim 6. New LIBERO raw-command caches must leave this disabled.
     convert_cached_gripper_closed_to_open: bool = True
@@ -221,12 +237,24 @@ class ExperimentConfig:
             "cross_attention_kv",
             "fastthinkact_cross_attention_kv",
             "unified_cross_attention",
+            "hidden_waypoint_cross_attention",
         }:
             raise ValueError(
                 "model.qwen_fusion must be 'none', 'language', "
                 "'self_attention_kv', 'fastthinkact_state_kv', "
                 "'cross_attention_kv', 'fastthinkact_cross_attention_kv', or "
-                "'unified_cross_attention'"
+                "'unified_cross_attention', or "
+                "'hidden_waypoint_cross_attention'"
+            )
+        if self.model.spatial_token_count <= 0:
+            raise ValueError("model.spatial_token_count must be positive")
+        if self.model.waypoint_dim <= 0:
+            raise ValueError("model.waypoint_dim must be positive")
+        if self.model.waypoint_embed_dim <= 0:
+            raise ValueError("model.waypoint_embed_dim must be positive")
+        if self.model.conditioning_variant not in {None, "b2", "b3"}:
+            raise ValueError(
+                "model.conditioning_variant must be null, 'b2', or 'b3'"
             )
         if self.model.pretrained_copy_mode not in {"selected", "compatible"}:
             raise ValueError(
@@ -295,14 +323,30 @@ class ExperimentConfig:
                 )
             if self.model.resolved_rdt_state_dim != 128:
                 raise ValueError("rdt_native_128 requires rdt_state_dim=128")
+            if self.model.native_rdt_128_mapping not in {
+                "eef_pose_ortho6d",
+                "libero_joint_eef_delta",
+            }:
+                raise ValueError(
+                    "model.native_rdt_128_mapping must be "
+                    "'eef_pose_ortho6d' or 'libero_joint_eef_delta'"
+                )
             cache_layout = (
                 self.model.resolved_cache_state_dim,
                 self.model.resolved_cache_action_dim,
             )
-            if cache_layout not in {(7, 7), (11, 10)}:
+            allowed_cache_layouts = (
+                {(8, 7)}
+                if self.model.native_rdt_128_mapping
+                == "libero_joint_eef_delta"
+                else {(7, 7), (11, 10)}
+            )
+            if cache_layout not in allowed_cache_layouts:
                 raise ValueError(
-                    "rdt_native_128 requires cached 7-D OXE state/actions or "
-                    "11-D state + 10-D action LIBERO caches"
+                    "rdt_native_128 cache dimensions do not match "
+                    f"native_rdt_128_mapping={self.model.native_rdt_128_mapping!r}; "
+                    f"got {cache_layout}, expected one of "
+                    f"{sorted(allowed_cache_layouts)}"
                 )
         elif self.model.resolved_rdt_state_dim != self.model.state_dim:
             raise ValueError(

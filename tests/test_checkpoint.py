@@ -95,6 +95,21 @@ class FakeConditionedRDT(nn.Module):
         self.runner = FakeRunner(core)
 
 
+def add_hidden_waypoint_interface(model: FakeConditionedRDT) -> None:
+    model.cfg.model.qwen_fusion = "hidden_waypoint_cross_attention"
+    model.cfg.model.conditioning_variant = "b2"
+    model.cfg.model.spatial_token_count = 5
+    model.cfg.model.qwen_hidden_size = 8
+    model.cfg.model.waypoint_dim = 2
+    model.cfg.model.waypoint_embed_dim = 4
+    model.cfg.model.hidden_size = 6
+    model.plan_hidden_norm = nn.LayerNorm(8)
+    model.waypoint_adaptor = nn.Sequential(nn.Linear(2, 4), nn.Linear(4, 4))
+    model.plan_adaptor = nn.Sequential(nn.Linear(12, 6), nn.Linear(6, 6))
+    model.plan_type_embedding = nn.Parameter(torch.zeros(1, 1, 6))
+    model.plan_position_embedding = nn.Parameter(torch.zeros(1, 5, 6))
+
+
 def fill_parameters(model: nn.Module, start: float) -> None:
     with torch.no_grad():
         for index, parameter in enumerate(model.parameters()):
@@ -319,6 +334,82 @@ def test_full_artifact_accepts_accelerator_gathered_state(tmp_path):
     fill_parameters(restored, start=-30.0)
     load_trainable_artifact(restored, tmp_path, trainable=False)
     assert_states_equal(restored, expected)
+
+
+def test_hidden_waypoint_interfaces_and_metadata_round_trip(tmp_path):
+    source = FakeConditionedRDT(FakeFullCore(), finetune_mode="full")
+    add_hidden_waypoint_interface(source)
+    fill_parameters(source, start=5.0)
+    expected = {
+        name: tensor.detach().clone()
+        for name, tensor in source.state_dict().items()
+    }
+
+    save_trainable_artifact(
+        source,
+        tmp_path,
+        {"global_step": 3},
+        model_state_dict=source.state_dict(),
+    )
+
+    interfaces = torch.load(tmp_path / INTERFACE_FILE, weights_only=True)
+    for name in (
+        "plan_hidden_norm",
+        "waypoint_adaptor",
+        "plan_adaptor",
+        "plan_type_embedding",
+        "plan_position_embedding",
+    ):
+        assert name in interfaces
+    metadata = json.loads((tmp_path / METADATA_FILE).read_text())
+    assert metadata["conditioning_interface"] == {
+        "type": "hidden_waypoint_cross_attention",
+        "conditioning_variant": "b2",
+        "cached_kv_retained_but_unused": True,
+        "spatial_token_count": 5,
+        "qwen_hidden_size": 8,
+        "waypoint_dim": 2,
+        "waypoint_embed_dim": 4,
+        "rdt_condition_dim": 6,
+    }
+
+    restored = FakeConditionedRDT(FakeFullCore(), finetune_mode="full")
+    add_hidden_waypoint_interface(restored)
+    fill_parameters(restored, start=-5.0)
+    load_trainable_artifact(restored, tmp_path, trainable=False)
+
+    for name, tensor in restored.state_dict().items():
+        torch.testing.assert_close(tensor, expected[name])
+    assert all(not parameter.requires_grad for parameter in restored.parameters())
+
+
+def test_b0_artifact_can_initialize_new_plan_modules_but_resume_stays_strict(
+    tmp_path,
+):
+    source = FakeConditionedRDT(FakeFullCore(), finetune_mode="full")
+    fill_parameters(source, start=2.0)
+    save_trainable_artifact(source, tmp_path, {"global_step": 20})
+
+    target = FakeConditionedRDT(FakeFullCore(), finetune_mode="full")
+    add_hidden_waypoint_interface(target)
+    plan_before = {
+        name: tensor.detach().clone()
+        for name, tensor in target.state_dict().items()
+        if name.startswith("plan_") or name.startswith("waypoint_adaptor.")
+    }
+
+    with pytest.raises(KeyError, match="plan"):
+        load_trainable_artifact(target, tmp_path, trainable=True)
+
+    load_trainable_artifact(
+        target,
+        tmp_path,
+        trainable=True,
+        allow_missing_plan_interfaces=True,
+    )
+    for name, expected in plan_before.items():
+        torch.testing.assert_close(target.state_dict()[name], expected)
+    assert all(parameter.requires_grad for parameter in target.parameters())
 
 
 def test_full_base_can_reinitialize_only_a_changed_action_output_head(tmp_path):

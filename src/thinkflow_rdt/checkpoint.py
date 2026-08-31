@@ -268,6 +268,21 @@ def _interface_state(
             state["unified_cross_extra_pos_embed"] = model_state_dict[
                 "unified_cross_extra_pos_embed"
             ]
+        for name in (
+            "plan_hidden_norm",
+            "waypoint_adaptor",
+            "plan_adaptor",
+        ):
+            if getattr(model, name, None) is not None:
+                state[name] = _component_state(model_state_dict, f"{name}.")
+        if "plan_type_embedding" in model_state_dict:
+            state["plan_type_embedding"] = model_state_dict[
+                "plan_type_embedding"
+            ]
+        if "plan_position_embedding" in model_state_dict:
+            state["plan_position_embedding"] = model_state_dict[
+                "plan_position_embedding"
+            ]
         return state
     state = {
         _FORMAT_KEY: artifact_format,
@@ -282,10 +297,30 @@ def _interface_state(
         state["unified_cross_extra_pos_embed"] = (
             model.unified_cross_extra_pos_embed.detach().cpu()
         )
+    for name in (
+        "plan_hidden_norm",
+        "waypoint_adaptor",
+        "plan_adaptor",
+    ):
+        module = getattr(model, name, None)
+        if module is not None:
+            state[name] = module.state_dict()
+    if getattr(model, "plan_type_embedding", None) is not None:
+        state["plan_type_embedding"] = model.plan_type_embedding.detach().cpu()
+    if getattr(model, "plan_position_embedding", None) is not None:
+        state["plan_position_embedding"] = (
+            model.plan_position_embedding.detach().cpu()
+        )
     return state
 
 
-def _load_interfaces(model, interfaces: dict[str, Any], *, trainable: bool) -> None:
+def _load_interfaces(
+    model,
+    interfaces: dict[str, Any],
+    *,
+    trainable: bool,
+    allow_missing_plan_interfaces: bool = False,
+) -> None:
     required = {
         "qwen_adaptor",
         "lang_adaptor",
@@ -301,7 +336,27 @@ def _load_interfaces(model, interfaces: dict[str, Any], *, trainable: bool) -> N
         )
     if action_adaptor is not None:
         required.add("action_adaptor")
+    for name in (
+        "plan_hidden_norm",
+        "waypoint_adaptor",
+        "plan_adaptor",
+    ):
+        if getattr(model, name, None) is not None:
+            required.add(name)
+    if getattr(model, "plan_type_embedding", None) is not None:
+        required.add("plan_type_embedding")
+    if getattr(model, "plan_position_embedding", None) is not None:
+        required.add("plan_position_embedding")
+    plan_names = {
+        "plan_hidden_norm",
+        "waypoint_adaptor",
+        "plan_adaptor",
+        "plan_type_embedding",
+        "plan_position_embedding",
+    }
     missing = required.difference(interfaces)
+    if allow_missing_plan_interfaces:
+        missing -= plan_names
     if missing:
         raise KeyError(
             f"{INTERFACE_FILE} is missing checkpoint components: {sorted(missing)}"
@@ -315,7 +370,19 @@ def _load_interfaces(model, interfaces: dict[str, Any], *, trainable: bool) -> N
     }
     if action_adaptor is not None:
         modules["action_adaptor"] = action_adaptor
+    for name in (
+        "plan_hidden_norm",
+        "waypoint_adaptor",
+        "plan_adaptor",
+    ):
+        module = getattr(model, name, None)
+        if module is not None:
+            modules[name] = module
     for name, module in modules.items():
+        if name not in interfaces:
+            if allow_missing_plan_interfaces and name in plan_names:
+                continue
+            raise KeyError(f"{INTERFACE_FILE} is missing {name!r}")
         module.load_state_dict(interfaces[name])
         if not trainable:
             module.requires_grad_(False)
@@ -331,6 +398,29 @@ def _load_interfaces(model, interfaces: dict[str, Any], *, trainable: bool) -> N
         )
         if not trainable:
             model.unified_cross_extra_pos_embed.requires_grad = False
+    plan_type_embedding = getattr(model, "plan_type_embedding", None)
+    if plan_type_embedding is not None and "plan_type_embedding" in interfaces:
+        plan_type_embedding.data.copy_(
+            interfaces["plan_type_embedding"].to(
+                device=plan_type_embedding.device,
+                dtype=plan_type_embedding.dtype,
+            )
+        )
+        if not trainable:
+            plan_type_embedding.requires_grad = False
+    plan_position_embedding = getattr(model, "plan_position_embedding", None)
+    if (
+        plan_position_embedding is not None
+        and "plan_position_embedding" in interfaces
+    ):
+        plan_position_embedding.data.copy_(
+            interfaces["plan_position_embedding"].to(
+                device=plan_position_embedding.device,
+                dtype=plan_position_embedding.dtype,
+            )
+        )
+        if not trainable:
+            plan_position_embedding.requires_grad = False
 
 
 def save_trainable_artifact(
@@ -342,6 +432,26 @@ def save_trainable_artifact(
 ) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    metadata = dict(metadata)
+    model_config = getattr(getattr(model, "cfg", None), "model", None)
+    if getattr(model_config, "qwen_fusion", None) == "hidden_waypoint_cross_attention":
+        conditioning_interface = {
+            "type": "hidden_waypoint_cross_attention",
+            "cached_kv_retained_but_unused": True,
+            "spatial_token_count": int(model_config.spatial_token_count),
+            "qwen_hidden_size": int(model_config.qwen_hidden_size),
+            "waypoint_dim": int(model_config.waypoint_dim),
+            "waypoint_embed_dim": int(model_config.waypoint_embed_dim),
+            "rdt_condition_dim": int(model_config.hidden_size),
+        }
+        conditioning_variant = getattr(
+            model_config, "conditioning_variant", None
+        )
+        if conditioning_variant is not None:
+            conditioning_interface["conditioning_variant"] = str(
+                conditioning_variant
+            )
+        metadata.setdefault("conditioning_interface", conditioning_interface)
     artifact_format = _artifact_format_for_save(model)
     if artifact_format == _LORA_FORMAT:
         if not _is_peft_model(model.runner.model):
@@ -379,7 +489,13 @@ def save_trainable_artifact(
     _atomic_json_save(metadata, output / METADATA_FILE)
 
 
-def load_trainable_artifact(model, artifact_dir: str | Path, trainable: bool) -> None:
+def load_trainable_artifact(
+    model,
+    artifact_dir: str | Path,
+    trainable: bool,
+    *,
+    allow_missing_plan_interfaces: bool = False,
+) -> None:
     artifact = Path(artifact_dir)
     interfaces_path = artifact / INTERFACE_FILE
     if not interfaces_path.exists():
@@ -421,7 +537,12 @@ def load_trainable_artifact(model, artifact_dir: str | Path, trainable: bool) ->
     else:
         raise ValueError(f"Unsupported RDT artifact format: {artifact_format!r}")
 
-    _load_interfaces(model, interfaces, trainable=trainable)
+    _load_interfaces(
+        model,
+        interfaces,
+        trainable=trainable,
+        allow_missing_plan_interfaces=allow_missing_plan_interfaces,
+    )
     metadata_path = artifact / METADATA_FILE
     if metadata_path.exists():
         with metadata_path.open("r", encoding="utf-8") as handle:

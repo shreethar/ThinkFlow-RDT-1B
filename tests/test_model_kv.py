@@ -182,6 +182,68 @@ def test_fastthinkact_cross_attention_projects_state_but_bypasses_qwen_kv():
     assert torch.isfinite(sampled).all()
 
 
+def test_hidden_waypoint_plan_uses_native_cross_attention_projection():
+    base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
+    model_config = replace(
+        base.model,
+        finetune_mode="full",
+        qwen_fusion="hidden_waypoint_cross_attention",
+    )
+    cfg = replace(base, model=model_config)
+    cfg.validate()
+    model = SFTConditionedRDT(cfg, load_pretrained=False)
+    torch.nn.init.normal_(
+        model.runner.model.final_layer.ffn_final.fc2.weight,
+        std=0.02,
+    )
+    projected_condition_lengths: list[int] = []
+    hooks = [
+        block.cross_attn.kv.register_forward_pre_hook(
+            lambda _module, inputs: projected_condition_lengths.append(
+                int(inputs[0].shape[1])
+            )
+        )
+        for block in model.runner.model.blocks
+    ]
+    batch_size = 2
+    batch = {
+        "lang_tokens": torch.randn(batch_size, 12, 64),
+        "lang_mask": torch.ones(batch_size, 12, dtype=torch.bool),
+        "img_tokens": torch.randn(batch_size, 16, 64),
+        "img_mask": torch.ones(batch_size, 16, dtype=torch.bool),
+        # Retained in the cache/batch, but deliberately unused by this mode.
+        "qwen_kv": torch.randn(batch_size, 5, 64),
+        "qwen_hidden_states": torch.randn(batch_size, 5, 64),
+        "latent_waypoints": torch.rand(batch_size, 5, 2),
+        "plan_mask": torch.ones(batch_size, 5, dtype=torch.bool),
+        "state": torch.randn(batch_size, 7),
+        "actions": torch.randn(batch_size, 16, 7),
+        "action_time_mask": torch.ones(batch_size, 16, dtype=torch.bool),
+        "action_dim_mask": torch.ones(batch_size, 7),
+        "ctrl_freq": torch.full((batch_size,), 10.0),
+    }
+
+    metrics = model(batch)
+    for hook in hooks:
+        hook.remove()
+    metrics["loss"].backward()
+
+    # Five plan tokens plus one native state token are appended to both the
+    # alternating language and image cross-attention contexts.
+    assert projected_condition_lengths == [18, 22]
+    assert model.plan_adaptor is not None
+    assert model.plan_adaptor[-1].weight.grad is not None
+    assert float(model.plan_adaptor[-1].weight.grad.norm()) > 0.0
+    assert model.waypoint_adaptor is not None
+    assert model.waypoint_adaptor[-1].weight.grad is not None
+    assert float(model.waypoint_adaptor[-1].weight.grad.norm()) > 0.0
+    assert model.plan_position_embedding is not None
+    assert model.plan_position_embedding.grad is not None
+    assert float(model.plan_position_embedding.grad.norm()) > 0.0
+    assert all(parameter.grad is None for parameter in model.qwen_adaptor.parameters())
+    assert metrics["loss"].isfinite()
+
+
 def test_qwen_fusion_ranking_loss_uses_matched_and_shuffled_conditions():
     base = load_config(REPO_ROOT / "configs" / "tiny_smoke.yaml")
     model_config = replace(

@@ -1,12 +1,11 @@
 seed: 42
 rdt_repo: /home/ubuntu/RoboticsDiffusionTransformer
 pretrained_model: robotics-diffusion-transformer/rdt-1b
-output_dir: output_2/b2_oxe_native128_full_state_qwen_crosskv
+output_dir: output_2/b2_oxe_native128_full_hidden_waypoint
 
 model:
-  # B2 and B0 share the same RDT architecture. B2 is selected by the cache:
-  # every sample contains five spatial Qwen KV tokens [5, 2048] rather than
-  # B0's single token [1, 2048].
+  # Each B2 sample retains KV [5,2048] for analysis, but training consumes the
+  # matching final hidden states [5,2560] and decoded waypoints [5,2].
   action_dim: 128
   state_dim: 128
   cache_action_dim: 7
@@ -14,6 +13,9 @@ model:
   pred_horizon: 64
   qwen_hidden_size: 2560
   qwen_kv_dim: 2048
+  spatial_token_count: 5
+  waypoint_dim: 2
+  waypoint_embed_dim: 64
   lang_token_dim: 4096
   img_token_dim: 1152
   max_lang_tokens: 128
@@ -28,7 +30,8 @@ model:
   copy_pretrained_final_fc1: true
   gradient_checkpointing: false
   finetune_mode: full
-  qwen_fusion: fastthinkact_cross_attention_kv
+  qwen_fusion: hidden_waypoint_cross_attention
+  conditioning_variant: b2
   pretrained_copy_mode: compatible
   rdt_state_dim: 128
   state_encoder_layout: rdt_native_128
@@ -96,13 +99,12 @@ training:
   mixed_precision: bf16
   report_to: wandb
   wandb_project: "ThinkLite B2 OXE"
-  wandb_run_name: oxe-b2-state-qwen-crosskv-rdt1b-full-20k
+  wandb_run_name: oxe-b2-hidden-waypoint-rdt1b-full-20k
   skip_nonfinite_updates: true
   max_consecutive_nonfinite_updates: 10
   log_gradient_stats: true
   qualitative_validation_examples: 32
-  # Experimental matched-vs-shuffled counterfactual objective. Fast-ThinkAct's
-  # published action stage uses imitation loss alone; this explicitly prevents
-  # RDT from treating the B2 KV as only a sample-independent bias.
+  # Matched-vs-shuffled counterfactual objective. Hidden states and waypoints
+  # are shuffled together so the negative remains a coherent foreign plan.
   qwen_fusion_loss_weight: 0.5
   qwen_fusion_loss_margin: 0.002

@@ -20,6 +20,7 @@ from thinkflow_rdt.checkpoint import load_trainable_artifact  # noqa: E402
 from thinkflow_rdt.config import ExperimentConfig, load_config  # noqa: E402
 from thinkflow_rdt.data import (  # noqa: E402
     ONLINE_SIGLIP_REQUIRED_KEYS,
+    PLAN_FEATURE_REQUIRED_KEYS,
     CachedFeatureDataset,
     RDTBatchCollator,
     RDTOnlineSiglipBatchCollator,
@@ -170,7 +171,7 @@ def build_cross_dataset_qwen_replacements(
     seed: int,
 ) -> dict[str, Any]:
     """Preselect mismatched Qwen tensors from a different dataset for each index."""
-    qwen_by_dataset: dict[str, list[tuple[int, torch.Tensor]]] = {}
+    qwen_by_dataset: dict[str, list[tuple[int, dict[str, torch.Tensor]]]] = {}
     source_dataset_by_index: dict[int, str] = {}
     for index in indices:
         sample = dataset[index]
@@ -182,11 +183,24 @@ def build_cross_dataset_qwen_replacements(
             raise ValueError(
                 f"Expected qwen_kv [tokens, dim] for index {index}, got {tuple(qwen_kv.shape)}"
             )
-        qwen_by_dataset.setdefault(dataset_id, []).append((index, qwen_kv.clone()))
+        features = {"qwen_kv": qwen_kv.clone()}
+        if "qwen_hidden_states" in sample or "latent_waypoints" in sample:
+            if not PLAN_FEATURE_REQUIRED_KEYS.issubset(sample):
+                raise KeyError(
+                    "Cross-dataset plan ablation requires both qwen_hidden_states "
+                    "and latent_waypoints"
+                )
+            features["qwen_hidden_states"] = torch.as_tensor(
+                sample["qwen_hidden_states"]
+            ).detach().cpu().clone()
+            features["latent_waypoints"] = torch.as_tensor(
+                sample["latent_waypoints"]
+            ).detach().cpu().clone()
+        qwen_by_dataset.setdefault(dataset_id, []).append((index, features))
         source_dataset_by_index[index] = dataset_id
 
     rng = random.Random(seed)
-    replacements: dict[int, torch.Tensor] = {}
+    replacements: dict[int, dict[str, torch.Tensor]] = {}
     replacement_dataset_by_index: dict[int, str] = {}
     pair_counts: dict[str, int] = {}
     dataset_ids = sorted(qwen_by_dataset)
@@ -198,8 +212,10 @@ def build_cross_dataset_qwen_replacements(
         if not candidate_datasets:
             continue
         replacement_dataset_id = rng.choice(candidate_datasets)
-        _, replacement_qwen = rng.choice(qwen_by_dataset[replacement_dataset_id])
-        replacements[index] = replacement_qwen.clone()
+        _, replacement_features = rng.choice(qwen_by_dataset[replacement_dataset_id])
+        replacements[index] = {
+            key: value.clone() for key, value in replacement_features.items()
+        }
         replacement_dataset_by_index[index] = replacement_dataset_id
         pair_key = f"{source_dataset_id}->{replacement_dataset_id}"
         pair_counts[pair_key] = pair_counts.get(pair_key, 0) + 1
@@ -224,49 +240,70 @@ def build_cross_dataset_qwen_replacements(
 def cross_dataset_qwen_for_batch(
     cross_dataset_qwen: dict[str, Any],
     batch_indices: list[int],
-    reference: torch.Tensor,
-) -> tuple[torch.Tensor, int]:
-    tensors = []
+    references: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], int]:
+    tensors: dict[str, list[torch.Tensor]] = {key: [] for key in references}
     missing = 0
-    replacements: dict[int, torch.Tensor] = cross_dataset_qwen["replacements"]
+    replacements: dict[int, dict[str, torch.Tensor]] = cross_dataset_qwen[
+        "replacements"
+    ]
     for row, index in enumerate(batch_indices):
         replacement = replacements.get(index)
         if replacement is None:
-            tensors.append(torch.zeros_like(reference[row]))
+            for key, reference in references.items():
+                tensors[key].append(torch.zeros_like(reference[row]))
             missing += 1
         else:
-            tensors.append(
-                replacement.to(device=reference.device, dtype=reference.dtype)
-            )
-    return torch.stack(tensors, dim=0), missing
+            for key, reference in references.items():
+                if key not in replacement:
+                    raise KeyError(
+                        f"Cross-dataset replacement is missing plan feature {key!r}"
+                    )
+                tensors[key].append(
+                    replacement[key].to(
+                        device=reference.device,
+                        dtype=reference.dtype,
+                    )
+                )
+    return {
+        key: torch.stack(values, dim=0) for key, values in tensors.items()
+    }, missing
 
 
 def apply_variant(
     batch: dict[str, Any],
     variant: str,
     *,
-    cross_dataset_qwen_batch: torch.Tensor | None = None,
+    cross_dataset_qwen_batch: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     out = clone_batch(batch)
     if variant == "baseline":
         return out
     if variant == "zero_qwen":
         out["qwen_kv"] = torch.zeros_like(out["qwen_kv"])
+        if "qwen_hidden_states" in out:
+            out["qwen_hidden_states"] = torch.zeros_like(out["qwen_hidden_states"])
+            out["latent_waypoints"] = torch.zeros_like(out["latent_waypoints"])
+            out["plan_mask"] = torch.zeros_like(out["plan_mask"], dtype=torch.bool)
         return out
     if variant == "shuffle_qwen":
         out["qwen_kv"] = roll_or_zero(out["qwen_kv"])
+        for key in ("qwen_hidden_states", "latent_waypoints", "plan_mask"):
+            if key in out:
+                out[key] = roll_or_zero(out[key])
         return out
     if variant == "cross_dataset_qwen":
         if cross_dataset_qwen_batch is None:
             out["qwen_kv"] = torch.zeros_like(out["qwen_kv"])
             return out
-        if cross_dataset_qwen_batch.shape != out["qwen_kv"].shape:
-            raise ValueError(
-                "cross_dataset_qwen replacement shape "
-                f"{tuple(cross_dataset_qwen_batch.shape)} does not match "
-                f"batch qwen_kv shape {tuple(out['qwen_kv'].shape)}"
-            )
-        out["qwen_kv"] = cross_dataset_qwen_batch
+        for key, replacement in cross_dataset_qwen_batch.items():
+            if replacement.shape != out[key].shape:
+                raise ValueError(
+                    f"cross_dataset_qwen {key} replacement shape "
+                    f"{tuple(replacement.shape)} does not match batch shape "
+                    f"{tuple(out[key].shape)}"
+                )
+            out[key] = replacement
         return out
     if variant == "zero_lang":
         out["lang_tokens"] = torch.zeros_like(out["lang_tokens"])
@@ -290,6 +327,9 @@ def apply_variant(
         return out
     if variant == "shuffle_all_context":
         out["qwen_kv"] = roll_or_zero(out["qwen_kv"])
+        for key in ("qwen_hidden_states", "latent_waypoints", "plan_mask"):
+            if key in out:
+                out[key] = roll_or_zero(out[key])
         out["lang_tokens"] = roll_or_zero(out["lang_tokens"])
         out["lang_mask"] = roll_or_zero(out["lang_mask"])
         out["img_tokens"] = roll_or_zero(out["img_tokens"])
@@ -631,6 +671,20 @@ def finalize_gripper_metrics(
 
 
 def build_collator(cfg: ExperimentConfig, *, online_siglip: bool):
+    require_plan_features = (
+        cfg.model.qwen_fusion == "hidden_waypoint_cross_attention"
+    )
+    plan_kwargs = {
+        "plan_hidden_dim": cfg.model.qwen_hidden_size,
+        "spatial_token_count": cfg.model.spatial_token_count,
+        "waypoint_dim": cfg.model.waypoint_dim,
+        "require_plan_features": require_plan_features,
+        "native_rdt_128_mapping": cfg.model.native_rdt_128_mapping,
+        "cache_state_dim": cfg.model.resolved_cache_state_dim,
+        "cache_action_dim": cfg.model.resolved_cache_action_dim,
+        "native_rdt_128": cfg.model.state_encoder_layout == "rdt_native_128",
+        "action_stats_paths": cfg.data.action_stats_paths,
+    }
     if online_siglip:
         return RDTOnlineSiglipBatchCollator(
             max_lang_tokens=cfg.model.max_lang_tokens,
@@ -643,6 +697,7 @@ def build_collator(cfg: ExperimentConfig, *, online_siglip: bool):
             convert_cached_gripper_closed_to_open=(
                 cfg.model.convert_cached_gripper_closed_to_open
             ),
+            **plan_kwargs,
         )
     return RDTBatchCollator(
         max_lang_tokens=cfg.model.max_lang_tokens,
@@ -657,6 +712,7 @@ def build_collator(cfg: ExperimentConfig, *, online_siglip: bool):
         convert_cached_gripper_closed_to_open=(
             cfg.model.convert_cached_gripper_closed_to_open
         ),
+        **plan_kwargs,
     )
 
 
@@ -739,10 +795,14 @@ def evaluate_model(
                     "No cross-dataset Qwen replacement pool was provided; falling back to zeros."
                 )
             else:
+                cross_dataset_references = {"qwen_kv": batch["qwen_kv"]}
+                for key in ("qwen_hidden_states", "latent_waypoints"):
+                    if key in batch:
+                        cross_dataset_references[key] = batch[key]
                 cross_dataset_qwen_batch, missing = cross_dataset_qwen_for_batch(
                     cross_dataset_qwen,
                     batch_indices,
-                    batch["qwen_kv"],
+                    cross_dataset_references,
                 )
                 if missing:
                     variant_notes["cross_dataset_qwen"].append(
@@ -952,7 +1012,10 @@ def main() -> None:
     merged_manifest = args.output_dir / f"merged_{args.split}_manifest.jsonl"
     merged_rows = merge_manifests(manifests, merged_manifest)
 
-    required_keys = ONLINE_SIGLIP_REQUIRED_KEYS if args.online_siglip else None
+    required_keys = set(ONLINE_SIGLIP_REQUIRED_KEYS) if args.online_siglip else None
+    if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+        required_keys = set() if required_keys is None else required_keys
+        required_keys.update(PLAN_FEATURE_REQUIRED_KEYS)
     dataset = CachedFeatureDataset(merged_manifest, required_keys=required_keys)
     indices = selected_indices(
         len(dataset),

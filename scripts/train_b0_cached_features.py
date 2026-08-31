@@ -282,6 +282,11 @@ def build_config(args: argparse.Namespace):
         ),
     )
     model_cfg = cfg.model
+    if args.conditioning_variant is not None:
+        model_cfg = replace(
+            model_cfg,
+            conditioning_variant=str(args.conditioning_variant),
+        )
     if args.no_gradient_checkpointing:
         model_cfg = replace(model_cfg, gradient_checkpointing=False)
     if args.image_tokens is not None:
@@ -421,6 +426,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate-lora", type=float, default=None)
     parser.add_argument("--learning-rate-interfaces", type=float, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument(
+        "--conditioning-variant",
+        choices=("b2", "b3"),
+        default=None,
+        help=(
+            "Record and enforce the B2/B3 provenance of hidden+waypoint "
+            "conditioning in the resolved config and checkpoints."
+        ),
+    )
     parser.add_argument("--warmup-steps", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--validate-every", type=int, default=None)

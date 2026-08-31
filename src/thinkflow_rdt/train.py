@@ -29,6 +29,7 @@ from .checkpoint import (
 from .config import ExperimentConfig
 from .data import (
     ONLINE_SIGLIP_REQUIRED_KEYS,
+    PLAN_FEATURE_REQUIRED_KEYS,
     CachedFeatureDataset,
     EpisodePackSampler,
     FixedStratifiedSampler,
@@ -77,16 +78,48 @@ NATIVE_EEF_ACTION_NAMES = (
     "rot6d_5",
     "gripper_open",
 )
+NATIVE_EEF_DELTA_ACTION_NAMES = (
+    "dx",
+    "dy",
+    "dz",
+    "droll",
+    "dpitch",
+    "dyaw",
+    "gripper_open",
+)
 
 
-def native_rdt_action_to_10d(values: torch.Tensor) -> torch.Tensor:
-    """Extract supervised EEF dimensions from a native 128-D RDT vector."""
+def native_rdt_action_to_task(
+    values: torch.Tensor,
+    *,
+    mapping: str = "eef_pose_ortho6d",
+) -> torch.Tensor:
+    """Extract the active action slots from a native 128-D RDT vector."""
     if values.shape[-1] != 128:
         raise ValueError(f"Expected native RDT width 128, got {values.shape[-1]}")
+    if mapping == "libero_joint_eef_delta":
+        return torch.cat(
+            (values[..., 39:45], values[..., 10:11]),
+            dim=-1,
+        )
+    if mapping != "eef_pose_ortho6d":
+        raise ValueError(f"Unsupported native RDT mapping: {mapping!r}")
     return torch.cat(
         (values[..., 30:33], values[..., 33:39], values[..., 10:11]),
         dim=-1,
     )
+
+
+def native_rdt_state_to_task(
+    values: torch.Tensor,
+    *,
+    mapping: str = "eef_pose_ortho6d",
+) -> torch.Tensor:
+    if values.shape[-1] != 128:
+        raise ValueError(f"Expected native RDT width 128, got {values.shape[-1]}")
+    if mapping == "libero_joint_eef_delta":
+        return torch.cat((values[..., :7], values[..., 10:12]), dim=-1)
+    return native_rdt_action_to_task(values, mapping=mapping)
 
 
 def _binary_transition_events(
@@ -216,28 +249,41 @@ def _trajectory_comparison_figure(
     prediction: torch.Tensor,
     target: torch.Tensor,
     time_mask: torch.Tensor,
+    *,
+    mapping: str,
 ):
     import matplotlib.pyplot as plt
 
-    prediction_10d = native_rdt_action_to_10d(prediction).float().cpu()
-    target_10d = native_rdt_action_to_10d(target).float().cpu()
+    prediction_task = native_rdt_action_to_task(
+        prediction, mapping=mapping
+    ).float().cpu()
+    target_task = native_rdt_action_to_task(target, mapping=mapping).float().cpu()
     valid_steps = int(time_mask.bool().sum().item())
-    valid_steps = max(1, min(valid_steps, prediction_10d.shape[0]))
-    figure, axes = plt.subplots(5, 2, figsize=(12, 12), sharex=True)
-    for dimension, axis in enumerate(axes.flatten()):
+    valid_steps = max(1, min(valid_steps, prediction_task.shape[0]))
+    names = (
+        NATIVE_EEF_DELTA_ACTION_NAMES
+        if mapping == "libero_joint_eef_delta"
+        else NATIVE_EEF_ACTION_NAMES
+    )
+    rows = math.ceil(len(names) / 2)
+    figure, axes = plt.subplots(rows, 2, figsize=(12, 2.4 * rows), sharex=True)
+    flat_axes = axes.flatten()
+    for dimension, axis in enumerate(flat_axes[: len(names)]):
         axis.plot(
-            target_10d[:valid_steps, dimension].numpy(),
+            target_task[:valid_steps, dimension].numpy(),
             label="ground truth",
             linewidth=2,
         )
         axis.plot(
-            prediction_10d[:valid_steps, dimension].numpy(),
+            prediction_task[:valid_steps, dimension].numpy(),
             label="diffusion sample",
             linewidth=1.5,
         )
-        axis.set_title(NATIVE_EEF_ACTION_NAMES[dimension])
+        axis.set_title(names[dimension])
         axis.grid(alpha=0.25)
-    axes.flatten()[0].legend(loc="best")
+    for axis in flat_axes[len(names) :]:
+        axis.remove()
+    flat_axes[0].legend(loc="best")
     figure.supxlabel("future horizon step")
     figure.tight_layout()
     return figure
@@ -316,10 +362,17 @@ def create_dataloader(
     stratified: bool = False,
     batch_size: int | None = None,
 ) -> DataLoader:
+    require_plan_features = (
+        cfg.model.qwen_fusion == "hidden_waypoint_cross_attention"
+    )
     if online_siglip:
         dataset = CachedFeatureDataset(
             manifest,
-            required_keys=ONLINE_SIGLIP_REQUIRED_KEYS,
+            required_keys=(
+                ONLINE_SIGLIP_REQUIRED_KEYS | PLAN_FEATURE_REQUIRED_KEYS
+                if require_plan_features
+                else ONLINE_SIGLIP_REQUIRED_KEYS
+            ),
             excluded_dataset_ids=cfg.data.excluded_dataset_ids,
         )
         collator = RDTOnlineSiglipBatchCollator(
@@ -330,6 +383,10 @@ def create_dataloader(
             action_dim=cfg.model.action_dim,
             lang_token_dim=cfg.model.lang_token_dim,
             qwen_kv_dim=cfg.model.qwen_kv_dim,
+            plan_hidden_dim=cfg.model.qwen_hidden_size,
+            spatial_token_count=cfg.model.spatial_token_count,
+            waypoint_dim=cfg.model.waypoint_dim,
+            require_plan_features=require_plan_features,
             convert_cached_gripper_closed_to_open=(
                 cfg.model.convert_cached_gripper_closed_to_open
             ),
@@ -338,11 +395,26 @@ def create_dataloader(
             native_rdt_128=(
                 cfg.model.state_encoder_layout == "rdt_native_128"
             ),
+            native_rdt_128_mapping=cfg.model.native_rdt_128_mapping,
             action_stats_paths=cfg.data.action_stats_paths,
         )
     else:
         dataset = CachedFeatureDataset(
             manifest,
+            required_keys=(
+                None
+                if not require_plan_features
+                else {
+                    "qwen_kv",
+                    "qwen_hidden_states",
+                    "latent_waypoints",
+                    "lang_tokens",
+                    "img_tokens",
+                    "state",
+                    "actions",
+                    "ctrl_freq",
+                }
+            ),
             excluded_dataset_ids=cfg.data.excluded_dataset_ids,
         )
         collator = RDTBatchCollator(
@@ -355,6 +427,10 @@ def create_dataloader(
             lang_token_dim=cfg.model.lang_token_dim,
             img_token_dim=cfg.model.img_token_dim,
             qwen_kv_dim=cfg.model.qwen_kv_dim,
+            plan_hidden_dim=cfg.model.qwen_hidden_size,
+            spatial_token_count=cfg.model.spatial_token_count,
+            waypoint_dim=cfg.model.waypoint_dim,
+            require_plan_features=require_plan_features,
             convert_cached_gripper_closed_to_open=(
                 cfg.model.convert_cached_gripper_closed_to_open
             ),
@@ -363,6 +439,7 @@ def create_dataloader(
             native_rdt_128=(
                 cfg.model.state_encoder_layout == "rdt_native_128"
             ),
+            native_rdt_128_mapping=cfg.model.native_rdt_128_mapping,
             action_stats_paths=cfg.data.action_stats_paths,
         )
     persistent = cfg.data.persistent_workers and cfg.data.num_workers > 0
@@ -631,14 +708,23 @@ def create_optimizer(model: SFTConditionedRDT, cfg: ExperimentConfig):
                 continue
             if name.startswith("runner.model."):
                 rdt_parameters.append(parameter)
-            elif name.startswith("qwen_adaptor."):
+            elif name.startswith(
+                (
+                    "qwen_adaptor.",
+                    "plan_hidden_norm.",
+                    "waypoint_adaptor.",
+                    "plan_adaptor.",
+                    "plan_type_embedding",
+                    "plan_position_embedding",
+                )
+            ):
                 projector_parameters.append(parameter)
             else:
                 other_parameters.append(parameter)
         if not rdt_parameters:
             raise RuntimeError("No full-RDT parameters are trainable")
         if not projector_parameters:
-            raise RuntimeError("No Qwen KV projector parameters are trainable")
+            raise RuntimeError("No plan-conditioning projector parameters are trainable")
         parameter_groups = [
             {
                 "params": rdt_parameters,
@@ -650,7 +736,7 @@ def create_optimizer(model: SFTConditionedRDT, cfg: ExperimentConfig):
                 "params": projector_parameters,
                 "lr": learning_rate,
                 "weight_decay": cfg.training.weight_decay_interfaces,
-                "name": "qwen_projector",
+                "name": "plan_projector",
             },
         ]
         if other_parameters:
@@ -971,6 +1057,13 @@ def validate(
     action_encoder_layout = getattr(
         cfg.model, "action_encoder_layout", "raw"
     )
+    native_mapping = getattr(
+        cfg.model, "native_rdt_128_mapping", "eef_pose_ortho6d"
+    )
+    native_action_width = (
+        7 if native_mapping == "libero_joint_eef_delta" else 10
+    )
+    native_metric_label = f"native{native_action_width}"
     validation_batch_limit = resolve_validation_batch_limit(cfg, accelerator)
     loss_sum = torch.zeros((), device=accelerator.device, dtype=torch.float64)
     mae_sum = torch.zeros_like(loss_sum)
@@ -1135,7 +1228,21 @@ def validate(
             run_qwen_ablation = (
                 index < cfg.training.sample_validation_batches
                 and getattr(cfg.model, "qwen_fusion", "none") != "none"
-                and isinstance(batch.get("qwen_kv"), torch.Tensor)
+                and (
+                    (
+                        cfg.model.qwen_fusion
+                        == "hidden_waypoint_cross_attention"
+                        and isinstance(
+                            batch.get("qwen_hidden_states"), torch.Tensor
+                        )
+                        and isinstance(batch.get("latent_waypoints"), torch.Tensor)
+                    )
+                    or (
+                        cfg.model.qwen_fusion
+                        != "hidden_waypoint_cross_attention"
+                        and isinstance(batch.get("qwen_kv"), torch.Tensor)
+                    )
+                )
                 and isinstance(batch.get("actions"), torch.Tensor)
             )
             run_image_ablation = (
@@ -1160,12 +1267,39 @@ def validate(
                     dtype=torch.long,
                 )
             if run_qwen_ablation:
-                qwen_kv = batch["qwen_kv"]
-                assert isinstance(qwen_kv, torch.Tensor)
                 zero_batch = dict(batch)
-                zero_batch["qwen_kv"] = torch.zeros_like(qwen_kv)
                 shuffled_batch = dict(batch)
-                shuffled_batch["qwen_kv"] = qwen_kv.roll(1, dims=0)
+                if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                    hidden_states = batch["qwen_hidden_states"]
+                    latent_waypoints = batch["latent_waypoints"]
+                    assert isinstance(hidden_states, torch.Tensor)
+                    assert isinstance(latent_waypoints, torch.Tensor)
+                    zero_batch["qwen_hidden_states"] = torch.zeros_like(
+                        hidden_states
+                    )
+                    zero_batch["latent_waypoints"] = torch.zeros_like(
+                        latent_waypoints
+                    )
+                    zero_batch["plan_mask"] = torch.zeros(
+                        hidden_states.shape[:2],
+                        dtype=torch.bool,
+                        device=hidden_states.device,
+                    )
+                    shuffled_batch["qwen_hidden_states"] = hidden_states.roll(
+                        1, dims=0
+                    )
+                    shuffled_batch["latent_waypoints"] = latent_waypoints.roll(
+                        1, dims=0
+                    )
+                    if isinstance(batch.get("plan_mask"), torch.Tensor):
+                        shuffled_batch["plan_mask"] = batch["plan_mask"].roll(
+                            1, dims=0
+                        )
+                else:
+                    qwen_kv = batch["qwen_kv"]
+                    assert isinstance(qwen_kv, torch.Tensor)
+                    zero_batch["qwen_kv"] = torch.zeros_like(qwen_kv)
+                    shuffled_batch["qwen_kv"] = qwen_kv.roll(1, dims=0)
                 qwen_ablation_batches = [zero_batch, shuffled_batch]
             image_zero_batch: dict[str, object] | None = None
             if run_image_ablation:
@@ -1413,8 +1547,12 @@ def validate(
                     ).sum().double()
                     image_zero_sample_valid_count += per_sample_valid.sum().double()
                 if action_encoder_layout == "rdt_native_128":
-                    prediction_10d = native_rdt_action_to_10d(prediction)
-                    target_10d = native_rdt_action_to_10d(target)
+                    prediction_10d = native_rdt_action_to_task(
+                        prediction, mapping=native_mapping
+                    )
+                    target_10d = native_rdt_action_to_task(
+                        target, mapping=native_mapping
+                    )
                     raw_time_mask = batch["action_time_mask"].to(
                         accelerator.device, dtype=torch.bool
                     )
@@ -1422,13 +1560,23 @@ def validate(
                         "action_dim_mask"
                     ][:, 10].to(accelerator.device, dtype=torch.bool).unsqueeze(1)
                     native_libero_layout = (
-                        getattr(cfg.model, "resolved_cache_state_dim", None) == 11
-                        and getattr(cfg.model, "resolved_cache_action_dim", None) == 10
+                        native_mapping == "libero_joint_eef_delta"
+                        or (
+                            getattr(cfg.model, "resolved_cache_state_dim", None)
+                            == 11
+                            and getattr(
+                                cfg.model, "resolved_cache_action_dim", None
+                            )
+                            == 10
+                        )
                     )
                     # Native OXE slot 10 is gripper-open. The LIBERO cache keeps
                     # its simulator command convention: negative=open,
                     # positive=close/hold.
-                    if native_libero_layout:
+                    if native_mapping == "libero_joint_eef_delta":
+                        predicted_open = prediction[..., 10] >= 0.0
+                        target_open = target[..., 10] >= 0.0
+                    elif native_libero_layout:
                         predicted_open = prediction[..., 10] < 0.0
                         target_open = target[..., 10] < 0.0
                     else:
@@ -1467,7 +1615,11 @@ def validate(
                         )
                         state_values = batch.get("state")
                         if state_values is not None:
-                            if native_libero_layout:
+                            if native_mapping == "libero_joint_eef_delta":
+                                state_open = state_values[:, 10:12].to(
+                                    accelerator.device
+                                ).mean(dim=-1) >= 0.5
+                            elif native_libero_layout:
                                 state_open = state_values[:, 10].to(
                                     accelerator.device
                                 ).abs() >= 0.035
@@ -1535,14 +1687,15 @@ def validate(
                             )
                         ).sum().double()
                         sampled_native10_count[horizon_slot] += (
-                            horizon_valid.sum().double() * 10
+                            horizon_valid.sum().double() * native_action_width
                         )
 
                     for ablation_index, ablation_prediction in enumerate(
                         qwen_ablation_predictions
                     ):
-                        ablation_prediction_10d = native_rdt_action_to_10d(
-                            ablation_prediction
+                        ablation_prediction_10d = native_rdt_action_to_task(
+                            ablation_prediction,
+                            mapping=native_mapping,
                         )
                         prediction_delta = (
                             ablation_prediction_10d - prediction_10d
@@ -1557,7 +1710,9 @@ def validate(
                         ).sum().double()
                         qwen_ablation_prediction_delta_count[
                             ablation_index
-                        ] += raw_time_mask.sum().double() * 10
+                        ] += (
+                            raw_time_mask.sum().double() * native_action_width
+                        )
                         for horizon_slot, horizon in enumerate(
                             sampled_horizons
                         ):
@@ -1576,10 +1731,14 @@ def validate(
                             ).sum().double()
                             qwen_ablation_native10_count[
                                 ablation_index, horizon_slot
-                            ] += horizon_valid.sum().double() * 10
+                            ] += (
+                                horizon_valid.sum().double()
+                                * native_action_width
+                            )
                     if image_zero_prediction is not None:
-                        image_zero_prediction_10d = native_rdt_action_to_10d(
-                            image_zero_prediction
+                        image_zero_prediction_10d = native_rdt_action_to_task(
+                            image_zero_prediction,
+                            mapping=native_mapping,
                         )
                         image_prediction_delta = (
                             image_zero_prediction_10d - prediction_10d
@@ -1591,7 +1750,7 @@ def validate(
                             )
                         ).sum().double()
                         image_zero_prediction_delta_count += (
-                            raw_time_mask.sum().double() * 10
+                            raw_time_mask.sum().double() * native_action_width
                         )
 
                     if (
@@ -1624,9 +1783,11 @@ def validate(
                                 prediction[row],
                                 target[row],
                                 batch["action_time_mask"][row],
+                                mapping=native_mapping,
                             )
-                            state_10d = native_rdt_action_to_10d(
-                                batch["state"][row]
+                            state_10d = native_rdt_state_to_task(
+                                batch["state"][row],
+                                mapping=native_mapping,
                             ).float().cpu().tolist()
                             qualitative_rows.append(
                                 [
@@ -2002,7 +2163,9 @@ def validate(
             result[f"{prefix}/sample_mse_delta"] = float(
                 (ablation_sample_mse - result["val/sample_mse"])
             )
-            result[f"{prefix}/prediction_delta_rmse_native10"] = float(
+            result[
+                f"{prefix}/prediction_delta_rmse_{native_metric_label}"
+            ] = float(
                 torch.sqrt(
                     qwen_ablation_prediction_delta_squared_error[
                         ablation_index
@@ -2037,7 +2200,10 @@ def validate(
         result["val/image_ablation/zero/sample_mse_delta"] = float(
             image_zero_sample_mse - result["val/sample_mse"]
         )
-        result["val/image_ablation/zero/prediction_delta_rmse_native10"] = float(
+        result[
+            "val/image_ablation/zero/prediction_delta_rmse_"
+            f"{native_metric_label}"
+        ] = float(
             torch.sqrt(
                 image_zero_prediction_delta_squared_error
                 / image_zero_prediction_delta_count.clamp_min(1.0)
@@ -2045,7 +2211,9 @@ def validate(
         )
     if action_encoder_layout == "rdt_native_128":
         for slot, horizon in enumerate(sampled_horizons):
-            horizon_prefix = f"val/sampled_native10/horizon_{horizon}"
+            horizon_prefix = (
+                f"val/sampled_{native_metric_label}/horizon_{horizon}"
+            )
             result[f"{horizon_prefix}/rmse"] = (
                 float(
                     torch.sqrt(
@@ -2076,7 +2244,8 @@ def validate(
                     continue
                 result[
                     "val/qwen_ablation/"
-                    f"{ablation_name}/sampled_native10/horizon_{horizon}/rmse"
+                    f"{ablation_name}/sampled_{native_metric_label}/"
+                    f"horizon_{horizon}/rmse"
                 ] = float(
                     torch.sqrt(
                         qwen_ablation_native10_squared_error[
@@ -2097,7 +2266,7 @@ def validate(
                     "episode_id",
                     "step_idx",
                     "instruction",
-                    "native_state_10d",
+                    "native_state_active_slots",
                     "observation_images",
                     "target_vs_diffusion_sample",
                 ],
@@ -2438,7 +2607,17 @@ def train(
     )
     artifact_to_load = resume_from if resume_from is not None else init_artifact
     if artifact_to_load is not None:
-        load_trainable_artifact(model, artifact_to_load, trainable=True)
+        load_trainable_artifact(
+            model,
+            artifact_to_load,
+            trainable=True,
+            # A B0/Libero_RDT initialization predates the new plan modules.
+            # Start those modules from their explicit initialization. Exact
+            # resume remains strict and must contain every plan tensor.
+            allow_missing_plan_interfaces=(
+                init_artifact is not None and resume_from is None
+            ),
+        )
     if mask_noisy_gripper_input is not None:
         model.mask_noisy_gripper_input = bool(mask_noisy_gripper_input)
     resolved_mask_noisy_gripper_input = bool(model.mask_noisy_gripper_input)

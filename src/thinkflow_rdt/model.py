@@ -492,6 +492,56 @@ class SFTConditionedRDT(nn.Module):
             nn.GELU(),
             nn.Linear(projector_width, projector_width, dtype=dtype),
         )
+        self.plan_hidden_norm: nn.Module | None = None
+        self.waypoint_adaptor: nn.Module | None = None
+        self.plan_adaptor: nn.Module | None = None
+        self.plan_type_embedding: nn.Parameter | None = None
+        self.plan_position_embedding: nn.Parameter | None = None
+        if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+            self.plan_hidden_norm = nn.LayerNorm(
+                cfg.model.qwen_hidden_size,
+                dtype=dtype,
+            )
+            self.waypoint_adaptor = nn.Sequential(
+                nn.Linear(
+                    cfg.model.waypoint_dim,
+                    cfg.model.waypoint_embed_dim,
+                    dtype=dtype,
+                ),
+                nn.GELU(),
+                nn.Linear(
+                    cfg.model.waypoint_embed_dim,
+                    cfg.model.waypoint_embed_dim,
+                    dtype=dtype,
+                ),
+            )
+            self.plan_adaptor = nn.Sequential(
+                nn.Linear(
+                    cfg.model.qwen_hidden_size + cfg.model.waypoint_embed_dim,
+                    cfg.model.hidden_size,
+                    dtype=dtype,
+                ),
+                nn.GELU(),
+                nn.Linear(
+                    cfg.model.hidden_size,
+                    cfg.model.hidden_size,
+                    dtype=dtype,
+                ),
+            )
+            self.plan_type_embedding = nn.Parameter(
+                torch.zeros(1, 1, cfg.model.hidden_size, dtype=dtype)
+            )
+            # These are trained by RDT, not extracted from Qwen. They preserve
+            # which of the ordered five trajectory/spatial slots a token came
+            # from while the hidden state carries the sample-specific content.
+            self.plan_position_embedding = nn.Parameter(
+                torch.zeros(
+                    1,
+                    cfg.model.spatial_token_count,
+                    cfg.model.hidden_size,
+                    dtype=dtype,
+                )
+            )
         self.unified_cross_extra_pos_embed = nn.Parameter(
             torch.zeros(1, 2, cfg.model.hidden_size, dtype=dtype)
         )
@@ -593,12 +643,26 @@ class SFTConditionedRDT(nn.Module):
         )
         if self.action_adaptor is not None:
             self.action_adaptor.requires_grad_(True)
-        self.qwen_adaptor.requires_grad_(True)
+        self.qwen_adaptor.requires_grad_(
+            cfg.model.qwen_fusion != "hidden_waypoint_cross_attention"
+        )
+        for module in (
+            self.plan_hidden_norm,
+            self.waypoint_adaptor,
+            self.plan_adaptor,
+        ):
+            if module is not None:
+                module.requires_grad_(True)
+        if self.plan_type_embedding is not None:
+            self.plan_type_embedding.requires_grad_(True)
+        if self.plan_position_embedding is not None:
+            self.plan_position_embedding.requires_grad_(True)
         self.unified_cross_extra_pos_embed.requires_grad_(
             cfg.model.qwen_fusion
             in {
                 "unified_cross_attention",
                 "fastthinkact_cross_attention_kv",
+                "hidden_waypoint_cross_attention",
             }
         )
 
@@ -625,6 +689,26 @@ class SFTConditionedRDT(nn.Module):
             "percentage": 100.0 * trainable / max(total, 1),
             "finetune_mode": self.cfg.model.finetune_mode,
             "qwen_fusion": self.cfg.model.qwen_fusion,
+            "plan_conditioning_trainable": (
+                any(
+                    parameter.requires_grad
+                    for module in (
+                        self.plan_hidden_norm,
+                        self.waypoint_adaptor,
+                        self.plan_adaptor,
+                    )
+                    if module is not None
+                    for parameter in module.parameters()
+                )
+                or bool(
+                    self.plan_type_embedding is not None
+                    and self.plan_type_embedding.requires_grad
+                )
+                or bool(
+                    self.plan_position_embedding is not None
+                    and self.plan_position_embedding.requires_grad
+                )
+            ),
             "rdt_state_dim": self.rdt_state_dim,
             "state_adaptor_frozen": not any(
                 parameter.requires_grad
@@ -663,6 +747,8 @@ class SFTConditionedRDT(nn.Module):
             "lang_tokens",
             "img_tokens",
             "qwen_kv",
+            "qwen_hidden_states",
+            "latent_waypoints",
             "state",
             "state_dim_mask",
             "actions",
@@ -682,6 +768,81 @@ class SFTConditionedRDT(nn.Module):
             key: value.to(dtype=dtype) if key in float_keys else value
             for key, value in batch.items()
         }
+
+    def _adapt_hidden_waypoint_plan(
+        self,
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.plan_hidden_norm is None
+            or self.waypoint_adaptor is None
+            or self.plan_adaptor is None
+            or self.plan_type_embedding is None
+            or self.plan_position_embedding is None
+        ):
+            raise RuntimeError(
+                "Hidden/waypoint plan modules were not constructed for this config"
+            )
+        hidden = batch.get("qwen_hidden_states")
+        waypoints = batch.get("latent_waypoints")
+        if hidden is None or waypoints is None:
+            raise KeyError(
+                "hidden_waypoint_cross_attention requires qwen_hidden_states "
+                "and latent_waypoints"
+            )
+        expected_hidden = (
+            hidden.shape[0],
+            self.cfg.model.spatial_token_count,
+            self.cfg.model.qwen_hidden_size,
+        )
+        expected_waypoints = (
+            hidden.shape[0],
+            self.cfg.model.spatial_token_count,
+            self.cfg.model.waypoint_dim,
+        )
+        if tuple(hidden.shape) != expected_hidden:
+            raise ValueError(
+                f"Expected hidden plan shape {expected_hidden}, got "
+                f"{tuple(hidden.shape)}"
+            )
+        if tuple(waypoints.shape) != expected_waypoints:
+            raise ValueError(
+                f"Expected waypoint shape {expected_waypoints}, got "
+                f"{tuple(waypoints.shape)}"
+            )
+        if not bool(torch.isfinite(hidden.float()).all()):
+            raise ValueError("qwen_hidden_states contains NaN or Inf")
+        if not bool(torch.isfinite(waypoints.float()).all()):
+            raise ValueError("latent_waypoints contains NaN or Inf")
+
+        hidden_features = self.plan_hidden_norm(hidden)
+        # The student's waypoint head predicts normalized image coordinates.
+        # Centering [0,1] at zero gives the small coordinate branch a stable
+        # scale without claiming that up-projection creates new information.
+        waypoint_features = self.waypoint_adaptor(waypoints * 2.0 - 1.0)
+        plan_tokens = self.plan_adaptor(
+            torch.cat([hidden_features, waypoint_features], dim=-1)
+        )
+        plan_tokens = (
+            plan_tokens
+            + self.plan_type_embedding
+            + self.plan_position_embedding
+        )
+        plan_mask = batch.get("plan_mask")
+        if plan_mask is None:
+            plan_mask = torch.ones(
+                plan_tokens.shape[:2],
+                dtype=torch.bool,
+                device=plan_tokens.device,
+            )
+        else:
+            plan_mask = plan_mask.bool()
+            if tuple(plan_mask.shape) != tuple(plan_tokens.shape[:2]):
+                raise ValueError(
+                    "plan_mask must match plan token axes, got "
+                    f"{tuple(plan_mask.shape)} vs {tuple(plan_tokens.shape[:2])}"
+                )
+        return plan_tokens, plan_mask
 
     @staticmethod
     def _euler_xyz_to_ortho6d(euler: torch.Tensor) -> torch.Tensor:
@@ -914,6 +1075,20 @@ class SFTConditionedRDT(nn.Module):
             )
             extra_cross_cond = torch.cat(extra_parts, dim=1)
             extra_cross_mask = torch.cat(extra_masks, dim=1)
+        elif self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+            if state_cond is None:
+                raise ValueError(
+                    "hidden_waypoint_cross_attention requires state_cond"
+                )
+            plan_tokens, plan_mask = self._adapt_hidden_waypoint_plan(batch)
+            state_token = state_cond + self.unified_cross_extra_pos_embed[:, 0:1]
+            state_mask = torch.ones(
+                state_cond.shape[:2],
+                dtype=torch.bool,
+                device=state_cond.device,
+            )
+            extra_cross_cond = torch.cat([state_token, plan_tokens], dim=1)
+            extra_cross_mask = torch.cat([state_mask, plan_mask], dim=1)
         else:
             raise ValueError(f"Unsupported qwen_fusion: {self.cfg.model.qwen_fusion}")
         return (
@@ -1035,8 +1210,15 @@ class SFTConditionedRDT(nn.Module):
             )
         target = actions
         if self.cfg.model.action_encoder_layout == "rdt_native_128":
-            xyz_start, xyz_stop = 30, 33
-            rotation_start, rotation_stop = 33, 39
+            if (
+                self.cfg.model.native_rdt_128_mapping
+                == "libero_joint_eef_delta"
+            ):
+                xyz_start, xyz_stop = 39, 42
+                rotation_start, rotation_stop = 42, 45
+            else:
+                xyz_start, xyz_stop = 30, 33
+                rotation_start, rotation_stop = 33, 39
             gripper_start, gripper_stop = 10, 11
         elif self.cfg.model.action_encoder_layout == "libero_ortho6d":
             xyz_start, xyz_stop = 0, 3
@@ -1260,7 +1442,17 @@ class SFTConditionedRDT(nn.Module):
                         continue
                     for offset, sample_index in enumerate(indices):
                         permutation[sample_index] = indices[(offset + 1) % len(indices)]
-            shuffled_batch["qwen_kv"] = batch["qwen_kv"][permutation]
+            if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                shuffled_batch["qwen_hidden_states"] = batch[
+                    "qwen_hidden_states"
+                ][permutation]
+                shuffled_batch["latent_waypoints"] = batch[
+                    "latent_waypoints"
+                ][permutation]
+                if "plan_mask" in batch:
+                    shuffled_batch["plan_mask"] = batch["plan_mask"][permutation]
+            else:
+                shuffled_batch["qwen_kv"] = batch["qwen_kv"][permutation]
             (
                 shuffled_lang_cond,
                 shuffled_img_cond,
@@ -1366,10 +1558,15 @@ class SFTConditionedRDT(nn.Module):
             raise ValueError(
                 "rotation_geodesic_weight must be one finite non-negative scalar"
             )
-        if self.cfg.model.action_encoder_layout in {
-            "libero_ortho6d",
-            "rdt_native_128",
-        }:
+        uses_ortho6d_rotation = (
+            self.cfg.model.action_encoder_layout == "libero_ortho6d"
+            or (
+                self.cfg.model.action_encoder_layout == "rdt_native_128"
+                and self.cfg.model.native_rdt_128_mapping
+                != "libero_joint_eef_delta"
+            )
+        )
+        if uses_ortho6d_rotation:
             predicted_rotation = self._ortho6d_to_rotation_matrix(
                 prediction[..., rotation_start:rotation_stop]
             )
