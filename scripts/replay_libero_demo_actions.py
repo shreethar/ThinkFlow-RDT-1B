@@ -24,7 +24,11 @@ for path in (REPO_ROOT / "src", REPO_ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 from inspect_libero_outputs import install_robosuite_mujoco_compatibility  # noqa: E402
-from thinkflow_rdt.adapters.libero import libero_observation_to_rdt  # noqa: E402
+from thinkflow_rdt.adapters.libero import (  # noqa: E402
+    libero_action_to_rdt,
+    libero_observation_to_rdt,
+    rdt_action_to_libero,
+)
 
 LIBERO_BENCHMARK_CHOICES = (
     "libero_spatial",
@@ -70,6 +74,30 @@ def action_stats(actions: np.ndarray) -> dict[str, Any]:
             "zero": int(np.sum(actions[:, 6] == 0.0)),
         },
     }
+
+
+def codec_roundtrip(raw_actions: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    """Exercise the exact LIBERO 7D -> RDT 10D -> LIBERO 7D codec."""
+    raw = np.asarray(raw_actions, dtype=np.float32)[..., :7]
+    encoded = libero_action_to_rdt(raw)
+    decoded = rdt_action_to_libero(encoded)
+    error = decoded.astype(np.float64) - raw.astype(np.float64)
+    absolute_error = np.abs(error)
+    translation_l2 = np.linalg.norm(error[..., :3], axis=-1)
+    rotation_l2 = np.linalg.norm(error[..., 3:6], axis=-1)
+    report = {
+        "raw_shape": list(raw.shape),
+        "encoded_shape": list(encoded.shape),
+        "decoded_shape": list(decoded.shape),
+        "allclose_atol_1e-6": bool(np.allclose(decoded, raw, rtol=0.0, atol=1e-6)),
+        "max_abs_error": float(absolute_error.max(initial=0.0)),
+        "mean_abs_error": float(absolute_error.mean()) if absolute_error.size else 0.0,
+        "per_dimension_max_abs_error": absolute_error.max(axis=0, initial=0.0).tolist(),
+        "translation_max_l2": float(translation_l2.max(initial=0.0)),
+        "rotation_command_max_l2": float(rotation_l2.max(initial=0.0)),
+        "gripper_max_abs_error": float(absolute_error[..., 6].max(initial=0.0)),
+    }
+    return decoded, report
 
 
 def find_demo_file(dataset_dir: Path, *, task_name: str | None) -> Path:
@@ -120,6 +148,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--demo-hdf5", type=Path)
     parser.add_argument("--demo-name")
     parser.add_argument("--max-steps", type=int, help="Limit replay length. Defaults to full demo action length.")
+    parser.add_argument(
+        "--action-source",
+        choices=("raw", "codec_roundtrip"),
+        default="raw",
+        help=(
+            "raw replays the HDF5 commands directly; codec_roundtrip first applies "
+            "the production 7D -> 10D ortho6D -> 7D conversion and replays its output."
+        ),
+    )
     parser.add_argument("--settle-steps", type=int, default=0, help="Optional zero-action steps after setting demo state.")
     parser.add_argument("--video-resolution", type=int, default=512)
     parser.add_argument("--fps", type=int, default=20)
@@ -148,8 +185,11 @@ def main() -> None:
         if "actions" not in demo:
             raise KeyError(f"{demo.name} has no actions dataset")
         initial_state = np.asarray(demo["states"][0], dtype=np.float64)
-        actions = np.asarray(demo["actions"], dtype=np.float32)[:, :7]
+        raw_actions = np.asarray(demo["actions"], dtype=np.float32)[:, :7]
         recorded_positions = recorded_eef_positions(demo)
+
+    decoded_actions, codec_report = codec_roundtrip(raw_actions)
+    actions = raw_actions if args.action_source == "raw" else decoded_actions
 
     replay_steps = len(actions) if args.max_steps is None else min(args.max_steps, len(actions))
     env = OffScreenRenderEnv(
@@ -204,7 +244,9 @@ def main() -> None:
                     json.dumps(
                         {
                             "step": step,
+                            "raw_demo_action": raw_actions[step],
                             "action": action,
+                            "action_source": args.action_source,
                             "reward": float(reward),
                             "done": bool(done),
                             "success": bool(success),
@@ -242,12 +284,14 @@ def main() -> None:
         "instruction": task.language,
         "demo_hdf5": demo_hdf5.resolve(),
         "demo_name": demo_name,
+        "action_source": args.action_source,
         "actions_replayed": int(executed_steps),
         "requested_replay_steps": int(replay_steps),
         "success": bool(success),
         "done": bool(done),
         "final_state_7d_closed": final_state,
         "action_stats": action_stats(actions[:replay_steps]),
+        "codec_roundtrip": codec_report,
         "video": args.output.resolve(),
         "elapsed_sec": time.perf_counter() - start_time,
     }

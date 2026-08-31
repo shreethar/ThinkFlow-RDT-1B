@@ -161,6 +161,14 @@ def tensor_stats(name: str, tensor: torch.Tensor) -> dict[str, float | str]:
     }
 
 
+def action_component_slices(layout: str) -> tuple[slice, slice, slice]:
+    if layout == "rdt_native_128":
+        return slice(30, 33), slice(33, 39), slice(10, 11)
+    if layout == "libero_ortho6d":
+        return slice(0, 3), slice(3, 9), slice(9, 10)
+    return slice(0, 3), slice(3, 6), slice(6, 7)
+
+
 def main() -> None:
     args = parse_args()
     if args.num_samples <= 0:
@@ -206,6 +214,10 @@ def main() -> None:
             convert_cached_gripper_closed_to_open=(
                 cfg.model.convert_cached_gripper_closed_to_open
             ),
+            cache_state_dim=cfg.model.resolved_cache_state_dim,
+            cache_action_dim=cfg.model.resolved_cache_action_dim,
+            native_rdt_128=(cfg.model.state_encoder_layout == "rdt_native_128"),
+            action_stats_paths=cfg.data.action_stats_paths,
         )
     else:
         collator = RDTBatchCollator(
@@ -221,6 +233,10 @@ def main() -> None:
             convert_cached_gripper_closed_to_open=(
                 cfg.model.convert_cached_gripper_closed_to_open
             ),
+            cache_state_dim=cfg.model.resolved_cache_state_dim,
+            cache_action_dim=cfg.model.resolved_cache_action_dim,
+            native_rdt_128=(cfg.model.state_encoder_layout == "rdt_native_128"),
+            action_stats_paths=cfg.data.action_stats_paths,
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -241,6 +257,9 @@ def main() -> None:
     saved_batches: list[dict[str, torch.Tensor]] = []
     saved_predictions: list[torch.Tensor] = []
     saved_targets: list[torch.Tensor] = []
+    xyz_slice, rotation_slice, gripper_slice = action_component_slices(
+        cfg.model.action_encoder_layout
+    )
 
     for start in range(0, len(indices), args.batch_size):
         batch_indices = indices[start : start + args.batch_size]
@@ -308,16 +327,16 @@ def main() -> None:
                         target,
                         batch["action_time_mask"],
                         batch["action_dim_mask"],
-                        0,
-                        3,
+                        xyz_slice.start,
+                        xyz_slice.stop,
                     ),
                     "sample_mse_rot": masked_component_mse(
                         prediction,
                         target,
                         batch["action_time_mask"],
                         batch["action_dim_mask"],
-                        3,
-                        9 if cfg.model.action_encoder_layout == "libero_ortho6d" else 6,
+                        rotation_slice.start,
+                        rotation_slice.stop,
                         wrap_angles=(cfg.model.action_encoder_layout == "rdt_eef"),
                     ),
                     "sample_mse_rot_raw": masked_component_mse(
@@ -325,16 +344,16 @@ def main() -> None:
                         target,
                         batch["action_time_mask"],
                         batch["action_dim_mask"],
-                        3,
-                        9 if cfg.model.action_encoder_layout == "libero_ortho6d" else 6,
+                        rotation_slice.start,
+                        rotation_slice.stop,
                     ),
                     "sample_mse_gripper": masked_component_mse(
                         prediction,
                         target,
                         batch["action_time_mask"],
                         batch["action_dim_mask"],
-                        9 if cfg.model.action_encoder_layout == "libero_ortho6d" else 6,
-                        10 if cfg.model.action_encoder_layout == "libero_ortho6d" else 7,
+                        gripper_slice.start,
+                        gripper_slice.stop,
                     ),
                 }
                 sample_metrics.update(tensor_stats("prediction", prediction))
@@ -346,7 +365,9 @@ def main() -> None:
             key: sum(item[key] for item in loss_metrics) / len(loss_metrics)
             for key in loss_metrics[0]
         }
-        target_gripper = batch["actions"][..., -1].detach().float().cpu()
+        target_gripper = (
+            batch["actions"][..., gripper_slice.start].detach().float().cpu()
+        )
         gripper_mean_name = (
             "target_raw_gripper_command_mean"
             if cfg.model.action_encoder_layout == "libero_ortho6d"
