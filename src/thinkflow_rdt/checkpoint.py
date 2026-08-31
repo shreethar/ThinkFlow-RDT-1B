@@ -434,16 +434,27 @@ def save_trainable_artifact(
     output.mkdir(parents=True, exist_ok=True)
     metadata = dict(metadata)
     model_config = getattr(getattr(model, "cfg", None), "model", None)
-    if getattr(model_config, "qwen_fusion", None) == "hidden_waypoint_cross_attention":
+    if getattr(model_config, "qwen_fusion", None) in {
+        "hidden_cross_attention",
+        "hidden_waypoint_cross_attention",
+    }:
+        fusion_type = str(model_config.qwen_fusion)
         conditioning_interface = {
-            "type": "hidden_waypoint_cross_attention",
+            "type": fusion_type,
             "cached_kv_retained_but_unused": True,
             "spatial_token_count": int(model_config.spatial_token_count),
             "qwen_hidden_size": int(model_config.qwen_hidden_size),
-            "waypoint_dim": int(model_config.waypoint_dim),
-            "waypoint_embed_dim": int(model_config.waypoint_embed_dim),
             "rdt_condition_dim": int(model_config.hidden_size),
         }
+        if fusion_type == "hidden_waypoint_cross_attention":
+            conditioning_interface.update(
+                {
+                    "waypoint_dim": int(model_config.waypoint_dim),
+                    "waypoint_embed_dim": int(model_config.waypoint_embed_dim),
+                }
+            )
+        else:
+            conditioning_interface["qwen_token_selector"] = "think_end"
         conditioning_variant = getattr(
             model_config, "conditioning_variant", None
         )

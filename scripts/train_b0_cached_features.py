@@ -428,11 +428,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument(
         "--conditioning-variant",
-        choices=("b2", "b3"),
+        choices=("b0", "b2", "b3"),
         default=None,
         help=(
-            "Record and enforce the B2/B3 provenance of hidden+waypoint "
-            "conditioning in the resolved config and checkpoints."
+            "Record and enforce B0/B2/B3 hidden-conditioning provenance in "
+            "the resolved config and checkpoints."
         ),
     )
     parser.add_argument("--warmup-steps", type=int, default=None)

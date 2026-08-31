@@ -418,6 +418,13 @@ def main() -> None:
             "hidden_waypoint_cross_attention requires --qwen-extraction b2 "
             "or b3 and its matching LatentStudent checkpoint"
         )
+    if (
+        cfg.model.qwen_fusion == "hidden_cross_attention"
+        and qwen_extraction_mode != "b0"
+    ):
+        raise ValueError(
+            "hidden_cross_attention requires --qwen-extraction b0"
+        )
     qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
     qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
     student_model_id = args.student_model_id or metadata.get("student_model_id")
@@ -645,7 +652,7 @@ def main() -> None:
                             )
                         else:
                             assert qwen is not None
-                            qwen_kv = extract_qwen_kv(
+                            b0_features = extract_qwen_kv(
                                 encoded,
                                 qwen_processor,
                                 qwen,
@@ -656,7 +663,15 @@ def main() -> None:
                                 stop_at_think_end=bool(metadata.get("qwen_stop_at_think", True)),
                                 prompt_template=metadata.get("qwen_trajectory_prompt_template"),
                                 enable_thinking=bool(metadata.get("qwen_enable_thinking", False)),
+                                return_hidden_state=(
+                                    cfg.model.qwen_fusion == "hidden_cross_attention"
+                                ),
+                                think_token_selector="think_end",
                             )
+                            if isinstance(b0_features, tuple):
+                                qwen_kv, qwen_hidden_states = b0_features
+                            else:
+                                qwen_kv = b0_features
                     img_tokens, img_mask = extract_siglip_features(
                         encoded,
                         siglip_processor,
@@ -701,37 +716,40 @@ def main() -> None:
                     if use_qwen:
                         assert qwen_kv is not None
                         policy_batch["qwen_kv"] = qwen_kv
-                        if (
-                            cfg.model.qwen_fusion
-                            == "hidden_waypoint_cross_attention"
-                        ):
-                            if qwen_hidden_states is None or latent_waypoints is None:
+                        if cfg.model.qwen_fusion in {
+                            "hidden_cross_attention",
+                            "hidden_waypoint_cross_attention",
+                        }:
+                            if qwen_hidden_states is None:
                                 raise RuntimeError(
-                                    "Hidden+waypoint conditioning is enabled but "
-                                    "online plan features are unavailable"
+                                    "Hidden conditioning is enabled but online "
+                                    "hidden states are unavailable"
                                 )
                             expected_hidden = (
                                 len(active),
                                 cfg.model.spatial_token_count,
                                 cfg.model.qwen_hidden_size,
                             )
-                            expected_waypoints = (
-                                len(active),
-                                cfg.model.spatial_token_count,
-                                cfg.model.waypoint_dim,
-                            )
                             if tuple(qwen_hidden_states.shape) != expected_hidden:
                                 raise ValueError(
                                     "Online spatial hidden state shape mismatch: "
                                     f"{tuple(qwen_hidden_states.shape)} != {expected_hidden}"
                                 )
-                            if tuple(latent_waypoints.shape) != expected_waypoints:
-                                raise ValueError(
-                                    "Online waypoint shape mismatch: "
-                                    f"{tuple(latent_waypoints.shape)} != {expected_waypoints}"
-                                )
                             policy_batch["qwen_hidden_states"] = qwen_hidden_states
-                            policy_batch["latent_waypoints"] = latent_waypoints
+                            if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                                if latent_waypoints is None:
+                                    raise RuntimeError("Online waypoints are unavailable")
+                                expected_waypoints = (
+                                    len(active),
+                                    cfg.model.spatial_token_count,
+                                    cfg.model.waypoint_dim,
+                                )
+                                if tuple(latent_waypoints.shape) != expected_waypoints:
+                                    raise ValueError(
+                                        "Online waypoint shape mismatch: "
+                                        f"{tuple(latent_waypoints.shape)} != {expected_waypoints}"
+                                    )
+                                policy_batch["latent_waypoints"] = latent_waypoints
                             policy_batch["plan_mask"] = torch.ones(
                                 qwen_hidden_states.shape[:2],
                                 dtype=torch.bool,

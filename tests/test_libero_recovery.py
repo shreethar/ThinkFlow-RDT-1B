@@ -75,6 +75,6 @@ def test_full_optimizer_uses_interface_specific_learning_rate() -> None:
     rates = {group["name"]: group["lr"] for group in optimizer.param_groups}
     assert rates == {
         "rdt": pytest.approx(1e-5),
-        "qwen_projector": pytest.approx(1e-5),
+        "plan_projector": pytest.approx(1e-5),
         "interfaces": pytest.approx(5e-6),
     }

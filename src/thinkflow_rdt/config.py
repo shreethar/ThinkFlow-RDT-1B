@@ -49,6 +49,8 @@ class ModelConfig:
     # token. Each RDT block then applies its own pretrained cross-attention K/V
     # projection. The cached Qwen K/V remains in the batch for diagnostics but
     # is deliberately not consumed by this mode.
+    # ``hidden_cross_attention`` is the B0 counterpart: it adapts one literal
+    # </think> final-layer hidden state without a waypoint branch.
     qwen_fusion: str = "language"
     # Identifies which LatentStudent supervision produced an otherwise shared
     # hidden+waypoint interface. It is provenance, not an architecture switch.
@@ -237,6 +239,7 @@ class ExperimentConfig:
             "cross_attention_kv",
             "fastthinkact_cross_attention_kv",
             "unified_cross_attention",
+            "hidden_cross_attention",
             "hidden_waypoint_cross_attention",
         }:
             raise ValueError(
@@ -244,7 +247,7 @@ class ExperimentConfig:
                 "'self_attention_kv', 'fastthinkact_state_kv', "
                 "'cross_attention_kv', 'fastthinkact_cross_attention_kv', or "
                 "'unified_cross_attention', or "
-                "'hidden_waypoint_cross_attention'"
+                "'hidden_cross_attention', or 'hidden_waypoint_cross_attention'"
             )
         if self.model.spatial_token_count <= 0:
             raise ValueError("model.spatial_token_count must be positive")
@@ -252,9 +255,9 @@ class ExperimentConfig:
             raise ValueError("model.waypoint_dim must be positive")
         if self.model.waypoint_embed_dim <= 0:
             raise ValueError("model.waypoint_embed_dim must be positive")
-        if self.model.conditioning_variant not in {None, "b2", "b3"}:
+        if self.model.conditioning_variant not in {None, "b0", "b2", "b3"}:
             raise ValueError(
-                "model.conditioning_variant must be null, 'b2', or 'b3'"
+                "model.conditioning_variant must be null, 'b0', 'b2', or 'b3'"
             )
         if self.model.pretrained_copy_mode not in {"selected", "compatible"}:
             raise ValueError(

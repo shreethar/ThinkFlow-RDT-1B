@@ -19,6 +19,7 @@ if str(SRC_ROOT) not in sys.path:
 from thinkflow_rdt.checkpoint import load_trainable_artifact  # noqa: E402
 from thinkflow_rdt.config import ExperimentConfig, load_config  # noqa: E402
 from thinkflow_rdt.data import (  # noqa: E402
+    HIDDEN_FEATURE_REQUIRED_KEYS,
     ONLINE_SIGLIP_REQUIRED_KEYS,
     PLAN_FEATURE_REQUIRED_KEYS,
     CachedFeatureDataset,
@@ -184,15 +185,21 @@ def build_cross_dataset_qwen_replacements(
                 f"Expected qwen_kv [tokens, dim] for index {index}, got {tuple(qwen_kv.shape)}"
             )
         features = {"qwen_kv": qwen_kv.clone()}
-        if "qwen_hidden_states" in sample or "latent_waypoints" in sample:
-            if not PLAN_FEATURE_REQUIRED_KEYS.issubset(sample):
+        if "qwen_hidden_states" in sample:
+            if not HIDDEN_FEATURE_REQUIRED_KEYS.issubset(sample):
                 raise KeyError(
-                    "Cross-dataset plan ablation requires both qwen_hidden_states "
-                    "and latent_waypoints"
+                    "Cross-dataset hidden-plan ablation requires "
+                    "qwen_hidden_states"
                 )
             features["qwen_hidden_states"] = torch.as_tensor(
                 sample["qwen_hidden_states"]
             ).detach().cpu().clone()
+        if "latent_waypoints" in sample:
+            if not PLAN_FEATURE_REQUIRED_KEYS.issubset(sample):
+                raise KeyError(
+                    "Cross-dataset hidden-waypoint ablation requires both "
+                    "qwen_hidden_states and latent_waypoints"
+                )
             features["latent_waypoints"] = torch.as_tensor(
                 sample["latent_waypoints"]
             ).detach().cpu().clone()
@@ -283,7 +290,9 @@ def apply_variant(
         out["qwen_kv"] = torch.zeros_like(out["qwen_kv"])
         if "qwen_hidden_states" in out:
             out["qwen_hidden_states"] = torch.zeros_like(out["qwen_hidden_states"])
+        if "latent_waypoints" in out:
             out["latent_waypoints"] = torch.zeros_like(out["latent_waypoints"])
+        if "plan_mask" in out:
             out["plan_mask"] = torch.zeros_like(out["plan_mask"], dtype=torch.bool)
         return out
     if variant == "shuffle_qwen":
@@ -674,11 +683,16 @@ def build_collator(cfg: ExperimentConfig, *, online_siglip: bool):
     require_plan_features = (
         cfg.model.qwen_fusion == "hidden_waypoint_cross_attention"
     )
+    require_hidden_features = cfg.model.qwen_fusion in {
+        "hidden_cross_attention",
+        "hidden_waypoint_cross_attention",
+    }
     plan_kwargs = {
         "plan_hidden_dim": cfg.model.qwen_hidden_size,
         "spatial_token_count": cfg.model.spatial_token_count,
         "waypoint_dim": cfg.model.waypoint_dim,
         "require_plan_features": require_plan_features,
+        "require_hidden_features": require_hidden_features,
         "native_rdt_128_mapping": cfg.model.native_rdt_128_mapping,
         "cache_state_dim": cfg.model.resolved_cache_state_dim,
         "cache_action_dim": cfg.model.resolved_cache_action_dim,
@@ -1016,6 +1030,9 @@ def main() -> None:
     if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
         required_keys = set() if required_keys is None else required_keys
         required_keys.update(PLAN_FEATURE_REQUIRED_KEYS)
+    elif cfg.model.qwen_fusion == "hidden_cross_attention":
+        required_keys = set() if required_keys is None else required_keys
+        required_keys.update(HIDDEN_FEATURE_REQUIRED_KEYS)
     dataset = CachedFeatureDataset(merged_manifest, required_keys=required_keys)
     indices = selected_indices(
         len(dataset),

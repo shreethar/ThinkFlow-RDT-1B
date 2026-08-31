@@ -524,3 +524,32 @@ def test_collator_batches_required_hidden_waypoint_plan_features():
     assert batch["qwen_hidden_states"].shape == (1, 5, 8)
     assert batch["latent_waypoints"].shape == (1, 5, 2)
     assert batch["plan_mask"].tolist() == [[True] * 5]
+
+
+def test_collator_batches_b0_hidden_without_waypoints():
+    collator = RDTBatchCollator(
+        max_lang_tokens=2,
+        image_tokens=3,
+        pred_horizon=2,
+        feature_dim=8,
+        state_dim=7,
+        action_dim=7,
+        plan_hidden_dim=8,
+        spatial_token_count=1,
+        require_hidden_features=True,
+    )
+    sample = {
+        "qwen_kv": torch.randn(1, 8),
+        "qwen_hidden_states": torch.randn(1, 8),
+        "lang_tokens": torch.randn(2, 8),
+        "img_tokens": torch.randn(3, 8),
+        "state": torch.randn(7),
+        "actions": torch.randn(2, 7),
+        "ctrl_freq": 20.0,
+    }
+
+    batch = collator([sample])
+
+    assert batch["qwen_hidden_states"].shape == (1, 1, 8)
+    assert batch["plan_mask"].tolist() == [[True]]
+    assert "latent_waypoints" not in batch

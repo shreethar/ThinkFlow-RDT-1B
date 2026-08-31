@@ -380,6 +380,11 @@ class PolicyEngine:
         self.cfg = load_config(args.config)
         if self.cfg.model.qwen_fusion == "none":
             raise ValueError("The selected config disables Qwen fusion; this is not B0 evaluation")
+        if (
+            self.cfg.model.qwen_fusion == "hidden_cross_attention"
+            and self.qwen_extraction_mode != "b0"
+        ):
+            raise ValueError("hidden_cross_attention requires --qwen-extraction b0")
 
         print(
             "Loading frozen T5, "
@@ -513,7 +518,7 @@ class PolicyEngine:
             )
         else:
             assert self.qwen is not None
-            qwen_kv = self.extract_qwen_kv(
+            b0_features = self.extract_qwen_kv(
                 encoded,
                 self.qwen_processor,
                 self.qwen,
@@ -523,7 +528,15 @@ class PolicyEngine:
                 expected_dim=self.cfg.model.qwen_kv_dim,
                 stop_at_think_end=True,
                 enable_thinking=False,
+                return_hidden_state=(
+                    self.cfg.model.qwen_fusion == "hidden_cross_attention"
+                ),
+                think_token_selector="think_end",
             )
+            if isinstance(b0_features, tuple):
+                qwen_kv, spatial_hidden_states = b0_features
+            else:
+                qwen_kv = b0_features
         expected_qwen_tokens = (
             self.cfg.model.spatial_token_count
             if self.qwen_extraction_mode in {"b2", "b3"}
@@ -539,21 +552,18 @@ class PolicyEngine:
                 f"{self.qwen_extraction_mode.upper()} extraction returned "
                 f"{tuple(qwen_kv.shape)}, expected {expected_qwen_shape}"
             )
-        if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
-            if spatial_hidden_states is None or latent_waypoints is None:
+        if self.cfg.model.qwen_fusion in {
+            "hidden_cross_attention",
+            "hidden_waypoint_cross_attention",
+        }:
+            if spatial_hidden_states is None:
                 raise ValueError(
-                    "hidden_waypoint_cross_attention requires --qwen-extraction "
-                    "b2 or b3; B0 only extracts the </think> KV token"
+                    "Hidden conditioning requires online hidden-state extraction"
                 )
             expected_hidden_shape = (
                 1,
                 self.cfg.model.spatial_token_count,
                 self.cfg.model.qwen_hidden_size,
-            )
-            expected_waypoint_shape = (
-                1,
-                self.cfg.model.spatial_token_count,
-                self.cfg.model.waypoint_dim,
             )
             if tuple(spatial_hidden_states.shape) != expected_hidden_shape:
                 raise ValueError(
@@ -561,16 +571,24 @@ class PolicyEngine:
                     f"{tuple(spatial_hidden_states.shape)}, expected "
                     f"{expected_hidden_shape}"
                 )
-            if tuple(latent_waypoints.shape) != expected_waypoint_shape:
-                raise ValueError(
-                    "LatentStudent waypoint extraction returned "
-                    f"{tuple(latent_waypoints.shape)}, expected "
-                    f"{expected_waypoint_shape}"
-                )
             if not torch.isfinite(spatial_hidden_states).all():
-                raise FloatingPointError("LatentStudent hidden states contain NaN/Inf")
-            if not torch.isfinite(latent_waypoints).all():
-                raise FloatingPointError("LatentStudent waypoints contain NaN/Inf")
+                raise FloatingPointError("Qwen hidden states contain NaN/Inf")
+            if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                if latent_waypoints is None:
+                    raise ValueError("LatentStudent waypoints are unavailable")
+                expected_waypoint_shape = (
+                    1,
+                    self.cfg.model.spatial_token_count,
+                    self.cfg.model.waypoint_dim,
+                )
+                if tuple(latent_waypoints.shape) != expected_waypoint_shape:
+                    raise ValueError(
+                        "LatentStudent waypoint extraction returned "
+                        f"{tuple(latent_waypoints.shape)}, expected "
+                        f"{expected_waypoint_shape}"
+                    )
+                if not torch.isfinite(latent_waypoints).all():
+                    raise FloatingPointError("LatentStudent waypoints contain NaN/Inf")
         qwen_seconds = time.perf_counter() - qwen_started
         siglip_started = time.perf_counter()
         img_tokens, img_mask = self.extract_siglip_features(
@@ -598,11 +616,15 @@ class PolicyEngine:
             "img_mask": img_mask,
             "qwen_kv": qwen_kv,
         }
-        if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+        if self.cfg.model.qwen_fusion in {
+            "hidden_cross_attention",
+            "hidden_waypoint_cross_attention",
+        }:
             assert spatial_hidden_states is not None
-            assert latent_waypoints is not None
             batch["qwen_hidden_states"] = spatial_hidden_states
-            batch["latent_waypoints"] = latent_waypoints
+            if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                assert latent_waypoints is not None
+                batch["latent_waypoints"] = latent_waypoints
             batch["plan_mask"] = torch.ones(
                 spatial_hidden_states.shape[:2],
                 dtype=torch.bool,

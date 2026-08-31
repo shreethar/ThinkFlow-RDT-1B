@@ -690,6 +690,11 @@ def main() -> None:
             "hidden_waypoint_cross_attention requires --qwen-extraction b2 or "
             "b3 plus the matching --student-model-id"
         )
+    if (
+        cfg.model.qwen_fusion == "hidden_cross_attention"
+        and qwen_extraction_mode != "b0"
+    ):
+        raise ValueError("hidden_cross_attention requires --qwen-extraction b0")
     qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
     qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
     student_model_id = args.student_model_id or metadata.get("student_model_id")
@@ -901,7 +906,7 @@ def main() -> None:
                     )
                 else:
                     assert qwen is not None
-                    cached_qwen = extract_qwen_kv(
+                    b0_features = extract_qwen_kv(
                         encoded,
                         qwen_processor,
                         qwen,
@@ -912,7 +917,15 @@ def main() -> None:
                         stop_at_think_end=bool(metadata.get("qwen_stop_at_think", True)),
                         prompt_template=metadata.get("qwen_trajectory_prompt_template"),
                         enable_thinking=bool(metadata.get("qwen_enable_thinking", False)),
+                        return_hidden_state=(
+                            cfg.model.qwen_fusion == "hidden_cross_attention"
+                        ),
+                        think_token_selector="think_end",
                     )
+                    if isinstance(b0_features, tuple):
+                        cached_qwen, cached_qwen_hidden_states = b0_features
+                    else:
+                        cached_qwen = b0_features
             img_tokens, img_mask = extract_siglip_features(
                 encoded,
                 siglip_processor,
@@ -954,24 +967,19 @@ def main() -> None:
             if use_qwen:
                 assert cached_qwen is not None
                 batch["qwen_kv"] = cached_qwen
-                if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
-                    if (
-                        cached_qwen_hidden_states is None
-                        or cached_latent_waypoints is None
-                    ):
+                if cfg.model.qwen_fusion in {
+                    "hidden_cross_attention",
+                    "hidden_waypoint_cross_attention",
+                }:
+                    if cached_qwen_hidden_states is None:
                         raise RuntimeError(
-                            "Hidden+waypoint fusion is enabled but online "
-                            "LatentStudent features are unavailable"
+                            "Hidden fusion is enabled but online hidden states "
+                            "are unavailable"
                         )
                     expected_hidden_shape = (
                         1,
                         cfg.model.spatial_token_count,
                         cfg.model.qwen_hidden_size,
-                    )
-                    expected_waypoint_shape = (
-                        1,
-                        cfg.model.spatial_token_count,
-                        cfg.model.waypoint_dim,
                     )
                     if tuple(cached_qwen_hidden_states.shape) != expected_hidden_shape:
                         raise ValueError(
@@ -979,14 +987,22 @@ def main() -> None:
                             f"{tuple(cached_qwen_hidden_states.shape)}, expected "
                             f"{expected_hidden_shape}"
                         )
-                    if tuple(cached_latent_waypoints.shape) != expected_waypoint_shape:
-                        raise ValueError(
-                            "Online latent waypoints have shape "
-                            f"{tuple(cached_latent_waypoints.shape)}, expected "
-                            f"{expected_waypoint_shape}"
-                        )
                     batch["qwen_hidden_states"] = cached_qwen_hidden_states
-                    batch["latent_waypoints"] = cached_latent_waypoints
+                    if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                        if cached_latent_waypoints is None:
+                            raise RuntimeError("Online latent waypoints are unavailable")
+                        expected_waypoint_shape = (
+                            1,
+                            cfg.model.spatial_token_count,
+                            cfg.model.waypoint_dim,
+                        )
+                        if tuple(cached_latent_waypoints.shape) != expected_waypoint_shape:
+                            raise ValueError(
+                                "Online latent waypoints have shape "
+                                f"{tuple(cached_latent_waypoints.shape)}, expected "
+                                f"{expected_waypoint_shape}"
+                            )
+                        batch["latent_waypoints"] = cached_latent_waypoints
                     batch["plan_mask"] = torch.ones(
                         cached_qwen_hidden_states.shape[:2],
                         dtype=torch.bool,

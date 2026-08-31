@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fine-tune B2 or B3 on one LIBERO suite using hidden+waypoint conditioning
+# Fine-tune B0/B2/B3 on one LIBERO suite using hidden conditioning
 # and the Libero_RDT native action/state slot assignment.
 #
 # Required when starting from an already fine-tuned Libero_RDT artifact:
@@ -15,8 +15,8 @@ set -euo pipefail
 VARIANT=${VARIANT:-b2}
 SUITE=${SUITE:-libero_spatial}
 case "$VARIANT" in
-  b2|b3) ;;
-  *) echo "VARIANT must be b2 or b3, got '$VARIANT'" >&2; exit 2 ;;
+  b0|b2|b3) ;;
+  *) echo "VARIANT must be b0, b2 or b3, got '$VARIANT'" >&2; exit 2 ;;
 esac
 case "$SUITE" in
   libero_spatial|libero_10) ;;
@@ -27,10 +27,19 @@ if [[ "$VARIANT" == "b3" && "$SUITE" != "libero_spatial" ]]; then
   exit 2
 fi
 
-CONFIG=${CONFIG:-configs/libero_b2_hidden_waypoint_native128_full.yaml}
-CACHE_ROOT=${CACHE_ROOT:-cache_features_libero_${VARIANT}_native/${SUITE}}
+if [[ "$VARIANT" == "b0" ]]; then
+  DEFAULT_CONFIG=configs/libero_b0_hidden_native128_full.yaml
+  DEFAULT_CACHE_ROOT=cache_features_libero_b0_hidden_native/${SUITE}
+  CONDITION_LABEL=hidden
+else
+  DEFAULT_CONFIG=configs/libero_b2_hidden_waypoint_native128_full.yaml
+  DEFAULT_CACHE_ROOT=cache_features_libero_${VARIANT}_native/${SUITE}
+  CONDITION_LABEL=hidden_waypoint
+fi
+CONFIG=${CONFIG:-$DEFAULT_CONFIG}
+CACHE_ROOT=${CACHE_ROOT:-$DEFAULT_CACHE_ROOT}
 INIT_ARTIFACT=${INIT_ARTIFACT:-}
-OUTPUT_DIR=${OUTPUT_DIR:-output_2/${SUITE}_${VARIANT}_hidden_waypoint_native128_full}
+OUTPUT_DIR=${OUTPUT_DIR:-output_2/${SUITE}_${VARIANT}_${CONDITION_LABEL}_native128_full}
 MAX_STEPS=${MAX_STEPS:-20000}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-8}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-4}
@@ -47,7 +56,7 @@ NUM_WORKERS=${NUM_WORKERS:-4}
 QWEN_FUSION_LOSS_WEIGHT=${QWEN_FUSION_LOSS_WEIGHT:-0.5}
 QWEN_FUSION_LOSS_MARGIN=${QWEN_FUSION_LOSS_MARGIN:-0.002}
 WANDB_PROJECT=${WANDB_PROJECT:-ThinkLite ${VARIANT^^} LIBERO}
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-${SUITE}-${VARIANT}-hidden-waypoint-native128-full}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-${SUITE}-${VARIANT}-${CONDITION_LABEL}-native128-full}
 SIGLIP_MODEL_ID=${SIGLIP_MODEL_ID:-/home/ubuntu/models/siglip-so400m-patch14-384}
 SIGLIP_FALLBACK_MODEL_ID=${SIGLIP_FALLBACK_MODEL_ID:-google/siglip-so400m-patch14-384}
 

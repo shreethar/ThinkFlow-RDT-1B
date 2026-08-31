@@ -28,6 +28,7 @@ from .checkpoint import (
 )
 from .config import ExperimentConfig
 from .data import (
+    HIDDEN_FEATURE_REQUIRED_KEYS,
     ONLINE_SIGLIP_REQUIRED_KEYS,
     PLAN_FEATURE_REQUIRED_KEYS,
     CachedFeatureDataset,
@@ -365,12 +366,21 @@ def create_dataloader(
     require_plan_features = (
         cfg.model.qwen_fusion == "hidden_waypoint_cross_attention"
     )
+    require_hidden_features = cfg.model.qwen_fusion in {
+        "hidden_cross_attention",
+        "hidden_waypoint_cross_attention",
+    }
     if online_siglip:
         dataset = CachedFeatureDataset(
             manifest,
             required_keys=(
-                ONLINE_SIGLIP_REQUIRED_KEYS | PLAN_FEATURE_REQUIRED_KEYS
-                if require_plan_features
+                ONLINE_SIGLIP_REQUIRED_KEYS
+                | (
+                    PLAN_FEATURE_REQUIRED_KEYS
+                    if require_plan_features
+                    else HIDDEN_FEATURE_REQUIRED_KEYS
+                )
+                if require_hidden_features
                 else ONLINE_SIGLIP_REQUIRED_KEYS
             ),
             excluded_dataset_ids=cfg.data.excluded_dataset_ids,
@@ -386,6 +396,7 @@ def create_dataloader(
             plan_hidden_dim=cfg.model.qwen_hidden_size,
             spatial_token_count=cfg.model.spatial_token_count,
             waypoint_dim=cfg.model.waypoint_dim,
+            require_hidden_features=require_hidden_features,
             require_plan_features=require_plan_features,
             convert_cached_gripper_closed_to_open=(
                 cfg.model.convert_cached_gripper_closed_to_open
@@ -403,17 +414,17 @@ def create_dataloader(
             manifest,
             required_keys=(
                 None
-                if not require_plan_features
+                if not require_hidden_features
                 else {
                     "qwen_kv",
                     "qwen_hidden_states",
-                    "latent_waypoints",
                     "lang_tokens",
                     "img_tokens",
                     "state",
                     "actions",
                     "ctrl_freq",
                 }
+                | ({"latent_waypoints"} if require_plan_features else set())
             ),
             excluded_dataset_ids=cfg.data.excluded_dataset_ids,
         )
@@ -430,6 +441,7 @@ def create_dataloader(
             plan_hidden_dim=cfg.model.qwen_hidden_size,
             spatial_token_count=cfg.model.spatial_token_count,
             waypoint_dim=cfg.model.waypoint_dim,
+            require_hidden_features=require_hidden_features,
             require_plan_features=require_plan_features,
             convert_cached_gripper_closed_to_open=(
                 cfg.model.convert_cached_gripper_closed_to_open
@@ -1245,15 +1257,26 @@ def validate(
                 and (
                     (
                         cfg.model.qwen_fusion
-                        == "hidden_waypoint_cross_attention"
+                        in {
+                            "hidden_cross_attention",
+                            "hidden_waypoint_cross_attention",
+                        }
                         and isinstance(
                             batch.get("qwen_hidden_states"), torch.Tensor
                         )
-                        and isinstance(batch.get("latent_waypoints"), torch.Tensor)
+                        and (
+                            cfg.model.qwen_fusion == "hidden_cross_attention"
+                            or isinstance(
+                                batch.get("latent_waypoints"), torch.Tensor
+                            )
+                        )
                     )
                     or (
                         cfg.model.qwen_fusion
-                        != "hidden_waypoint_cross_attention"
+                        not in {
+                            "hidden_cross_attention",
+                            "hidden_waypoint_cross_attention",
+                        }
                         and isinstance(batch.get("qwen_kv"), torch.Tensor)
                     )
                 )
@@ -1283,16 +1306,14 @@ def validate(
             if run_qwen_ablation:
                 zero_batch = dict(batch)
                 shuffled_batch = dict(batch)
-                if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                if cfg.model.qwen_fusion in {
+                    "hidden_cross_attention",
+                    "hidden_waypoint_cross_attention",
+                }:
                     hidden_states = batch["qwen_hidden_states"]
-                    latent_waypoints = batch["latent_waypoints"]
                     assert isinstance(hidden_states, torch.Tensor)
-                    assert isinstance(latent_waypoints, torch.Tensor)
                     zero_batch["qwen_hidden_states"] = torch.zeros_like(
                         hidden_states
-                    )
-                    zero_batch["latent_waypoints"] = torch.zeros_like(
-                        latent_waypoints
                     )
                     zero_batch["plan_mask"] = torch.zeros(
                         hidden_states.shape[:2],
@@ -1302,9 +1323,15 @@ def validate(
                     shuffled_batch["qwen_hidden_states"] = hidden_states.roll(
                         1, dims=0
                     )
-                    shuffled_batch["latent_waypoints"] = latent_waypoints.roll(
-                        1, dims=0
-                    )
+                    if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                        latent_waypoints = batch["latent_waypoints"]
+                        assert isinstance(latent_waypoints, torch.Tensor)
+                        zero_batch["latent_waypoints"] = torch.zeros_like(
+                            latent_waypoints
+                        )
+                        shuffled_batch["latent_waypoints"] = latent_waypoints.roll(
+                            1, dims=0
+                        )
                     if isinstance(batch.get("plan_mask"), torch.Tensor):
                         shuffled_batch["plan_mask"] = batch["plan_mask"].roll(
                             1, dims=0

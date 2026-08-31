@@ -110,6 +110,18 @@ def add_hidden_waypoint_interface(model: FakeConditionedRDT) -> None:
     model.plan_position_embedding = nn.Parameter(torch.zeros(1, 5, 6))
 
 
+def add_b0_hidden_interface(model: FakeConditionedRDT) -> None:
+    model.cfg.model.qwen_fusion = "hidden_cross_attention"
+    model.cfg.model.conditioning_variant = "b0"
+    model.cfg.model.spatial_token_count = 1
+    model.cfg.model.qwen_hidden_size = 8
+    model.cfg.model.hidden_size = 6
+    model.plan_hidden_norm = nn.LayerNorm(8)
+    model.plan_adaptor = nn.Sequential(nn.Linear(8, 6), nn.Linear(6, 6))
+    model.plan_type_embedding = nn.Parameter(torch.zeros(1, 1, 6))
+    model.plan_position_embedding = nn.Parameter(torch.zeros(1, 1, 6))
+
+
 def fill_parameters(model: nn.Module, start: float) -> None:
     with torch.no_grad():
         for index, parameter in enumerate(model.parameters()):
@@ -381,6 +393,42 @@ def test_hidden_waypoint_interfaces_and_metadata_round_trip(tmp_path):
     for name, tensor in restored.state_dict().items():
         torch.testing.assert_close(tensor, expected[name])
     assert all(not parameter.requires_grad for parameter in restored.parameters())
+
+
+def test_b0_hidden_interfaces_and_metadata_round_trip(tmp_path):
+    source = FakeConditionedRDT(FakeFullCore(), finetune_mode="full")
+    add_b0_hidden_interface(source)
+    fill_parameters(source, start=7.0)
+    expected = {
+        name: tensor.detach().clone()
+        for name, tensor in source.state_dict().items()
+    }
+
+    save_trainable_artifact(
+        source,
+        tmp_path,
+        {"global_step": 4},
+        model_state_dict=source.state_dict(),
+    )
+
+    metadata = json.loads((tmp_path / METADATA_FILE).read_text())
+    assert metadata["conditioning_interface"] == {
+        "type": "hidden_cross_attention",
+        "cached_kv_retained_but_unused": True,
+        "spatial_token_count": 1,
+        "qwen_hidden_size": 8,
+        "rdt_condition_dim": 6,
+        "qwen_token_selector": "think_end",
+        "conditioning_variant": "b0",
+    }
+
+    restored = FakeConditionedRDT(FakeFullCore(), finetune_mode="full")
+    add_b0_hidden_interface(restored)
+    fill_parameters(restored, start=-7.0)
+    load_trainable_artifact(restored, tmp_path, trainable=False)
+
+    for name, tensor in restored.state_dict().items():
+        torch.testing.assert_close(tensor, expected[name])
 
 
 def test_b0_artifact_can_initialize_new_plan_modules_but_resume_stays_strict(

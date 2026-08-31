@@ -497,27 +497,33 @@ class SFTConditionedRDT(nn.Module):
         self.plan_adaptor: nn.Module | None = None
         self.plan_type_embedding: nn.Parameter | None = None
         self.plan_position_embedding: nn.Parameter | None = None
-        if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+        if cfg.model.qwen_fusion in {
+            "hidden_cross_attention",
+            "hidden_waypoint_cross_attention",
+        }:
             self.plan_hidden_norm = nn.LayerNorm(
                 cfg.model.qwen_hidden_size,
                 dtype=dtype,
             )
-            self.waypoint_adaptor = nn.Sequential(
-                nn.Linear(
-                    cfg.model.waypoint_dim,
-                    cfg.model.waypoint_embed_dim,
-                    dtype=dtype,
-                ),
-                nn.GELU(),
-                nn.Linear(
-                    cfg.model.waypoint_embed_dim,
-                    cfg.model.waypoint_embed_dim,
-                    dtype=dtype,
-                ),
-            )
+            plan_input_dim = cfg.model.qwen_hidden_size
+            if cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                self.waypoint_adaptor = nn.Sequential(
+                    nn.Linear(
+                        cfg.model.waypoint_dim,
+                        cfg.model.waypoint_embed_dim,
+                        dtype=dtype,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(
+                        cfg.model.waypoint_embed_dim,
+                        cfg.model.waypoint_embed_dim,
+                        dtype=dtype,
+                    ),
+                )
+                plan_input_dim += cfg.model.waypoint_embed_dim
             self.plan_adaptor = nn.Sequential(
                 nn.Linear(
-                    cfg.model.qwen_hidden_size + cfg.model.waypoint_embed_dim,
+                    plan_input_dim,
                     cfg.model.hidden_size,
                     dtype=dtype,
                 ),
@@ -644,7 +650,8 @@ class SFTConditionedRDT(nn.Module):
         if self.action_adaptor is not None:
             self.action_adaptor.requires_grad_(True)
         self.qwen_adaptor.requires_grad_(
-            cfg.model.qwen_fusion != "hidden_waypoint_cross_attention"
+            cfg.model.qwen_fusion
+            not in {"hidden_cross_attention", "hidden_waypoint_cross_attention"}
         )
         for module in (
             self.plan_hidden_norm,
@@ -662,6 +669,7 @@ class SFTConditionedRDT(nn.Module):
             in {
                 "unified_cross_attention",
                 "fastthinkact_cross_attention_kv",
+                "hidden_cross_attention",
                 "hidden_waypoint_cross_attention",
             }
         )
@@ -769,60 +777,59 @@ class SFTConditionedRDT(nn.Module):
             for key, value in batch.items()
         }
 
-    def _adapt_hidden_waypoint_plan(
+    def _adapt_hidden_plan(
         self,
         batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if (
             self.plan_hidden_norm is None
-            or self.waypoint_adaptor is None
             or self.plan_adaptor is None
             or self.plan_type_embedding is None
             or self.plan_position_embedding is None
         ):
             raise RuntimeError(
-                "Hidden/waypoint plan modules were not constructed for this config"
+                "Hidden plan modules were not constructed for this config"
             )
         hidden = batch.get("qwen_hidden_states")
-        waypoints = batch.get("latent_waypoints")
-        if hidden is None or waypoints is None:
-            raise KeyError(
-                "hidden_waypoint_cross_attention requires qwen_hidden_states "
-                "and latent_waypoints"
-            )
+        if hidden is None:
+            raise KeyError("Hidden fusion requires qwen_hidden_states")
         expected_hidden = (
             hidden.shape[0],
             self.cfg.model.spatial_token_count,
             self.cfg.model.qwen_hidden_size,
-        )
-        expected_waypoints = (
-            hidden.shape[0],
-            self.cfg.model.spatial_token_count,
-            self.cfg.model.waypoint_dim,
         )
         if tuple(hidden.shape) != expected_hidden:
             raise ValueError(
                 f"Expected hidden plan shape {expected_hidden}, got "
                 f"{tuple(hidden.shape)}"
             )
-        if tuple(waypoints.shape) != expected_waypoints:
-            raise ValueError(
-                f"Expected waypoint shape {expected_waypoints}, got "
-                f"{tuple(waypoints.shape)}"
-            )
         if not bool(torch.isfinite(hidden.float()).all()):
             raise ValueError("qwen_hidden_states contains NaN or Inf")
-        if not bool(torch.isfinite(waypoints.float()).all()):
-            raise ValueError("latent_waypoints contains NaN or Inf")
 
         hidden_features = self.plan_hidden_norm(hidden)
-        # The student's waypoint head predicts normalized image coordinates.
-        # Centering [0,1] at zero gives the small coordinate branch a stable
-        # scale without claiming that up-projection creates new information.
-        waypoint_features = self.waypoint_adaptor(waypoints * 2.0 - 1.0)
-        plan_tokens = self.plan_adaptor(
-            torch.cat([hidden_features, waypoint_features], dim=-1)
-        )
+        plan_input = hidden_features
+        if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+            waypoints = batch.get("latent_waypoints")
+            if waypoints is None or self.waypoint_adaptor is None:
+                raise KeyError(
+                    "hidden_waypoint_cross_attention requires latent_waypoints"
+                )
+            expected_waypoints = (
+                hidden.shape[0],
+                self.cfg.model.spatial_token_count,
+                self.cfg.model.waypoint_dim,
+            )
+            if tuple(waypoints.shape) != expected_waypoints:
+                raise ValueError(
+                    f"Expected waypoint shape {expected_waypoints}, got "
+                    f"{tuple(waypoints.shape)}"
+                )
+            if not bool(torch.isfinite(waypoints.float()).all()):
+                raise ValueError("latent_waypoints contains NaN or Inf")
+            # The student's waypoint head predicts normalized image coordinates.
+            waypoint_features = self.waypoint_adaptor(waypoints * 2.0 - 1.0)
+            plan_input = torch.cat([hidden_features, waypoint_features], dim=-1)
+        plan_tokens = self.plan_adaptor(plan_input)
         plan_tokens = (
             plan_tokens
             + self.plan_type_embedding
@@ -1075,12 +1082,15 @@ class SFTConditionedRDT(nn.Module):
             )
             extra_cross_cond = torch.cat(extra_parts, dim=1)
             extra_cross_mask = torch.cat(extra_masks, dim=1)
-        elif self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+        elif self.cfg.model.qwen_fusion in {
+            "hidden_cross_attention",
+            "hidden_waypoint_cross_attention",
+        }:
             if state_cond is None:
                 raise ValueError(
-                    "hidden_waypoint_cross_attention requires state_cond"
+                    "hidden cross-attention fusion requires state_cond"
                 )
-            plan_tokens, plan_mask = self._adapt_hidden_waypoint_plan(batch)
+            plan_tokens, plan_mask = self._adapt_hidden_plan(batch)
             state_token = state_cond + self.unified_cross_extra_pos_embed[:, 0:1]
             state_mask = torch.ones(
                 state_cond.shape[:2],
@@ -1442,13 +1452,17 @@ class SFTConditionedRDT(nn.Module):
                         continue
                     for offset, sample_index in enumerate(indices):
                         permutation[sample_index] = indices[(offset + 1) % len(indices)]
-            if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+            if self.cfg.model.qwen_fusion in {
+                "hidden_cross_attention",
+                "hidden_waypoint_cross_attention",
+            }:
                 shuffled_batch["qwen_hidden_states"] = batch[
                     "qwen_hidden_states"
                 ][permutation]
-                shuffled_batch["latent_waypoints"] = batch[
-                    "latent_waypoints"
-                ][permutation]
+                if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+                    shuffled_batch["latent_waypoints"] = batch[
+                        "latent_waypoints"
+                    ][permutation]
                 if "plan_mask" in batch:
                     shuffled_batch["plan_mask"] = batch["plan_mask"][permutation]
             else:

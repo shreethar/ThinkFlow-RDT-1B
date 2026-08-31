@@ -73,6 +73,7 @@ PLAN_FEATURE_REQUIRED_KEYS = {
     "qwen_hidden_states",
     "latent_waypoints",
 }
+HIDDEN_FEATURE_REQUIRED_KEYS = {"qwen_hidden_states"}
 
 
 class CachedFeatureDataset(Dataset[dict[str, Any]]):
@@ -649,6 +650,7 @@ class RDTBatchCollator:
     plan_hidden_dim: int | None = None
     spatial_token_count: int = 5
     waypoint_dim: int = 2
+    require_hidden_features: bool = False
     require_plan_features: bool = False
     convert_cached_gripper_closed_to_open: bool = True
     cache_state_dim: int | None = None
@@ -917,6 +919,18 @@ class RDTBatchCollator:
             raise ValueError("latent_waypoints contains NaN or Inf")
         return hidden, waypoints
 
+    def _prepare_hidden_features(self, hidden_value: Any) -> torch.Tensor:
+        hidden = torch.as_tensor(hidden_value)
+        expected_hidden = (self.spatial_token_count, self.plan_hidden_dim)
+        if tuple(hidden.shape) != expected_hidden:
+            raise ValueError(
+                "Expected qwen_hidden_states "
+                f"{expected_hidden}, got {tuple(hidden.shape)}"
+            )
+        if not bool(torch.isfinite(hidden.float()).all()):
+            raise ValueError("qwen_hidden_states contains NaN or Inf")
+        return hidden
+
     def _convert_cached_gripper_to_rdt_open(
         self,
         state: torch.Tensor,
@@ -955,10 +969,11 @@ class RDTBatchCollator:
             "action_dim_mask": [],
             "ctrl_freq": [],
         }
-        if self.require_plan_features:
+        if self.require_hidden_features or self.require_plan_features:
             batch["qwen_hidden_states"] = []
-            batch["latent_waypoints"] = []
             batch["plan_mask"] = []
+        if self.require_plan_features:
+            batch["latent_waypoints"] = []
         dataset_ids: list[str] = []
         instructions: list[str] = []
         episode_ids: list[str] = []
@@ -973,7 +988,8 @@ class RDTBatchCollator:
             )
 
             qwen_kv = self._prepare_qwen_kv(sample["qwen_kv"])
-            plan_features: tuple[torch.Tensor, torch.Tensor] | None = None
+            hidden_features: torch.Tensor | None = None
+            latent_waypoints: torch.Tensor | None = None
             if self.require_plan_features:
                 missing = PLAN_FEATURE_REQUIRED_KEYS.difference(sample)
                 if missing:
@@ -981,9 +997,18 @@ class RDTBatchCollator:
                         "Hidden/waypoint fusion requires cache keys: "
                         + ", ".join(sorted(missing))
                     )
-                plan_features = self._prepare_plan_features(
+                hidden_features, latent_waypoints = self._prepare_plan_features(
                     sample["qwen_hidden_states"],
                     sample["latent_waypoints"],
+                )
+            elif self.require_hidden_features:
+                missing = HIDDEN_FEATURE_REQUIRED_KEYS.difference(sample)
+                if missing:
+                    raise KeyError(
+                        "Hidden-only fusion requires cache key qwen_hidden_states"
+                    )
+                hidden_features = self._prepare_hidden_features(
+                    sample["qwen_hidden_states"]
                 )
 
             if "lang_mask" in sample:
@@ -1039,10 +1064,10 @@ class RDTBatchCollator:
                 )
 
             batch["qwen_kv"].append(qwen_kv)
-            if plan_features is not None:
-                hidden_states, latent_waypoints = plan_features
-                batch["qwen_hidden_states"].append(hidden_states)
-                batch["latent_waypoints"].append(latent_waypoints)
+            if hidden_features is not None:
+                batch["qwen_hidden_states"].append(hidden_features)
+                if latent_waypoints is not None:
+                    batch["latent_waypoints"].append(latent_waypoints)
                 batch["plan_mask"].append(
                     torch.ones(self.spatial_token_count, dtype=torch.bool)
                 )
@@ -1088,6 +1113,7 @@ class RDTOnlineSiglipBatchCollator:
     plan_hidden_dim: int | None = None
     spatial_token_count: int = 5
     waypoint_dim: int = 2
+    require_hidden_features: bool = False
     require_plan_features: bool = False
     convert_cached_gripper_closed_to_open: bool = True
     cache_state_dim: int | None = None
@@ -1112,6 +1138,7 @@ class RDTOnlineSiglipBatchCollator:
             plan_hidden_dim=self.plan_hidden_dim,
             spatial_token_count=self.spatial_token_count,
             waypoint_dim=self.waypoint_dim,
+            require_hidden_features=self.require_hidden_features,
             require_plan_features=self.require_plan_features,
             convert_cached_gripper_closed_to_open=(
                 self.convert_cached_gripper_closed_to_open
@@ -1136,10 +1163,11 @@ class RDTOnlineSiglipBatchCollator:
             "ctrl_freq": [],
             "image_slot_mask": [],
         }
-        if self.require_plan_features:
+        if self.require_hidden_features or self.require_plan_features:
             tensor_batch["qwen_hidden_states"] = []
-            tensor_batch["latent_waypoints"] = []
             tensor_batch["plan_mask"] = []
+        if self.require_plan_features:
+            tensor_batch["latent_waypoints"] = []
         # The historical key name is retained for cache compatibility. Payloads
         # may be encoded bytes or lossless uint8 image arrays.
         image_slot_jpegs: list[list[Any]] = []
@@ -1158,7 +1186,8 @@ class RDTOnlineSiglipBatchCollator:
                 default_lang_mask[: supplied.shape[0]] &= supplied
 
             qwen_kv = self._base._prepare_qwen_kv(sample["qwen_kv"])
-            plan_features: tuple[torch.Tensor, torch.Tensor] | None = None
+            hidden_features: torch.Tensor | None = None
+            latent_waypoints: torch.Tensor | None = None
             if self.require_plan_features:
                 missing = PLAN_FEATURE_REQUIRED_KEYS.difference(sample)
                 if missing:
@@ -1166,9 +1195,18 @@ class RDTOnlineSiglipBatchCollator:
                         "Hidden/waypoint fusion requires cache keys: "
                         + ", ".join(sorted(missing))
                     )
-                plan_features = self._base._prepare_plan_features(
+                hidden_features, latent_waypoints = self._base._prepare_plan_features(
                     sample["qwen_hidden_states"],
                     sample["latent_waypoints"],
+                )
+            elif self.require_hidden_features:
+                missing = HIDDEN_FEATURE_REQUIRED_KEYS.difference(sample)
+                if missing:
+                    raise KeyError(
+                        "Hidden-only fusion requires cache key qwen_hidden_states"
+                    )
+                hidden_features = self._base._prepare_hidden_features(
+                    sample["qwen_hidden_states"]
                 )
 
             state = torch.as_tensor(sample["state"], dtype=torch.float32).flatten()
@@ -1226,10 +1264,10 @@ class RDTOnlineSiglipBatchCollator:
                 )
 
             tensor_batch["qwen_kv"].append(qwen_kv)
-            if plan_features is not None:
-                hidden_states, latent_waypoints = plan_features
-                tensor_batch["qwen_hidden_states"].append(hidden_states)
-                tensor_batch["latent_waypoints"].append(latent_waypoints)
+            if hidden_features is not None:
+                tensor_batch["qwen_hidden_states"].append(hidden_features)
+                if latent_waypoints is not None:
+                    tensor_batch["latent_waypoints"].append(latent_waypoints)
                 tensor_batch["plan_mask"].append(
                     torch.ones(self.spatial_token_count, dtype=torch.bool)
                 )
