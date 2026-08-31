@@ -565,6 +565,14 @@ def save_sample_shard(
                 "dataset with seven joint positions"
             )
         joint_state = batch["joint_state"][:, :7].float()
+        eef_position = batch["libero_native_state"][:, :3].float()
+        if tuple(eef_position.shape) != (batch_size, 3):
+            raise ValueError(
+                "LIBERO EEF position must have shape [samples,3], got "
+                f"{tuple(eef_position.shape)}"
+            )
+        if not bool(torch.isfinite(eef_position).all()):
+            raise ValueError("LIBERO EEF position contains NaN/Inf")
         raw_gripper = batch["libero_native_state"][:, 6:8].float()
         normalized_gripper = (
             raw_gripper - LIBERO_GRIPPER_QPOS_MIN
@@ -579,6 +587,7 @@ def save_sample_shard(
         )
         proprioception_schema = "libero_joint7_gripper2_norm01_action7_v1"
     else:
+        eef_position = None
         cached_state = batch["state"]
         cached_actions = batch["actions"]
         state_dim_mask = batch["state_dim_mask"]
@@ -613,6 +622,10 @@ def save_sample_shard(
     }
     if "joint_state" in batch:
         record["joint_state"] = batch["joint_state"].cpu()
+    if eef_position is not None:
+        # Diagnostic sidecar only; it is not part of the model's native state
+        # slot mapping.
+        record["eef_position"] = eef_position.cpu()
     if "joint_states" in batch:
         record["joint_states"] = batch["joint_states"].cpu()
     if "joint_states_mask" in batch:
@@ -673,6 +686,12 @@ def save_sample_shard(
                 "has_lang_tokens": lang_tokens is not None,
                 "has_image_slots": cache_image_slots,
                 "has_joint_states": "joint_states" in record,
+                "has_eef_position": "eef_position" in record,
+                "eef_position_dim": (
+                    int(record["eef_position"].shape[-1])
+                    if "eef_position" in record
+                    else None
+                ),
                 "proprioception_schema": proprioception_schema,
                 "state_dim": int(cached_state.shape[-1]),
                 "action_dim": int(cached_actions.shape[-1]),

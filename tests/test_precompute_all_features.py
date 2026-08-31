@@ -113,7 +113,7 @@ def test_b0_sample_shard_retains_kv_hidden_and_native_libero_schema(tmp_path):
         "instructions": ["pick up the object"] * batch_size,
         "joint_state": torch.arange(14, dtype=torch.float32).reshape(2, 7),
         "libero_native_state": torch.tensor(
-            [[0, 0, 0, 0, 0, 0, -0.04245, 0.05185]] * batch_size,
+            [[0.1, 0.2, 0.3, 0, 0, 0, -0.04245, 0.05185]] * batch_size,
             dtype=torch.float32,
         ),
         "libero_native_actions": torch.randn(batch_size, 64, 7),
@@ -165,6 +165,11 @@ def test_b0_sample_shard_retains_kv_hidden_and_native_libero_schema(tmp_path):
         shard["state"][:, 7:9], torch.tensor([[0.0, 1.0]] * 2)
     )
     assert shard["actions"].shape == (2, 64, 7)
+    torch.testing.assert_close(
+        shard["eef_position"], torch.tensor([[0.1, 0.2, 0.3]] * 2)
+    )
+    assert entry["has_eef_position"] is True
+    assert entry["eef_position_dim"] == 3
 
 
 def make_sample(

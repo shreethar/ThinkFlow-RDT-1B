@@ -18,7 +18,7 @@ from precompute_latent_student_kv import save_sample_shard  # noqa: E402
 def test_libero_sample_shard_saves_joint7_and_normalized_gripper2(tmp_path) -> None:
     batch = {
         "libero_native_state": torch.tensor(
-            [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.04245, 0.05185]]
+            [[0.1, 0.2, 0.3, 0.0, 0.0, 0.0, -0.04245, 0.05185]]
         ),
         "libero_native_actions": torch.zeros(1, 64, 7),
         "joint_state": torch.arange(7, dtype=torch.float32).unsqueeze(0),
@@ -63,6 +63,9 @@ def test_libero_sample_shard_saves_joint7_and_normalized_gripper2(tmp_path) -> N
         torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 1.0]),
     )
     assert shard["actions"].shape == (1, 64, 7)
+    torch.testing.assert_close(
+        shard["eef_position"], torch.tensor([[0.1, 0.2, 0.3]])
+    )
     assert shard["proprioception_schema"] == (
         "libero_joint7_gripper2_norm01_action7_v1"
     )
@@ -70,3 +73,5 @@ def test_libero_sample_shard_saves_joint7_and_normalized_gripper2(tmp_path) -> N
     assert manifest["state_dim"] == 9
     assert manifest["action_dim"] == 7
     assert manifest["conditioning_variant"] == "b2"
+    assert manifest["has_eef_position"] is True
+    assert manifest["eef_position_dim"] == 3

@@ -74,6 +74,7 @@ def main() -> None:
         required = {
             "qwen_kv": (1, 2048),
             "qwen_hidden_states": (1, 2560),
+            "eef_position": (3,),
         }
         if shard.get("qwen_token_selector") != "think_end":
             raise ValueError(
@@ -141,6 +142,7 @@ def main() -> None:
                     else "kv[5,2048]"
                 ),
                 "cached_state": "joint7+normalized_gripper2",
+                "diagnostic_sidecar": "absolute_eef_xyz[3]",
                 "cached_actions": "[samples,64,7] raw LIBERO commands",
                 "native_state_slots": {"joints": "0:7", "gripper": "10:12"},
                 "native_action_slots": {"eef_delta": "39:45", "gripper": 10},
