@@ -41,6 +41,7 @@ from precompute_all_features import (  # noqa: E402
     standardized_collate_fn,
 )
 from rollout_libero_rdt import (  # noqa: E402
+    B2_TRAJECTORY_PROMPT,
     LIBERO_BENCHMARK_CHOICES,
     LIBERO_DEFAULT_BENCHMARK,
     absolute_target_state_to_libero_action,
@@ -48,6 +49,10 @@ from rollout_libero_rdt import (  # noqa: E402
     install_robosuite_mujoco_compatibility,
     load_feature_metadata,
     load_t5_encoder,
+    native_rdt_action_to_libero_10d,
+    native_rdt_action_to_libero_7d,
+    native_rdt_policy_inputs,
+    resolve_qwen_extraction_mode,
     resolve_model_id,
     rdt_state_open_from_libero,
     rollout_sample,
@@ -58,48 +63,6 @@ from thinkflow_rdt.adapters.libero import rdt_action_to_libero  # noqa: E402
 from thinkflow_rdt.checkpoint import load_trainable_artifact  # noqa: E402
 from thinkflow_rdt.config import load_config  # noqa: E402
 from thinkflow_rdt.model import SFTConditionedRDT  # noqa: E402
-
-
-def native_rdt_action_to_libero_10d(actions: np.ndarray) -> np.ndarray:
-    """Extract LIBERO's supervised 10-D command from native RDT output."""
-    values = np.asarray(actions)
-    if values.shape[-1] != 128:
-        raise ValueError(
-            f"Expected native RDT action width 128, got {values.shape[-1]}"
-        )
-    return np.concatenate(
-        [values[..., 30:33], values[..., 33:39], values[..., 10:11]],
-        axis=-1,
-    )
-
-
-def native_rdt_policy_inputs(
-    state: torch.Tensor,
-    state_dim_mask: torch.Tensor,
-    action_dim_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Map live LIBERO 11-D state / 10-D action masks into RDT's 128 slots."""
-    if state.ndim != 2 or state.shape[-1] != 11:
-        raise ValueError(f"Expected live LIBERO state [B, 11], got {tuple(state.shape)}")
-    if state_dim_mask.shape != state.shape:
-        raise ValueError("LIBERO state_dim_mask must match state shape")
-    if action_dim_mask.ndim != 2 or action_dim_mask.shape != (state.shape[0], 10):
-        raise ValueError(
-            "Expected live LIBERO action_dim_mask [B, 10], got "
-            f"{tuple(action_dim_mask.shape)}"
-        )
-    native_state = state.new_zeros(state.shape[0], 128)
-    native_state_mask = state_dim_mask.new_zeros(state.shape[0], 128)
-    native_state[:, 30:39] = state[:, :9] * state_dim_mask[:, :9]
-    native_state_mask[:, 30:39] = state_dim_mask[:, :9]
-    native_state[:, 10:12] = state[:, 9:11] * state_dim_mask[:, 9:11]
-    native_state_mask[:, 10:12] = state_dim_mask[:, 9:11]
-
-    native_action_mask = action_dim_mask.new_zeros(state.shape[0], 128)
-    native_action_mask[:, 30:39] = action_dim_mask[:, :9]
-    native_action_mask[:, 10] = action_dim_mask[:, 9]
-    return native_state, native_state_mask, native_action_mask
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Measure RDT success rate across LIBERO episodes.")
@@ -209,6 +172,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map", default="cuda")
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
     parser.add_argument(
+        "--qwen-extraction",
+        choices=("auto", "b0", "b2", "b3"),
+        default="auto",
+        help=(
+            "Use B0's </think> KV or B2/B3's five synchronized KV, hidden, "
+            "and waypoint features. Auto infers b3, then b2, from paths."
+        ),
+    )
+    parser.add_argument("--qwen-layer-index", type=int, default=7)
+    parser.add_argument(
         "--t5-model-id",
         default=None,
         help="Override T5 XXL model path/id. Defaults to cache metadata, then local RDT model root, then google/t5-v1_1-xxl.",
@@ -225,6 +198,27 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override Qwen processor path/id. Defaults to --qwen-model-id.",
     )
+    parser.add_argument("--student-model-id", default=None)
+    parser.add_argument("--processor-id", default=None)
+    parser.add_argument(
+        "--latent-student-code-dir",
+        type=Path,
+        default=Path("/home/ubuntu/VLA-FYP/train/stage2"),
+    )
+    parser.add_argument("--spatial-parameters-path", type=Path, default=None)
+    parser.add_argument("--latent-count", type=int, default=6)
+    parser.add_argument("--spatial-token-count", type=int, default=5)
+    parser.add_argument(
+        "--attn-implementation",
+        choices=("eager", "sdpa", "flash_attention_2"),
+        default="sdpa",
+    )
+    parser.add_argument(
+        "--student-precision",
+        choices=("auto", "bf16", "fp16", "fp32"),
+        default="bf16",
+    )
+    parser.add_argument("--b2-prompt-template", default=B2_TRAJECTORY_PROMPT)
     parser.add_argument(
         "--siglip-model-id",
         default=None,
@@ -389,6 +383,14 @@ def main() -> None:
             f"--action-chunk ({args.action_chunk}) cannot exceed "
             f"cfg.model.pred_horizon ({cfg.model.pred_horizon})"
         )
+    if (
+        cfg.model.native_rdt_128_mapping == "libero_joint_eef_delta"
+        and args.action_output_mode != "raw_delta_ortho6d"
+    ):
+        raise ValueError(
+            "libero_joint_eef_delta emits raw seven-dimensional controller "
+            "commands and requires --action-output-mode raw_delta_ortho6d"
+        )
     if args.target_state_start_index < 0:
         raise ValueError("--target-state-start-index must be non-negative")
     max_delta_pos = None if args.max_delta_pos < 0 else args.max_delta_pos
@@ -403,8 +405,25 @@ def main() -> None:
             "raw_delta_ortho6d"
         )
     metadata = load_feature_metadata(args.cache_root)
+    qwen_extraction_mode = resolve_qwen_extraction_mode(
+        args.qwen_extraction,
+        checkpoint=args.checkpoint,
+        config=args.config,
+    )
+    if (
+        cfg.model.qwen_fusion == "hidden_waypoint_cross_attention"
+        and qwen_extraction_mode == "b0"
+    ):
+        raise ValueError(
+            "hidden_waypoint_cross_attention requires --qwen-extraction b2 "
+            "or b3 and its matching LatentStudent checkpoint"
+        )
     qwen_id = args.qwen_model_id or metadata.get("qwen_model_id", "shreethar/stage1_unsloth")
     qwen_processor_id = args.qwen_processor_id or metadata.get("qwen_processor_id", qwen_id)
+    student_model_id = args.student_model_id or metadata.get("student_model_id")
+    student_processor_id = (
+        args.processor_id or metadata.get("processor_id") or student_model_id
+    )
     siglip_id = resolve_model_id(
         args.siglip_model_id
         or metadata.get(
@@ -420,7 +439,10 @@ def main() -> None:
     benchmark = get_benchmark(args.benchmark)(0)
 
     use_qwen = cfg.model.qwen_fusion != "none"
-    print("Loading T5, SigLIP, and optional Qwen encoders...")
+    print(
+        "Loading T5, SigLIP, and optional "
+        f"Qwen-{qwen_extraction_mode.upper()} encoders..."
+    )
     t5_tokenizer, t5 = load_t5_encoder(
         model_id=t5_id,
         fallback_model_id=args.t5_fallback_model_id,
@@ -430,15 +452,43 @@ def main() -> None:
     )
     qwen_processor = None
     qwen = None
+    latent_student = None
+    extract_latent_student_spatial_kv = None
     if use_qwen:
-        qwen_processor = AutoProcessor.from_pretrained(qwen_processor_id)
-        qwen_processor.tokenizer.padding_side = "left"
-        qwen = AutoModelForImageTextToText.from_pretrained(
-            qwen_id,
-            torch_dtype=torch.bfloat16,
-            device_map=args.device_map,
-            attn_implementation="sdpa",
-        ).eval()
+        if qwen_extraction_mode in {"b2", "b3"}:
+            if student_model_id is None:
+                raise ValueError(
+                    f"--qwen-extraction {qwen_extraction_mode} requires "
+                    "--student-model-id or student_model_id in cache metadata"
+                )
+            from precompute_latent_student_kv import (
+                extract_latent_student_spatial_kv as extract_spatial_features,
+                load_student_and_processor,
+            )
+            from run_precompute_32frame_episode_packs_latent_student_kv import (
+                validate_student_runtime_contract,
+            )
+
+            args.student_model_id = student_model_id
+            args.processor_id = student_processor_id
+            args.layer_index = args.qwen_layer_index
+            latent_student, qwen_processor = load_student_and_processor(args, device)
+            validate_student_runtime_contract(
+                latent_student,
+                qwen_processor,
+                args=args,
+                cfg=cfg,
+            )
+            extract_latent_student_spatial_kv = extract_spatial_features
+        else:
+            qwen_processor = AutoProcessor.from_pretrained(qwen_processor_id)
+            qwen_processor.tokenizer.padding_side = "left"
+            qwen = AutoModelForImageTextToText.from_pretrained(
+                qwen_id,
+                torch_dtype=torch.bfloat16,
+                device_map=args.device_map,
+                attn_implementation="sdpa",
+            ).eval()
     siglip_processor = SiglipImageProcessor.from_pretrained(siglip_id)
     siglip = SiglipVisionModel.from_pretrained(
         siglip_id,
@@ -567,20 +617,46 @@ def main() -> None:
                     )
                     assert encoded is not None
                     qwen_kv = None
+                    qwen_hidden_states = None
+                    latent_waypoints = None
                     if use_qwen:
-                        assert qwen_processor is not None and qwen is not None
-                        qwen_kv = extract_qwen_kv(
-                            encoded,
-                            qwen_processor,
-                            qwen,
-                            device=device,
-                            layer_index=int(metadata.get("qwen_layer_index", 7)),
-                            max_new_tokens=args.qwen_max_new_tokens,
-                            expected_dim=cfg.model.qwen_kv_dim,
-                            stop_at_think_end=bool(metadata.get("qwen_stop_at_think", True)),
-                            prompt_template=metadata.get("qwen_trajectory_prompt_template"),
-                            enable_thinking=bool(metadata.get("qwen_enable_thinking", False)),
-                        )
+                        assert qwen_processor is not None
+                        if qwen_extraction_mode in {"b2", "b3"}:
+                            if (
+                                latent_student is None
+                                or extract_latent_student_spatial_kv is None
+                            ):
+                                raise RuntimeError(
+                                    "LatentStudent spatial extractor was not loaded"
+                                )
+                            (
+                                qwen_kv,
+                                qwen_hidden_states,
+                                latent_waypoints,
+                            ) = extract_latent_student_spatial_kv(
+                                encoded,
+                                student=latent_student,
+                                processor=qwen_processor,
+                                device=device,
+                                layer_index=args.qwen_layer_index,
+                                expected_dim=cfg.model.qwen_kv_dim,
+                                spatial_token_count=args.spatial_token_count,
+                                prompt_template=args.b2_prompt_template,
+                            )
+                        else:
+                            assert qwen is not None
+                            qwen_kv = extract_qwen_kv(
+                                encoded,
+                                qwen_processor,
+                                qwen,
+                                device=device,
+                                layer_index=int(metadata.get("qwen_layer_index", 7)),
+                                max_new_tokens=args.qwen_max_new_tokens,
+                                expected_dim=cfg.model.qwen_kv_dim,
+                                stop_at_think_end=bool(metadata.get("qwen_stop_at_think", True)),
+                                prompt_template=metadata.get("qwen_trajectory_prompt_template"),
+                                enable_thinking=bool(metadata.get("qwen_enable_thinking", False)),
+                            )
                     img_tokens, img_mask = extract_siglip_features(
                         encoded,
                         siglip_processor,
@@ -594,11 +670,22 @@ def main() -> None:
                     state_dim_mask = encoded["state_dim_mask"]
                     action_dim_mask = encoded["action_dim_mask"]
                     if cfg.model.state_encoder_layout == "rdt_native_128":
+                        if (
+                            cfg.model.native_rdt_128_mapping
+                            == "libero_joint_eef_delta"
+                        ):
+                            action_dim_mask = torch.ones(
+                                state.shape[0],
+                                7,
+                                dtype=action_dim_mask.dtype,
+                            )
                         state, state_dim_mask, action_dim_mask = (
                             native_rdt_policy_inputs(
                                 state,
                                 state_dim_mask,
                                 action_dim_mask,
+                                mapping=cfg.model.native_rdt_128_mapping,
+                                joint_state=encoded.get("joint_state"),
                             )
                         )
                     policy_batch = {
@@ -614,16 +701,61 @@ def main() -> None:
                     if use_qwen:
                         assert qwen_kv is not None
                         policy_batch["qwen_kv"] = qwen_kv
+                        if (
+                            cfg.model.qwen_fusion
+                            == "hidden_waypoint_cross_attention"
+                        ):
+                            if qwen_hidden_states is None or latent_waypoints is None:
+                                raise RuntimeError(
+                                    "Hidden+waypoint conditioning is enabled but "
+                                    "online plan features are unavailable"
+                                )
+                            expected_hidden = (
+                                len(active),
+                                cfg.model.spatial_token_count,
+                                cfg.model.qwen_hidden_size,
+                            )
+                            expected_waypoints = (
+                                len(active),
+                                cfg.model.spatial_token_count,
+                                cfg.model.waypoint_dim,
+                            )
+                            if tuple(qwen_hidden_states.shape) != expected_hidden:
+                                raise ValueError(
+                                    "Online spatial hidden state shape mismatch: "
+                                    f"{tuple(qwen_hidden_states.shape)} != {expected_hidden}"
+                                )
+                            if tuple(latent_waypoints.shape) != expected_waypoints:
+                                raise ValueError(
+                                    "Online waypoint shape mismatch: "
+                                    f"{tuple(latent_waypoints.shape)} != {expected_waypoints}"
+                                )
+                            policy_batch["qwen_hidden_states"] = qwen_hidden_states
+                            policy_batch["latent_waypoints"] = latent_waypoints
+                            policy_batch["plan_mask"] = torch.ones(
+                                qwen_hidden_states.shape[:2],
+                                dtype=torch.bool,
+                                device=qwen_hidden_states.device,
+                            )
                     torch.manual_seed(args.seed + task_id * 100_000 + batch_start * 1_000 + plan_index)
                     model_output = model.sample_actions(policy_batch).float().cpu().numpy()
                     predicted = None
                     if args.action_output_mode == "raw_delta_ortho6d":
-                        rdt_commands = (
-                            native_rdt_action_to_libero_10d(model_output)
-                            if cfg.model.action_encoder_layout == "rdt_native_128"
-                            else model_output
-                        )
-                        predicted = rdt_action_to_libero(rdt_commands)
+                        if (
+                            cfg.model.action_encoder_layout == "rdt_native_128"
+                            and cfg.model.native_rdt_128_mapping
+                            == "libero_joint_eef_delta"
+                        ):
+                            predicted = native_rdt_action_to_libero_7d(
+                                model_output
+                            )
+                        else:
+                            rdt_commands = (
+                                native_rdt_action_to_libero_10d(model_output)
+                                if cfg.model.action_encoder_layout == "rdt_native_128"
+                                else model_output
+                            )
+                            predicted = rdt_action_to_libero(rdt_commands)
                         finite_actions = predicted
                     elif args.action_output_mode == "normalized_delta":
                         assert stats is not None

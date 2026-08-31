@@ -43,6 +43,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--qwen-extraction",
+        choices=("auto", "b0", "b2", "b3"),
+        default="auto",
+    )
+    parser.add_argument("--qwen-layer-index", type=int, default=7)
+    parser.add_argument("--student-model-id", default=None)
+    parser.add_argument("--processor-id", default=None)
+    parser.add_argument(
+        "--latent-student-code-dir",
+        type=Path,
+        default=Path("/home/ubuntu/VLA-FYP/train/stage2"),
+    )
+    parser.add_argument("--spatial-parameters-path", type=Path, default=None)
+    parser.add_argument("--latent-count", type=int, default=6)
+    parser.add_argument("--spatial-token-count", type=int, default=5)
+    parser.add_argument(
+        "--student-precision",
+        choices=("auto", "bf16", "fp16", "fp32"),
+        default="bf16",
+    )
     parser.add_argument("--t5-precision", choices=("bf16", "8bit"), default="bf16")
     parser.add_argument("--siglip-model-id", default="/home/ubuntu/models/siglip-so400m-patch14-384")
     parser.add_argument(
@@ -112,11 +133,24 @@ def main() -> None:
             "--max-steps", str(args.max_steps),
             "--seed", str(args.seed),
             "--qwen-max-new-tokens", str(args.qwen_max_new_tokens),
+            "--qwen-extraction", args.qwen_extraction,
+            "--qwen-layer-index", str(args.qwen_layer_index),
+            "--latent-student-code-dir", str(args.latent_student_code_dir),
+            "--latent-count", str(args.latent_count),
+            "--spatial-token-count", str(args.spatial_token_count),
+            "--student-precision", args.student_precision,
             "--require-qwen-fusion",
             "--t5-precision", args.t5_precision,
             "--siglip-model-id", args.siglip_model_id,
             "--siglip-fallback-model-id", args.siglip_fallback_model_id,
         ]
+        for flag, value in (
+            ("--student-model-id", args.student_model_id),
+            ("--processor-id", args.processor_id),
+            ("--spatial-parameters-path", args.spatial_parameters_path),
+        ):
+            if value is not None:
+                command.extend([flag, str(value)])
         for task_id in task_ids:
             command.extend(["--task-id", str(task_id)])
         if args.save_videos:
@@ -147,6 +181,7 @@ def main() -> None:
         "task_ids": list(task_ids),
         "tasks_per_suite": len(task_ids),
         "qwen_mode": "online_per_replan",
+        "qwen_extraction": args.qwen_extraction,
         "suites": suite_summaries,
         "elapsed_seconds": time.time() - started,
     }
@@ -169,6 +204,7 @@ def main() -> None:
                 "task_ids": list(task_ids),
                 "tasks_per_suite": len(task_ids),
                 "qwen_mode": "online_per_replan",
+                "qwen_extraction": args.qwen_extraction,
                 "action_chunk": args.action_chunk,
                 "suites": list(suites),
             },

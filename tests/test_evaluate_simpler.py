@@ -41,6 +41,11 @@ def test_qwen_extraction_mode_auto_detects_b2_artifacts() -> None:
         checkpoint="arbitrary",
         config="arbitrary",
     ) == "b2"
+    assert resolve_qwen_extraction_mode(
+        "auto",
+        checkpoint="output_2/libero_b3_spatial/checkpoint-5000",
+        config="configs/libero_hidden_waypoint.yaml",
+    ) == "b3"
 
 
 def test_worker_socket_path_stays_below_linux_limit(monkeypatch, tmp_path):

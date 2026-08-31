@@ -36,6 +36,12 @@ SAVE_VIDEOS=${SAVE_VIDEOS:-0}
 VIDEO_RESOLUTION=${VIDEO_RESOLUTION:-512}
 SIGLIP_MODEL_ID=${SIGLIP_MODEL_ID:-/home/ubuntu/models/siglip-so400m-patch14-384}
 SIGLIP_FALLBACK_MODEL_ID=${SIGLIP_FALLBACK_MODEL_ID:-google/siglip-so400m-patch14-384}
+QWEN_EXTRACTION=${QWEN_EXTRACTION:-auto}
+STUDENT_MODEL_ID=${STUDENT_MODEL_ID:-}
+PROCESSOR_ID=${PROCESSOR_ID:-}
+LATENT_STUDENT_CODE_DIR=${LATENT_STUDENT_CODE_DIR:-/home/ubuntu/VLA-FYP/train/stage2}
+SPATIAL_PARAMETERS_PATH=${SPATIAL_PARAMETERS_PATH:-}
+STUDENT_PRECISION=${STUDENT_PRECISION:-bf16}
 
 if (( EVAL_EVERY <= 0 || MAX_STEPS <= 0 || MAX_STEPS < EVAL_EVERY )); then
   echo "Invalid MAX_STEPS/EVAL_EVERY: $MAX_STEPS/$EVAL_EVERY" >&2
@@ -110,6 +116,20 @@ for ((step=EVAL_EVERY; step<=MAX_STEPS; step+=EVAL_EVERY)); do
   if [[ "$SAVE_VIDEOS" == "1" ]]; then
     video_args=(--save-videos --video-resolution "$VIDEO_RESOLUTION")
   fi
+  latent_args=(
+    --qwen-extraction "$QWEN_EXTRACTION"
+    --latent-student-code-dir "$LATENT_STUDENT_CODE_DIR"
+    --student-precision "$STUDENT_PRECISION"
+  )
+  if [[ -n "$STUDENT_MODEL_ID" ]]; then
+    latent_args+=(--student-model-id "$STUDENT_MODEL_ID")
+  fi
+  if [[ -n "$PROCESSOR_ID" ]]; then
+    latent_args+=(--processor-id "$PROCESSOR_ID")
+  fi
+  if [[ -n "$SPATIAL_PARAMETERS_PATH" ]]; then
+    latent_args+=(--spatial-parameters-path "$SPATIAL_PARAMETERS_PATH")
+  fi
   log="$eval_dir/job.log"
   mkdir -p "$eval_dir"
   echo "[$(date -Is)] evaluating checkpoint-$step on GPU $ROLLOUT_GPU" | tee -a "$log"
@@ -127,6 +147,7 @@ for ((step=EVAL_EVERY; step<=MAX_STEPS; step+=EVAL_EVERY)); do
       --max-steps "$MAX_ROLLOUT_STEPS" \
       --siglip-model-id "$SIGLIP_MODEL_ID" \
       --siglip-fallback-model-id "$SIGLIP_FALLBACK_MODEL_ID" \
+      "${latent_args[@]}" \
       "${suite_args[@]}" \
       "${task_args[@]}" \
       --wandb-project "$WANDB_PROJECT" \

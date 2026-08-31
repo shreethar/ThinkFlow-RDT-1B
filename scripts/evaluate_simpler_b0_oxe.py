@@ -73,12 +73,14 @@ def resolve_qwen_extraction_mode(
     checkpoint: str | Path,
     config: str | Path,
 ) -> str:
-    """Resolve B0/B2 extraction while keeping an explicit override available."""
-    if requested in {"b0", "b2"}:
+    """Resolve B0/B2/B3 extraction while keeping an explicit override available."""
+    if requested in {"b0", "b2", "b3"}:
         return requested
     if requested != "auto":
         raise ValueError(f"Unsupported Qwen extraction mode: {requested!r}")
     names = f"{Path(checkpoint)} {Path(config)}".lower()
+    if "b3" in names:
+        return "b3"
     return "b2" if "b2" in names else "b0"
 
 
@@ -397,7 +399,7 @@ class PolicyEngine:
         self.qwen = None
         self.latent_student = None
         self.extract_latent_student_spatial_kv = None
-        if self.qwen_extraction_mode == "b2":
+        if self.qwen_extraction_mode in {"b2", "b3"}:
             from precompute_latent_student_kv import (
                 extract_latent_student_spatial_kv,
                 load_student_and_processor,
@@ -492,10 +494,12 @@ class PolicyEngine:
             raise RuntimeError("The SimplerEnv observation did not contain a valid image")
 
         qwen_started = time.perf_counter()
-        if self.qwen_extraction_mode == "b2":
+        spatial_hidden_states = None
+        latent_waypoints = None
+        if self.qwen_extraction_mode in {"b2", "b3"}:
             assert self.extract_latent_student_spatial_kv is not None
             assert self.latent_student is not None
-            qwen_kv, _spatial_hidden_states, _latent_waypoints = (
+            qwen_kv, spatial_hidden_states, latent_waypoints = (
                 self.extract_latent_student_spatial_kv(
                     encoded,
                     student=self.latent_student,
@@ -520,7 +524,11 @@ class PolicyEngine:
                 stop_at_think_end=True,
                 enable_thinking=False,
             )
-        expected_qwen_tokens = 5 if self.qwen_extraction_mode == "b2" else 1
+        expected_qwen_tokens = (
+            self.cfg.model.spatial_token_count
+            if self.qwen_extraction_mode in {"b2", "b3"}
+            else 1
+        )
         expected_qwen_shape = (
             1,
             expected_qwen_tokens,
@@ -531,6 +539,38 @@ class PolicyEngine:
                 f"{self.qwen_extraction_mode.upper()} extraction returned "
                 f"{tuple(qwen_kv.shape)}, expected {expected_qwen_shape}"
             )
+        if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+            if spatial_hidden_states is None or latent_waypoints is None:
+                raise ValueError(
+                    "hidden_waypoint_cross_attention requires --qwen-extraction "
+                    "b2 or b3; B0 only extracts the </think> KV token"
+                )
+            expected_hidden_shape = (
+                1,
+                self.cfg.model.spatial_token_count,
+                self.cfg.model.qwen_hidden_size,
+            )
+            expected_waypoint_shape = (
+                1,
+                self.cfg.model.spatial_token_count,
+                self.cfg.model.waypoint_dim,
+            )
+            if tuple(spatial_hidden_states.shape) != expected_hidden_shape:
+                raise ValueError(
+                    "LatentStudent hidden-state extraction returned "
+                    f"{tuple(spatial_hidden_states.shape)}, expected "
+                    f"{expected_hidden_shape}"
+                )
+            if tuple(latent_waypoints.shape) != expected_waypoint_shape:
+                raise ValueError(
+                    "LatentStudent waypoint extraction returned "
+                    f"{tuple(latent_waypoints.shape)}, expected "
+                    f"{expected_waypoint_shape}"
+                )
+            if not torch.isfinite(spatial_hidden_states).all():
+                raise FloatingPointError("LatentStudent hidden states contain NaN/Inf")
+            if not torch.isfinite(latent_waypoints).all():
+                raise FloatingPointError("LatentStudent waypoints contain NaN/Inf")
         qwen_seconds = time.perf_counter() - qwen_started
         siglip_started = time.perf_counter()
         img_tokens, img_mask = self.extract_siglip_features(
@@ -558,6 +598,16 @@ class PolicyEngine:
             "img_mask": img_mask,
             "qwen_kv": qwen_kv,
         }
+        if self.cfg.model.qwen_fusion == "hidden_waypoint_cross_attention":
+            assert spatial_hidden_states is not None
+            assert latent_waypoints is not None
+            batch["qwen_hidden_states"] = spatial_hidden_states
+            batch["latent_waypoints"] = latent_waypoints
+            batch["plan_mask"] = torch.ones(
+                spatial_hidden_states.shape[:2],
+                dtype=torch.bool,
+                device=spatial_hidden_states.device,
+            )
         torch.manual_seed(seed)
         rdt_started = time.perf_counter()
         output = self.model.sample_actions(batch).float().cpu().numpy()[0]
@@ -1140,12 +1190,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map", default="auto")
     parser.add_argument(
         "--qwen-extraction",
-        choices=("auto", "b0", "b2"),
+        choices=("auto", "b0", "b2", "b3"),
         default="auto",
         help=(
             "Select one </think> KV token (B0) or the LatentStudent five-spatial-"
-            "token KV path (B2). Auto selects B2 when the checkpoint/config path "
-            "contains 'b2'."
+            "token KV/hidden/waypoint path (B2/B3). B2 and B3 share the same "
+            "runtime contract and differ through the selected student checkpoint. "
+            "Auto detects b3, then b2, from checkpoint/config paths."
         ),
     )
     parser.add_argument("--qwen-model-id", default=str(DEFAULT_QWEN))
