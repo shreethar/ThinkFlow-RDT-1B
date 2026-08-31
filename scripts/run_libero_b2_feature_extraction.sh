@@ -13,7 +13,7 @@ set -euo pipefail
 #   ALL_SAMPLES_PER_EPISODE=1
 #   MAX_SAMPLES_PER_EPISODE=128  # used only when ALL_SAMPLES_PER_EPISODE=0
 #   OVERWRITE=1
-#   INCLUDE_T5=0  # set to 1 to additionally cache T5 XXL language embeddings
+#   INCLUDE_T5=1  # enabled by default; set to 0 only for an ablation
 #   ATTN_IMPLEMENTATION=sdpa  # force identical attention kernels across checkpoints
 #   STUDENT_PRECISION=auto    # use bf16 to override an fp32 checkpoint
 #   MAX_BATCHES_PER_SPLIT=20  # short throughput benchmark
@@ -48,7 +48,7 @@ MAX_BATCHES_PER_SPLIT=${MAX_BATCHES_PER_SPLIT:-}
 
 T5_MODEL_ID=${T5_MODEL_ID:-/home/ubuntu/RoboticsDiffusionTransformer/google/t5-v1_1-xxl}
 T5_PRECISION=${T5_PRECISION:-bf16}
-INCLUDE_T5=${INCLUDE_T5:-0}
+INCLUDE_T5=${INCLUDE_T5:-1}
 BATCH_SIZE=${BATCH_SIZE:-32}
 T5_BATCH_SIZE=${T5_BATCH_SIZE:-32}
 NUM_WORKERS=${NUM_WORKERS:-4}

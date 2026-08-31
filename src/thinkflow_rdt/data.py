@@ -282,7 +282,10 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         if original_anchor_kind in {"uniform", "uniform_fallback"}:
             anchor_index = 0
 
-        image_pool = list(pack.get("image_jpegs", []))
+        image_payloads = pack.get("image_jpegs")
+        if image_payloads is None:
+            image_payloads = pack.get("image_arrays", [])
+        image_pool = list(image_payloads)
         sample_image_indices = torch.as_tensor(pack["sample_image_indices"], dtype=torch.long)
         image_indices = sample_image_indices[sample_index].flatten().tolist()
         image_slot_jpegs = []
@@ -393,8 +396,14 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         image_slot_jpegs = pack.get("image_slot_jpegs")
         if image_slot_jpegs is not None:
             image_slot_jpegs = list(image_slot_jpegs[sample_index])
-        elif "image_jpegs" in pack and "sample_image_indices" in pack:
-            image_pool = list(pack["image_jpegs"])
+        elif (
+            ("image_jpegs" in pack or "image_arrays" in pack)
+            and "sample_image_indices" in pack
+        ):
+            image_payloads = pack.get("image_jpegs")
+            if image_payloads is None:
+                image_payloads = pack["image_arrays"]
+            image_pool = list(image_payloads)
             image_indices = torch.as_tensor(
                 pack["sample_image_indices"], dtype=torch.long
             )[sample_index].flatten().tolist()
@@ -673,7 +682,7 @@ class RDTBatchCollator:
             }:
                 raise ValueError("Unsupported native_rdt_128_mapping")
             allowed = (
-                {(8, 7)}
+                {(8, 7), (9, 7)}
                 if self.native_rdt_128_mapping == "libero_joint_eef_delta"
                 else {(7, 7), (11, 10)}
             )
@@ -737,32 +746,43 @@ class RDTBatchCollator:
         values = state.new_zeros(128)
         mask = state_mask.new_zeros(128)
         if self.native_rdt_128_mapping == "libero_joint_eef_delta":
-            if joint_state is None:
-                raise KeyError(
-                    "libero_joint_eef_delta requires joint_state in every cache sample"
-                )
-            joints = torch.as_tensor(
-                joint_state,
-                dtype=state.dtype,
-                device=state.device,
-            ).flatten()
-            if joints.numel() < 7:
+            if state.numel() == 9:
+                joints = state[:7]
+                gripper = state[7:9]
+                if bool(((gripper < 0) | (gripper > 1)).any()):
+                    raise ValueError(
+                        "Cached normalized gripper positions must be in [0,1]"
+                    )
+                gripper_mask = state_mask[7:9]
+            elif state.numel() == 8:
+                if joint_state is None:
+                    raise KeyError(
+                        "Legacy LIBERO state8 caches require joint_state"
+                    )
+                joints = torch.as_tensor(
+                    joint_state,
+                    dtype=state.dtype,
+                    device=state.device,
+                ).flatten()
+                if joints.numel() < 7:
+                    raise ValueError(
+                        f"Expected at least seven LIBERO joints, got {joints.numel()}"
+                    )
+                gripper = (
+                    state[6:8] - LIBERO_GRIPPER_QPOS_MIN
+                ) / (LIBERO_GRIPPER_QPOS_MAX - LIBERO_GRIPPER_QPOS_MIN)
+                gripper_mask = state_mask[6:8]
+            else:
                 raise ValueError(
-                    f"Expected at least seven LIBERO joints, got {joints.numel()}"
-                )
-            if state.numel() != 8:
-                raise ValueError(
-                    "libero_joint_eef_delta requires cached native LIBERO state8"
+                    "libero_joint_eef_delta requires cached state9 "
+                    "[joint7, normalized_gripper2] or legacy state8"
                 )
             if not bool(torch.isfinite(joints[:7]).all()):
-                raise ValueError("joint_state contains NaN or Inf")
+                raise ValueError("joint state contains NaN or Inf")
             values[:7] = joints[:7]
             mask[:7] = 1
-            gripper = (
-                state[6:8] - LIBERO_GRIPPER_QPOS_MIN
-            ) / (LIBERO_GRIPPER_QPOS_MAX - LIBERO_GRIPPER_QPOS_MIN)
-            values[10:12] = gripper * state_mask[6:8]
-            mask[10:12] = state_mask[6:8]
+            values[10:12] = gripper * gripper_mask
+            mask[10:12] = gripper_mask
             return values, mask
         values[RDT_XYZ_SLICE] = state[:3] * state_mask[:3]
         mask[RDT_XYZ_SLICE] = state_mask[:3]
@@ -1120,7 +1140,9 @@ class RDTOnlineSiglipBatchCollator:
             tensor_batch["qwen_hidden_states"] = []
             tensor_batch["latent_waypoints"] = []
             tensor_batch["plan_mask"] = []
-        image_slot_jpegs: list[list[bytes]] = []
+        # The historical key name is retained for cache compatibility. Payloads
+        # may be encoded bytes or lossless uint8 image arrays.
+        image_slot_jpegs: list[list[Any]] = []
         dataset_ids: list[str] = []
         instructions: list[str] = []
         episode_ids: list[str] = []
@@ -1185,7 +1207,9 @@ class RDTOnlineSiglipBatchCollator:
             dataset_id = str(sample.get("dataset_id") or "unknown")
             if self.native_rdt_128:
                 state, state_dim_mask = self._base._to_native_rdt_state(
-                    state, state_dim_mask
+                    state,
+                    state_dim_mask,
+                    joint_state=sample.get("joint_state"),
                 )
                 actions, action_dim_mask = self._base._to_native_rdt_actions(
                     actions,

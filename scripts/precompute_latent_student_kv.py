@@ -57,6 +57,10 @@ from thinkflow_rdt.adapters.sample_filtering import (  # noqa: E402
     DEFAULT_OPEN_TO_CLOSE_BEFORE,
 )
 from thinkflow_rdt.config import load_config  # noqa: E402
+from thinkflow_rdt.data import (  # noqa: E402
+    LIBERO_GRIPPER_QPOS_MAX,
+    LIBERO_GRIPPER_QPOS_MIN,
+)
 
 
 def import_latent_student(code_dir: Path | None) -> type[Any]:
@@ -551,17 +555,29 @@ def save_sample_shard(
     path = split_dir / filename
 
     if cache_proprioception_schema == "libero_native":
-        if "libero_native_state" not in batch or "libero_native_actions" not in batch:
+        if (
+            "libero_native_state" not in batch
+            or "libero_native_actions" not in batch
+            or "joint_state" not in batch
+        ):
             raise ValueError(
-                "--cache-proprioception-schema libero_native requires a LIBERO dataset"
+                "--cache-proprioception-schema libero_native requires a LIBERO "
+                "dataset with seven joint positions"
             )
-        cached_state = batch["libero_native_state"]
+        joint_state = batch["joint_state"][:, :7].float()
+        raw_gripper = batch["libero_native_state"][:, 6:8].float()
+        normalized_gripper = (
+            raw_gripper - LIBERO_GRIPPER_QPOS_MIN
+        ) / (LIBERO_GRIPPER_QPOS_MAX - LIBERO_GRIPPER_QPOS_MIN)
+        cached_state = torch.cat(
+            [joint_state, normalized_gripper.clamp(0.0, 1.0)], dim=-1
+        )
         cached_actions = batch["libero_native_actions"]
         state_dim_mask = torch.ones_like(cached_state)
         action_dim_mask = torch.ones(
             cached_actions.shape[0], cached_actions.shape[-1], dtype=torch.float32
         )
-        proprioception_schema = "libero_native_state8_action7_v1"
+        proprioception_schema = "libero_joint7_gripper2_norm01_action7_v1"
     else:
         cached_state = batch["state"]
         cached_actions = batch["actions"]
@@ -1025,8 +1041,9 @@ def parse_args() -> argparse.Namespace:
         choices=["rdt", "libero_native"],
         default="rdt",
         help=(
-            "Store the normal adapter tensors, or exact LIBERO-native 8D state "
-            "and 7D command tensors. libero_native is valid only for LIBERO."
+            "Store the normal adapter tensors, or LIBERO joint7 + normalized "
+            "gripper2 state and raw 7D command tensors. libero_native is valid "
+            "only for LIBERO."
         ),
     )
 
@@ -1152,20 +1169,21 @@ def main() -> None:
         "normalize_actions": normalize_actions,
         "action_target_mode": args.action_target_mode,
         "state_dim": (
-            8 if args.cache_proprioception_schema == "libero_native" else cfg.model.state_dim
+            9 if args.cache_proprioception_schema == "libero_native" else cfg.model.state_dim
         ),
         "action_dim": (
             7 if args.cache_proprioception_schema == "libero_native" else cfg.model.action_dim
         ),
         "proprioception_schema": (
-            "libero_native_state8_action7_v1"
+            "libero_joint7_gripper2_norm01_action7_v1"
             if args.cache_proprioception_schema == "libero_native"
             else "rdt_encoded"
         ),
         "state_encoder_layout": cfg.model.state_encoder_layout,
         "action_encoder_layout": cfg.model.action_encoder_layout,
         "gripper_processing": (
-            "raw two-finger qpos state; raw HDF5 action command"
+            "two finger qpos normalized independently with shared travel "
+            "min/max to [0,1]; raw HDF5 action command"
             if all(config.dataset_id in LIBERO_DATASET_IDS for config in configs)
             else "dataset-specific"
         ),

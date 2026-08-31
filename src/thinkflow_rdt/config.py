@@ -336,7 +336,7 @@ class ExperimentConfig:
                 self.model.resolved_cache_action_dim,
             )
             allowed_cache_layouts = (
-                {(8, 7)}
+                {(8, 7), (9, 7)}
                 if self.model.native_rdt_128_mapping
                 == "libero_joint_eef_delta"
                 else {(7, 7), (11, 10)}

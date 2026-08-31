@@ -68,12 +68,18 @@ def main() -> None:
             f"Cache variant {variant!r} does not match {args.expected_variant!r}. "
             "Re-extract with --feature-variant."
         )
-    prefix = "qwen_anchor_" if shard["cache_layout"] == "episode_pack" else "qwen_"
-    required = {
-        f"{prefix}kv": (5, 2048),
-        f"{prefix}hidden_states": (5, 2560),
-        f"{prefix}latent_waypoints": (5, 2),
-    }
+    if shard["cache_layout"] == "episode_pack":
+        required = {
+            "qwen_anchor_kv": (5, 2048),
+            "qwen_anchor_hidden_states": (5, 2560),
+            "latent_waypoints": (5, 2),
+        }
+    else:
+        required = {
+            "qwen_kv": (5, 2048),
+            "qwen_hidden_states": (5, 2560),
+            "latent_waypoints": (5, 2),
+        }
     sample_count = int(shard["num_samples"])
     for key, trailing_shape in required.items():
         if key not in shard:
@@ -86,7 +92,7 @@ def main() -> None:
             )
         if not bool(torch.isfinite(tensor.float()).all()):
             raise ValueError(f"{key} contains NaN/Inf")
-    for key, width in (("state", 8), ("actions", 7), ("joint_state", 7)):
+    for key, width in (("state", 9), ("actions", 7)):
         if key not in shard:
             raise KeyError(f"{shard_path} lacks Libero_RDT field {key!r}")
         tensor = torch.as_tensor(shard[key])
@@ -95,6 +101,15 @@ def main() -> None:
                 f"{key} has {tuple(tensor.shape)}; expected sample axis "
                 f"{sample_count} and final width {width}"
             )
+    actions = torch.as_tensor(shard["actions"])
+    if tuple(actions.shape) != (sample_count, 64, 7):
+        raise ValueError(
+            f"actions has {tuple(actions.shape)}, expected "
+            f"{(sample_count, 64, 7)}"
+        )
+    state = torch.as_tensor(shard["state"], dtype=torch.float32)
+    if not bool(((state[:, 7:9] >= 0) & (state[:, 7:9] <= 1)).all()):
+        raise ValueError("Cached gripper state is not normalized to [0,1]")
     print(
         json.dumps(
             {
@@ -106,6 +121,9 @@ def main() -> None:
                 "samples_in_first_shard": sample_count,
                 "training_condition": "hidden[5,2560]+waypoint[5,2]",
                 "retained_unused_feature": "kv[5,2048]",
+                "cached_state": "joint7+normalized_gripper2",
+                "cached_actions": "[samples,64,7] raw LIBERO commands",
+                "native_state_slots": {"joints": "0:7", "gripper": "10:12"},
                 "native_action_slots": {"eef_delta": "39:45", "gripper": 10},
             },
             indent=2,

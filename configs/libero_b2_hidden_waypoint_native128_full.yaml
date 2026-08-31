@@ -12,7 +12,7 @@ model:
   action_dim: 128
   state_dim: 128
   cache_action_dim: 7
-  cache_state_dim: 8
+  cache_state_dim: 9
   pred_horizon: 64
   qwen_hidden_size: 2560
   qwen_kv_dim: 2048

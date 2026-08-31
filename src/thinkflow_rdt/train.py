@@ -215,7 +215,7 @@ def _add_binary_confusion_metrics(
 
 
 def _validation_observation_grid(
-    payloads: list[bytes],
+    payloads: list[object],
     slot_mask: torch.Tensor | list[bool] | None = None,
 ) -> Image.Image | None:
     if slot_mask is None:
@@ -480,9 +480,23 @@ def resolve_model_id(primary: str, fallback: str | None = None) -> str:
     return primary
 
 
-def decode_cached_image(payload: bytes) -> Image.Image:
-    """Decode legacy JPEG or current lossless PNG cache payloads."""
-    return Image.open(io.BytesIO(payload)).convert("RGB")
+def decode_cached_image(payload: object) -> Image.Image:
+    """Decode encoded cache bytes or a lossless uint8 image array."""
+    if isinstance(payload, Image.Image):
+        return payload.convert("RGB")
+    if isinstance(payload, torch.Tensor):
+        payload = payload.detach().cpu().numpy()
+    if isinstance(payload, np.ndarray):
+        array = payload
+        if array.dtype != np.uint8:
+            array = np.clip(array, 0, 255).astype(np.uint8)
+        return Image.fromarray(array).convert("RGB")
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        return Image.open(io.BytesIO(bytes(payload))).convert("RGB")
+    raise TypeError(
+        "Cached image payload must be encoded bytes, a PIL image, a NumPy "
+        f"array, or a torch tensor; got {type(payload).__name__}"
+    )
 
 
 def load_online_siglip(
