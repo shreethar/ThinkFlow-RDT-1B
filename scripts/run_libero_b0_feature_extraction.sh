@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Extract B0/Qwen </think> cached features for one LIBERO suite.
+# Extract B0/Qwen literal </think> KV plus final-hidden features for one suite.
 #
 # Usage:
 #   scripts/run_libero_b0_feature_extraction.sh libero_object
 #
 # Common overrides:
 #   DATA_ROOT=dataset/datasets
-#   OUTPUT_ROOT=cache_features_libero_b0_raw_ortho6d
-#   GCS_DEST=gs://my-bucket/libero_b0_raw_ortho6d
+#   OUTPUT_ROOT=cache_features_libero_b0_hidden_native
+#   GCS_DEST=gs://my-bucket/libero_b0_hidden_native
 #   ALL_SAMPLES_PER_EPISODE=1
 #   MAX_SAMPLES_PER_EPISODE=128  # used only when ALL_SAMPLES_PER_EPISODE=0
 #   OVERWRITE=1
@@ -26,7 +26,7 @@ esac
 
 CONFIG=${CONFIG:-configs/b0_rdt1b_lora.yaml}
 DATA_ROOT=${DATA_ROOT:-dataset/datasets}
-OUTPUT_ROOT=${OUTPUT_ROOT:-cache_features_libero_b0_raw_ortho6d}
+OUTPUT_ROOT=${OUTPUT_ROOT:-cache_features_libero_b0_hidden_native}
 OUT_DIR="${OUTPUT_ROOT}/${SUITE}"
 
 QWEN_MODEL_ID=${QWEN_MODEL_ID:-/workspace/model/stage1_unsloth}
@@ -57,6 +57,7 @@ ARGS=(
   --qwen-cache-scope per_sample
   --action-target-mode delta
   --no-normalize-actions
+  --cache-proprioception-schema libero_native
   --gripper-change-scope directional
   --open-to-close-before "$OPEN_TO_CLOSE_BEFORE"
   --open-to-close-after "$OPEN_TO_CLOSE_AFTER"
@@ -66,6 +67,8 @@ ARGS=(
   --qwen-layer-index 7
   --no-qwen-enable-thinking
   --qwen-stop-at-think
+  --qwen-include-hidden-state
+  --qwen-think-token-selector think_end
   --qwen-max-new-tokens 128
   --t5-model-id "$T5_MODEL_ID"
   --t5-precision "$T5_PRECISION"

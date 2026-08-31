@@ -14,7 +14,9 @@ def parse_args() -> argparse.Namespace:
         description="Validate a B2/B3 hidden+waypoint cache before training."
     )
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--expected-variant", choices=("b2", "b3"), required=True)
+    parser.add_argument(
+        "--expected-variant", choices=("b0", "b2", "b3"), required=True
+    )
     parser.add_argument("--expected-dataset", required=True)
     return parser.parse_args()
 
@@ -68,7 +70,16 @@ def main() -> None:
             f"Cache variant {variant!r} does not match {args.expected_variant!r}. "
             "Re-extract with --feature-variant."
         )
-    if shard["cache_layout"] == "episode_pack":
+    if args.expected_variant == "b0":
+        required = {
+            "qwen_kv": (1, 2048),
+            "qwen_hidden_states": (1, 2560),
+        }
+        if shard.get("qwen_token_selector") != "think_end":
+            raise ValueError(
+                "B0 cache must use the literal </think> token selector"
+            )
+    elif shard["cache_layout"] == "episode_pack":
         required = {
             "qwen_anchor_kv": (5, 2048),
             "qwen_anchor_hidden_states": (5, 2560),
@@ -119,8 +130,16 @@ def main() -> None:
                 "dataset": dataset_id,
                 "variant": variant,
                 "samples_in_first_shard": sample_count,
-                "training_condition": "hidden[5,2560]+waypoint[5,2]",
-                "retained_unused_feature": "kv[5,2048]",
+                "training_condition": (
+                    "hidden[1,2560]"
+                    if args.expected_variant == "b0"
+                    else "hidden[5,2560]+waypoint[5,2]"
+                ),
+                "retained_unused_feature": (
+                    "kv[1,2048]"
+                    if args.expected_variant == "b0"
+                    else "kv[5,2048]"
+                ),
                 "cached_state": "joint7+normalized_gripper2",
                 "cached_actions": "[samples,64,7] raw LIBERO commands",
                 "native_state_slots": {"joints": "0:7", "gripper": "10:12"},

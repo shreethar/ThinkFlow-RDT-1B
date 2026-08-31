@@ -1,21 +1,170 @@
 from __future__ import annotations
 
+import io
 import json
 import numpy as np
 from PIL import Image
 import torch
+from types import SimpleNamespace
 
 from scripts.precompute_all_features import (
     anchor_kind,
     episode_sample_count_is_allowed,
     episode_pack_relative_path,
+    extract_qwen_kv,
     image_bytes_to_image,
     image_to_jpeg_bytes,
     image_to_lossless_png_bytes,
     iter_episode_sample_groups,
     save_episode_anchor_pack_job,
+    save_sample_shard,
     select_episode_qwen_anchors,
 )
+
+
+class _FakeQwenTokenizer:
+    eos_token_id = 2
+    pad_token_id = 0
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return 2 if token == "<|im_end|>" else -1
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [99] if text == "</think>" else []
+
+
+class _FakeQwenProcessor:
+    tokenizer = _FakeQwenTokenizer()
+
+    def apply_chat_template(self, messages, **kwargs) -> str:
+        del messages, kwargs
+        return "prompt with literal closing think token"
+
+    def __call__(self, **kwargs):
+        batch_size = len(kwargs["text"])
+        return {
+            "input_ids": torch.tensor([[11, 99, 12]] * batch_size),
+            "attention_mask": torch.ones(batch_size, 3, dtype=torch.long),
+        }
+
+
+class _FakeQwenModel:
+    def __call__(self, input_ids, attention_mask, **kwargs):
+        del attention_mask, kwargs
+        batch_size, sequence_length = input_ids.shape
+        positions = torch.arange(sequence_length, dtype=torch.float32)
+        keys = positions.view(1, 1, sequence_length, 1).repeat(
+            batch_size, 1, 1, 2
+        )
+        values = (positions + 10).view(1, 1, sequence_length, 1).repeat(
+            batch_size, 1, 1, 2
+        )
+        hidden = positions.view(1, sequence_length, 1).repeat(
+            batch_size, 1, 3
+        )
+        return SimpleNamespace(
+            past_key_values=((keys, values),),
+            hidden_states=(torch.zeros_like(hidden), hidden),
+        )
+
+
+def test_b0_extraction_selects_literal_think_end_for_kv_and_final_hidden():
+    batch = {
+        "instructions": ["pick up the block"],
+        "qwen_images": [[Image.new("RGB", (8, 8))]],
+    }
+
+    qwen_kv, qwen_hidden = extract_qwen_kv(
+        batch,
+        _FakeQwenProcessor(),
+        _FakeQwenModel(),
+        device=torch.device("cpu"),
+        layer_index=0,
+        max_new_tokens=8,
+        expected_dim=4,
+        return_hidden_state=True,
+        think_token_selector="think_end",
+    )
+
+    # The literal </think> is at padded sequence index 1. The old legacy
+    # selector would have gathered index 0 instead.
+    torch.testing.assert_close(
+        qwen_kv.float(),
+        torch.tensor([[[1.0, 1.0, 11.0, 11.0]]]),
+    )
+    torch.testing.assert_close(
+        qwen_hidden,
+        torch.tensor([[[1.0, 1.0, 1.0]]]),
+    )
+
+
+def test_b0_sample_shard_retains_kv_hidden_and_native_libero_schema(tmp_path):
+    batch_size = 2
+    batch = {
+        "metadata": [
+            {
+                "dataset_id": "libero_spatial",
+                "episode_id": "demo-0",
+                "step_idx": str(index),
+            }
+            for index in range(batch_size)
+        ],
+        "instructions": ["pick up the object"] * batch_size,
+        "joint_state": torch.arange(14, dtype=torch.float32).reshape(2, 7),
+        "libero_native_state": torch.tensor(
+            [[0, 0, 0, 0, 0, 0, -0.04245, 0.05185]] * batch_size,
+            dtype=torch.float32,
+        ),
+        "libero_native_actions": torch.randn(batch_size, 64, 7),
+        "action_time_mask": torch.ones(batch_size, 64, dtype=torch.bool),
+        "ctrl_freq": torch.full((batch_size,), 20.0),
+        "siglip_image_slots": [
+            [Image.new("RGB", (8, 8), color=(index, 0, 0))]
+            for index in range(batch_size)
+        ],
+        "siglip_slot_mask": torch.ones(batch_size, 1, dtype=torch.bool),
+    }
+    manifest = io.StringIO()
+    qwen_kv = torch.randn(batch_size, 1, 2048, dtype=torch.bfloat16)
+    qwen_hidden = torch.randn(batch_size, 1, 2560, dtype=torch.bfloat16)
+
+    count, manifest_line = save_sample_shard(
+        split_dir=tmp_path,
+        manifest_handle=manifest,
+        shard_index=0,
+        sample_start_index=0,
+        batch=batch,
+        qwen_kv=qwen_kv,
+        qwen_hidden_states=qwen_hidden,
+        lang_tokens=torch.randn(1, 3, 16),
+        lang_mask=torch.ones(1, 3, dtype=torch.bool),
+        sample_lang_index=torch.zeros(batch_size, dtype=torch.long),
+        image_history_size=1,
+        image_jpeg_quality=100,
+        save_padded_features=False,
+        image_codec="png",
+        cache_proprioception_schema="libero_native",
+        qwen_token_selector="think_end",
+    )
+
+    entry = json.loads(manifest_line)
+    shard = torch.load(
+        tmp_path / entry["path"], map_location="cpu", weights_only=True
+    )
+    assert count == 2
+    assert shard["conditioning_variant"] == "b0"
+    assert shard["qwen_token_selector"] == "think_end"
+    assert shard["proprioception_schema"] == (
+        "libero_joint7_gripper2_norm01_action7_v1"
+    )
+    torch.testing.assert_close(shard["qwen_kv"], qwen_kv)
+    torch.testing.assert_close(shard["qwen_hidden_states"], qwen_hidden)
+    assert shard["state"].shape == (2, 9)
+    torch.testing.assert_close(
+        shard["state"][:, 7:9], torch.tensor([[0.0, 1.0]] * 2)
+    )
+    assert shard["actions"].shape == (2, 64, 7)
 
 
 def make_sample(

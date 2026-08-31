@@ -47,6 +47,10 @@ from thinkflow_rdt.adapters.sample_filtering import (  # noqa: E402
     DEFAULT_MAX_SAMPLES_PER_EPISODE,
 )
 from thinkflow_rdt.config import load_config  # noqa: E402
+from thinkflow_rdt.data import (  # noqa: E402
+    LIBERO_GRIPPER_QPOS_MAX,
+    LIBERO_GRIPPER_QPOS_MIN,
+)
 
 
 CTRL_FREQ_BY_DATASET = {
@@ -235,6 +239,30 @@ def kv_vectors_from_layer_cache(
             f"Qwen KV dim mismatch: expected {expected_dim}, got {qwen_kv.shape[-1]}"
         )
     return qwen_kv
+
+
+def hidden_vectors_from_sequence(
+    hidden_states: torch.Tensor,
+    *,
+    target_indices: list[int],
+) -> torch.Tensor:
+    """Gather one final-layer hidden token per sample as ``[B,1,D]``."""
+    if hidden_states.ndim != 3:
+        raise ValueError(
+            "Expected final hidden states [B,T,D], got "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if hidden_states.shape[0] != len(target_indices):
+        raise ValueError(
+            "Hidden-state batch and target-index count differ: "
+            f"{hidden_states.shape[0]} vs {len(target_indices)}"
+        )
+    sequence_length = int(hidden_states.shape[1])
+    gathered = []
+    for batch_index, target_index in enumerate(target_indices):
+        target_index = max(0, min(int(target_index), sequence_length - 1))
+        gathered.append(hidden_states[batch_index, target_index])
+    return torch.stack(gathered, dim=0).unsqueeze(1).contiguous()
 
 
 def as_rgb_pil(image: Any) -> Image.Image | None:
@@ -567,7 +595,13 @@ def extract_qwen_kv(
     prompt_template: str | None = QWEN_TRAJECTORY_PROMPT_TEMPLATE,
     enable_thinking: bool = False,
     profile_counts: dict[str, int] | None = None,
-) -> torch.Tensor:
+    return_hidden_state: bool = False,
+    think_token_selector: str = "think_end",
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if think_token_selector not in {"pre_think_end", "think_end"}:
+        raise ValueError(
+            "think_token_selector must be 'pre_think_end' or 'think_end'"
+        )
     texts_list: list[str] = []
     images_list: list[list[Image.Image]] = []
 
@@ -609,33 +643,98 @@ def extract_qwen_kv(
     if think_end_ids and "input_ids" in inputs:
         for ids in inputs["input_ids"]:
             think_end_pos = find_subsequence(ids, think_end_ids)
-            prompt_target_indices.append(think_end_pos - 1 if think_end_pos != -1 else -1)
+            if think_end_pos == -1:
+                prompt_target_indices.append(-1)
+            elif think_token_selector == "think_end":
+                # find_subsequence returns the exclusive end position.
+                prompt_target_indices.append(think_end_pos - 1)
+            else:
+                prompt_target_indices.append(
+                    think_end_pos - len(think_end_ids) - 1
+                )
 
     if prompt_target_indices and all(index >= 0 for index in prompt_target_indices):
         if profile_counts is not None:
             profile_counts["qwen_forward_prompts"] = profile_counts.get("qwen_forward_prompts", 0) + len(texts_list)
             if "attention_mask" in inputs:
                 profile_counts["qwen_prompt_tokens"] = profile_counts.get("qwen_prompt_tokens", 0) + int(inputs["attention_mask"].sum().item())
-        outputs = vlm(
-            **inputs,
-            use_cache=True,
-            return_dict=True,
-        )
+        final_hidden_states = None
+        outputs = None
+        if return_hidden_state:
+            # Hugging Face causal-LM wrappers only expose the last hidden state
+            # through ``hidden_states``, which retains every layer and is very
+            # expensive at batch size 32. The multimodal backbone returns the
+            # same post-final-norm representation as ``last_hidden_state``
+            # without materializing all intermediate layers.
+            backbone = getattr(vlm, "model", None)
+            if backbone is not None:
+                try:
+                    backbone_outputs = backbone(
+                        **inputs,
+                        use_cache=True,
+                        output_hidden_states=False,
+                        return_dict=True,
+                    )
+                    candidate_hidden = getattr(
+                        backbone_outputs, "last_hidden_state", None
+                    )
+                    candidate_cache = getattr(
+                        backbone_outputs, "past_key_values", None
+                    )
+                    if (
+                        isinstance(candidate_hidden, torch.Tensor)
+                        and candidate_cache is not None
+                    ):
+                        outputs = backbone_outputs
+                        final_hidden_states = candidate_hidden
+                except (AttributeError, TypeError):
+                    # Older/custom wrappers may not expose a compatible
+                    # backbone signature. Use the universally supported path.
+                    outputs = None
+        if outputs is None:
+            outputs = vlm(
+                **inputs,
+                use_cache=True,
+                output_hidden_states=return_hidden_state,
+                return_dict=True,
+            )
         keys, values = layer_key_values_from_past(
             outputs.past_key_values,
             layer_index=layer_index,
         )
-        return kv_vectors_from_layer_cache(
+        qwen_kv = kv_vectors_from_layer_cache(
             keys,
             values,
             target_indices=prompt_target_indices,
             expected_dim=expected_dim,
         )
+        if not return_hidden_state:
+            return qwen_kv
+        if final_hidden_states is None:
+            output_hidden_states = getattr(outputs, "hidden_states", None)
+            if not output_hidden_states:
+                raise RuntimeError(
+                    "Qwen did not return hidden_states although final "
+                    "hidden-state extraction was requested"
+                )
+            final_hidden_states = output_hidden_states[-1]
+        qwen_hidden = hidden_vectors_from_sequence(
+            final_hidden_states,
+            target_indices=prompt_target_indices,
+        )
+        return qwen_kv, qwen_hidden
 
     if prompt_target_indices and any(index >= 0 for index in prompt_target_indices):
         raise ValueError(
             "Mixed Qwen prompts where only some samples contain </think> are not supported. "
             "Use a consistent --qwen-enable-thinking setting for the whole batch."
+        )
+
+    if return_hidden_state:
+        raise ValueError(
+            "Final hidden-state caching requires </think> to already be present "
+            "in every prompt. Use the B0 non-thinking prompt instead of the "
+            "generation fallback."
         )
 
     stopping_criteria = None
@@ -676,7 +775,11 @@ def extract_qwen_kv(
         prompt_length = int(inputs["attention_mask"][batch_index].sum().item())
         think_end_pos = find_subsequence(ids, think_end_ids)
         if think_end_pos != -1:
-            target_index = think_end_pos - 1
+            target_index = (
+                think_end_pos - 1
+                if think_token_selector == "think_end"
+                else think_end_pos - len(think_end_ids) - 1
+            )
         else:
             im_end_positions = torch.where(ids == eos_token_id)[0]
             target_index = (
@@ -1499,6 +1602,7 @@ def save_sample_shard(
     sample_start_index: int,
     batch: dict[str, Any],
     qwen_kv: torch.Tensor,
+    qwen_hidden_states: torch.Tensor | None,
     lang_tokens: torch.Tensor,
     lang_mask: torch.Tensor,
     sample_lang_index: torch.Tensor,
@@ -1506,28 +1610,80 @@ def save_sample_shard(
     image_jpeg_quality: int,
     save_padded_features: bool,
     image_codec: str = "png",
+    cache_proprioception_schema: str = "rdt",
+    qwen_token_selector: str = "think_end",
 ) -> tuple[int, str]:
     batch_size = int(qwen_kv.shape[0])
     filename = f"shard_{shard_index:09d}.pt"
     path = split_dir / filename
 
+    if cache_proprioception_schema == "libero_native":
+        if (
+            "libero_native_state" not in batch
+            or "libero_native_actions" not in batch
+            or "joint_state" not in batch
+        ):
+            raise ValueError(
+                "--cache-proprioception-schema libero_native requires a LIBERO "
+                "dataset with seven joint positions"
+            )
+        joint_state = batch["joint_state"][:, :7].float()
+        raw_gripper = batch["libero_native_state"][:, 6:8].float()
+        normalized_gripper = (
+            raw_gripper - LIBERO_GRIPPER_QPOS_MIN
+        ) / (LIBERO_GRIPPER_QPOS_MAX - LIBERO_GRIPPER_QPOS_MIN)
+        cached_state = torch.cat(
+            [joint_state, normalized_gripper.clamp(0.0, 1.0)], dim=-1
+        )
+        cached_actions = batch["libero_native_actions"]
+        state_dim_mask = torch.ones_like(cached_state)
+        action_dim_mask = torch.ones(
+            cached_actions.shape[0],
+            cached_actions.shape[-1],
+            dtype=torch.float32,
+        )
+        proprioception_schema = "libero_joint7_gripper2_norm01_action7_v1"
+    else:
+        cached_state = batch["state"]
+        cached_actions = batch["actions"]
+        state_dim_mask = batch["state_dim_mask"]
+        action_dim_mask = batch["action_dim_mask"]
+        proprioception_schema = "rdt_encoded"
+
+    feature_type = (
+        "qwen_think_end_kv_hidden"
+        if qwen_hidden_states is not None
+        else "qwen_think_end_kv"
+    )
     record: dict[str, Any] = {
         "cache_layout": "sample_shard",
-        "feature_type": "qwen_think_end_kv",
+        "feature_type": feature_type,
+        "conditioning_variant": "b0",
+        "qwen_token_selector": qwen_token_selector,
+        "proprioception_schema": proprioception_schema,
         "num_samples": batch_size,
         "sample_start_index": sample_start_index,
         "sample_stop_index": sample_start_index + batch_size,
         "qwen_kv": qwen_kv.cpu(),
-        "state": batch["state"].cpu(),
-        "state_dim_mask": batch["state_dim_mask"].cpu(),
-        "actions": batch["actions"].cpu(),
+        "state": cached_state.cpu(),
+        "state_dim_mask": state_dim_mask.cpu(),
+        "actions": cached_actions.cpu(),
         "action_time_mask": batch["action_time_mask"].cpu(),
-        "action_dim_mask": batch["action_dim_mask"].cpu(),
+        "action_dim_mask": action_dim_mask.cpu(),
         "ctrl_freq": batch["ctrl_freq"].cpu(),
         "metadata": list(batch["metadata"]),
         "instructions": [str(instruction) for instruction in batch["instructions"]],
         "sample_lang_index": sample_lang_index.cpu(),
     }
+    if qwen_hidden_states is not None:
+        if tuple(qwen_hidden_states.shape[:2]) != (batch_size, 1):
+            raise ValueError(
+                "B0 hidden states must have shape [samples,1,hidden], got "
+                f"{tuple(qwen_hidden_states.shape)}"
+            )
+        if not bool(torch.isfinite(qwen_hidden_states.float()).all()):
+            raise ValueError("Refusing to save Qwen hidden states containing NaN/Inf")
+        record["qwen_hidden_states"] = qwen_hidden_states.cpu()
     if "joint_state" in batch:
         record["joint_state"] = batch["joint_state"].cpu()
     if "joint_states" in batch:
@@ -1565,7 +1721,10 @@ def save_sample_shard(
             {
                 "path": filename,
                 "cache_layout": "sample_shard",
-                "feature_type": "qwen_think_end_kv",
+                "feature_type": feature_type,
+                "conditioning_variant": "b0",
+                "qwen_token_selector": qwen_token_selector,
+                "proprioception_schema": proprioception_schema,
                 "num_samples": batch_size,
                 "sample_start_index": sample_start_index,
                 "sample_stop_index": sample_start_index + batch_size,
@@ -1581,6 +1740,14 @@ def save_sample_shard(
                 "unique_instruction_count": int(len(record["lang_tokens"])),
                 "image_pool_count": len(image_pool),
                 "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
+                "qwen_token_count": int(qwen_kv.shape[1]),
+                "qwen_kv_dim": int(qwen_kv.shape[2]),
+                "qwen_hidden_state_dim": (
+                    int(qwen_hidden_states.shape[2])
+                    if qwen_hidden_states is not None
+                    else None
+                ),
+                "has_qwen_hidden_states": qwen_hidden_states is not None,
                 "has_img_tokens": False,
                 "has_image_slots": True,
                 "has_joint_states": "joint_states" in record,
@@ -2261,7 +2428,7 @@ def precompute_split(
                 break
 
             skipped_no_image += int(batch.get("skipped_no_image", 0))
-            qwen_kv = extract_qwen_kv(
+            qwen_features = extract_qwen_kv(
                 batch,
                 models["qwen_processor"],
                 models["qwen_vlm"],
@@ -2272,10 +2439,23 @@ def precompute_split(
                 stop_at_think_end=args.qwen_stop_at_think,
                 prompt_template=args.qwen_trajectory_prompt_template,
                 enable_thinking=args.qwen_enable_thinking,
+                return_hidden_state=args.qwen_include_hidden_state,
+                think_token_selector=args.qwen_think_token_selector,
             )
+            if args.qwen_include_hidden_state:
+                if not isinstance(qwen_features, tuple):
+                    raise RuntimeError("Expected Qwen KV and hidden-state tuple")
+                qwen_kv, qwen_hidden_states = qwen_features
+            else:
+                if isinstance(qwen_features, tuple):
+                    raise RuntimeError("Unexpected Qwen hidden-state output")
+                qwen_kv = qwen_features
+                qwen_hidden_states = None
             if args.max_samples_per_split is not None:
                 keep = min(args.max_samples_per_split - sample_count, qwen_kv.shape[0])
                 qwen_kv = qwen_kv[:keep]
+                if qwen_hidden_states is not None:
+                    qwen_hidden_states = qwen_hidden_states[:keep]
                 for key in (
                     "state",
                     "actions",
@@ -2285,6 +2465,8 @@ def precompute_split(
                     "joint_state",
                     "joint_states",
                     "joint_states_mask",
+                    "libero_native_state",
+                    "libero_native_actions",
                 ):
                     if key in batch:
                         batch[key] = batch[key][:keep]
@@ -2335,6 +2517,7 @@ def precompute_split(
                     sample_start_index=sample_count,
                     batch=batch,
                     qwen_kv=qwen_kv,
+                    qwen_hidden_states=qwen_hidden_states,
                     lang_tokens=lang_tokens,
                     lang_mask=lang_mask,
                     sample_lang_index=sample_lang_index,
@@ -2342,6 +2525,8 @@ def precompute_split(
                     image_jpeg_quality=args.image_jpeg_quality,
                     save_padded_features=args.save_padded_features,
                     image_codec=args.image_codec,
+                    cache_proprioception_schema=args.cache_proprioception_schema,
+                    qwen_token_selector=args.qwen_think_token_selector,
                 )
                 shard_count += 1
                 progress.set_postfix(
@@ -2614,6 +2799,15 @@ def parse_args() -> argparse.Namespace:
             "one batched .pt shard per DataLoader batch for online SigLIP training."
         ),
     )
+    parser.add_argument(
+        "--cache-proprioception-schema",
+        choices=["rdt", "libero_native"],
+        default="rdt",
+        help=(
+            "Store the standard encoded tensors, or LIBERO joint7 + normalized "
+            "gripper2 state with raw seven-dimensional actions."
+        ),
+    )
     parser.add_argument("--image-history-size", type=int, default=2)
     parser.add_argument("--max-images-per-sample", type=int, default=6)
     parser.add_argument(
@@ -2677,6 +2871,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--qwen-layer-index", type=int, default=7)
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
+    parser.add_argument(
+        "--qwen-include-hidden-state",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Cache the selected token's final-layer hidden state as [B,1,D].",
+    )
+    parser.add_argument(
+        "--qwen-think-token-selector",
+        choices=["pre_think_end", "think_end"],
+        default="think_end",
+        help=(
+            "Select the token immediately before </think> for legacy caches, "
+            "or the literal closing token for the revised B0 cache."
+        ),
+    )
     parser.add_argument(
         "--qwen-cache-scope",
         choices=["auto", "per_sample", "episode_anchors"],
@@ -2781,6 +2990,10 @@ def main() -> None:
             raise ValueError("--cache-layout sample_shards requires --qwen-cache-scope per_sample")
         if args.qwen_enable_thinking:
             raise ValueError("--cache-layout sample_shards expects --no-qwen-enable-thinking")
+    if args.qwen_include_hidden_state and args.cache_layout != "sample_shards":
+        raise ValueError(
+            "--qwen-include-hidden-state currently requires --cache-layout sample_shards"
+        )
     if args.episode_batch_size <= 0:
         raise ValueError("--episode-batch-size must be positive")
     if args.batch_size <= 0:
@@ -2852,6 +3065,14 @@ def main() -> None:
         dataset_ids=args.dataset,
         max_episodes=args.max_episodes,
     )
+    if args.cache_proprioception_schema == "libero_native" and not configs:
+        raise ValueError("libero_native proprioception requires a LIBERO dataset")
+    if args.cache_proprioception_schema == "libero_native" and not all(
+        config.dataset_id in LIBERO_DATASET_IDS for config in configs
+    ):
+        raise ValueError(
+            "--cache-proprioception-schema libero_native is valid only for LIBERO"
+        )
     if configs and all(config.dataset_id in LIBERO_DATASET_IDS for config in configs):
         if args.action_target_mode != "delta":
             raise ValueError(
@@ -2920,12 +3141,26 @@ def main() -> None:
         "close_to_open_after": args.close_to_open_after,
         "normalize_actions": normalize_actions,
         "action_target_mode": args.action_target_mode,
-        "state_dim": cfg.model.state_dim,
-        "action_dim": cfg.model.action_dim,
+        "state_dim": (
+            9 if args.cache_proprioception_schema == "libero_native" else cfg.model.state_dim
+        ),
+        "action_dim": (
+            7 if args.cache_proprioception_schema == "libero_native" else cfg.model.action_dim
+        ),
+        "proprioception_schema": (
+            "libero_joint7_gripper2_norm01_action7_v1"
+            if args.cache_proprioception_schema == "libero_native"
+            else "rdt_encoded"
+        ),
         "state_encoder_layout": cfg.model.state_encoder_layout,
         "action_encoder_layout": cfg.model.action_encoder_layout,
         "gripper_processing": (
-            "raw two-finger qpos state; raw HDF5 action command"
+            (
+                "two-finger qpos min/max normalized to [0,1]; raw HDF5 "
+                "action command"
+                if args.cache_proprioception_schema == "libero_native"
+                else "raw two-finger qpos state; raw HDF5 action command"
+            )
             if all(config.dataset_id in LIBERO_DATASET_IDS for config in configs)
             else "dataset-specific"
         ),
@@ -2941,6 +3176,12 @@ def main() -> None:
         "qwen_anchors_per_episode": args.qwen_anchors_per_episode,
         "qwen_stop_at_think": args.qwen_stop_at_think,
         "qwen_enable_thinking": args.qwen_enable_thinking,
+        "qwen_include_hidden_state": args.qwen_include_hidden_state,
+        "qwen_hidden_state_dim": (
+            cfg.model.qwen_hidden_size if args.qwen_include_hidden_state else None
+        ),
+        "qwen_think_token_selector": args.qwen_think_token_selector,
+        "conditioning_variant": "b0",
         "qwen_image_source": "primary_current_frame",
         "qwen_trajectory_prompt_template": args.qwen_trajectory_prompt_template,
         "image_history_size": args.image_history_size,
