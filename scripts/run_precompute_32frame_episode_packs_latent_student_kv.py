@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""Precompute up-to-32-sample OXE episode packs with LatentStudent spatial-token KV.
+"""Precompute OXE episode packs with LatentStudent KV, hidden states, and waypoints.
 
 This is the B2 counterpart of ``run_precompute_32frame_episode_packs.sh``.
 It keeps that launcher's episode sampling, action targets, T5 features, and
 image packing, but replaces Qwen's single ``</think>`` KV token with the five
-LatentStudent spatial-token KV pairs produced by
+LatentStudent spatial-token KV pairs, final hidden states, and waypoints produced by
 ``precompute_latent_student_kv.py``.
 """
 
@@ -170,6 +170,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--student-model-id", default=DEFAULT_STUDENT_MODEL_ID)
+    parser.add_argument(
+        "--feature-variant",
+        choices=("b2", "b3"),
+        default="b2",
+        help=(
+            "Experimental label stored in every pack and manifest; B2 and "
+            "B3 otherwise share the same tensor extraction contract."
+        ),
+    )
     parser.add_argument("--processor-id", default=DEFAULT_PROCESSOR_ID)
     parser.add_argument(
         "--latent-student-code-dir",
@@ -533,7 +542,11 @@ def save_episode_pack(
             "Expected spatial KV [samples, spatial_tokens, dim], got "
             f"{tuple(spatial_kv.shape)}"
         )
-    if latent_waypoints.shape[:2] != (batch_size, args.spatial_token_count):
+    if tuple(latent_waypoints.shape) != (
+        batch_size,
+        args.spatial_token_count,
+        2,
+    ):
         raise ValueError(
             "Expected latent waypoints [samples, spatial_tokens, dim], got "
             f"{tuple(latent_waypoints.shape)}"
@@ -589,6 +602,7 @@ def save_episode_pack(
     record: dict[str, Any] = {
         "cache_layout": "episode_pack",
         "feature_type": FEATURE_TYPE,
+        "conditioning_variant": args.feature_variant,
         "dataset_id": first_metadata["dataset_id"],
         "episode_id": first_metadata["episode_id"],
         "num_samples": batch_size,
@@ -634,6 +648,7 @@ def save_episode_pack(
             "path": relative_path.as_posix(),
             "cache_layout": "episode_pack",
             "feature_type": FEATURE_TYPE,
+            "conditioning_variant": args.feature_variant,
             "dataset_id": first_metadata["dataset_id"],
             "episode_id": first_metadata["episode_id"],
             "num_samples": batch_size,
@@ -646,6 +661,7 @@ def save_episode_pack(
             "qwen_token_count": int(spatial_kv.shape[1]),
             "qwen_kv_dim": int(spatial_kv.shape[2]),
             "qwen_hidden_state_dim": int(spatial_hidden_states.shape[2]),
+            "waypoint_dim": int(latent_waypoints.shape[2]),
             "image_pool_count": len(image_pool),
             "image_slot_count": int(batch["siglip_slot_mask"].shape[1]),
             "has_img_tokens": False,
@@ -1100,6 +1116,7 @@ def main() -> None:
 
     metadata = {
         "feature_type": FEATURE_TYPE,
+        "conditioning_variant": args.feature_variant,
         "config": args.config,
         "root": str(dataset_root),
         "splits": split_names,

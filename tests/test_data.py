@@ -232,6 +232,59 @@ def test_collator_maps_raw_libero_11d_10d_cache_to_native_128() -> None:
     assert batch["actions"][0, 1:].count_nonzero().item() == 0
 
 
+def test_collator_maps_libero_joint_state_and_eef_delta_to_author_slots() -> None:
+    collator = RDTBatchCollator(
+        max_lang_tokens=1,
+        image_tokens=1,
+        pred_horizon=2,
+        feature_dim=8,
+        state_dim=128,
+        action_dim=128,
+        cache_state_dim=8,
+        cache_action_dim=7,
+        native_rdt_128=True,
+        native_rdt_128_mapping="libero_joint_eef_delta",
+        convert_cached_gripper_closed_to_open=False,
+    )
+    joints = torch.arange(7, dtype=torch.float32) / 10
+    state = torch.tensor(
+        [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, -0.04245, 0.05185]
+    )
+    actions = torch.tensor(
+        [[0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 1.0]],
+        dtype=torch.float32,
+    )
+    sample = {
+        "qwen_kv": torch.zeros(1, 8),
+        "lang_tokens": torch.zeros(1, 8),
+        "img_tokens": torch.zeros(1, 8),
+        "state": state,
+        "joint_state": joints,
+        "actions": actions,
+        "actions_normalized": False,
+        "dataset_id": "libero_spatial",
+        "ctrl_freq": 20.0,
+    }
+
+    batch = collator([sample])
+
+    assert torch.nonzero(batch["state_dim_mask"][0]).flatten().tolist() == [
+        *range(7),
+        10,
+        11,
+    ]
+    assert torch.nonzero(batch["action_dim_mask"][0]).flatten().tolist() == [
+        10,
+        *range(39, 45),
+    ]
+    torch.testing.assert_close(batch["state"][0, :7], joints)
+    torch.testing.assert_close(
+        batch["state"][0, 10:12], torch.tensor([0.0, 1.0])
+    )
+    torch.testing.assert_close(batch["actions"][0, 0, 39:45], actions[0, :6])
+    assert batch["actions"][0, 0, 10].item() == 1.0
+
+
 def test_cached_feature_dataset_reads_episode_pack(tmp_path):
     pack_path = tmp_path / "episode_000000000.pt"
     manifest_path = tmp_path / "manifest.jsonl"
@@ -319,6 +372,7 @@ def test_cached_feature_dataset_reads_sample_shard(tmp_path):
             "sample_image_indices": torch.tensor([[0, 1], [1, 0]]),
             "sample_image_mask": torch.tensor([[True, False], [True, True]]),
             "latent_waypoints": torch.randn(2, 5, 2),
+            "qwen_hidden_states": torch.randn(2, 5, 8),
         },
         shard_path,
     )
@@ -350,3 +404,35 @@ def test_cached_feature_dataset_reads_sample_shard(tmp_path):
     assert sample["image_slot_jpegs"] == [b"image-b", b"image-a"]
     assert sample["image_slot_mask"].tolist() == [True, True]
     assert sample["latent_waypoints"].shape == (5, 2)
+    assert sample["qwen_hidden_states"].shape == (5, 8)
+
+
+def test_collator_batches_required_hidden_waypoint_plan_features():
+    collator = RDTBatchCollator(
+        max_lang_tokens=2,
+        image_tokens=3,
+        pred_horizon=2,
+        feature_dim=8,
+        state_dim=7,
+        action_dim=7,
+        plan_hidden_dim=8,
+        spatial_token_count=5,
+        waypoint_dim=2,
+        require_plan_features=True,
+    )
+    sample = {
+        "qwen_kv": torch.randn(5, 8),
+        "qwen_hidden_states": torch.randn(5, 8),
+        "latent_waypoints": torch.rand(5, 2),
+        "lang_tokens": torch.randn(2, 8),
+        "img_tokens": torch.randn(3, 8),
+        "state": torch.randn(7),
+        "actions": torch.randn(2, 7),
+        "ctrl_freq": 20.0,
+    }
+
+    batch = collator([sample])
+
+    assert batch["qwen_hidden_states"].shape == (1, 5, 8)
+    assert batch["latent_waypoints"].shape == (1, 5, 2)
+    assert batch["plan_mask"].tolist() == [[True] * 5]

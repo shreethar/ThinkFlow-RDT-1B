@@ -17,6 +17,8 @@ def test_subset_sample_shard_slices_only_sample_level_values() -> None:
         "sample_start_index": 10,
         "sample_stop_index": 14,
         "qwen_kv": torch.arange(8).reshape(4, 2),
+        "qwen_hidden_states": torch.arange(24).reshape(4, 3, 2),
+        "latent_waypoints": torch.arange(24).reshape(4, 3, 2).float(),
         "state": torch.arange(12).reshape(4, 3),
         "actions": torch.arange(20).reshape(4, 5),
         "ctrl_freq": torch.tensor([10.0, 11.0, 12.0, 13.0]),
@@ -32,6 +34,12 @@ def test_subset_sample_shard_slices_only_sample_level_values() -> None:
     assert result["sample_start_index"] == 20
     assert result["sample_stop_index"] == 22
     torch.testing.assert_close(result["state"], pack["state"][[1, 3]])
+    torch.testing.assert_close(
+        result["qwen_hidden_states"], pack["qwen_hidden_states"][[1, 3]]
+    )
+    torch.testing.assert_close(
+        result["latent_waypoints"], pack["latent_waypoints"][[1, 3]]
+    )
     torch.testing.assert_close(result["ctrl_freq"], torch.tensor([11.0, 13.0]))
     assert result["metadata"] == [{"step_idx": "1"}, {"step_idx": "3"}]
     torch.testing.assert_close(result["lang_tokens"], pack["lang_tokens"])

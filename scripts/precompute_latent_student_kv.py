@@ -530,6 +530,7 @@ def save_sample_shard(
     save_padded_features: bool,
     cache_proprioception_schema: str,
     image_storage: str,
+    feature_variant: str,
 ) -> tuple[int, str]:
     batch_size = int(latent_kv.shape[0])
     if spatial_hidden_states.ndim != 3 or spatial_hidden_states.shape[:2] != latent_kv.shape[:2]:
@@ -539,6 +540,13 @@ def save_sample_shard(
         )
     if not bool(torch.isfinite(spatial_hidden_states.float()).all()):
         raise ValueError("Refusing to save raw spatial hidden states containing NaN or Inf")
+    if waypoints.ndim != 3 or waypoints.shape[:2] != latent_kv.shape[:2] or waypoints.shape[2] != 2:
+        raise ValueError(
+            "Latent waypoints must be [samples, spatial_tokens, 2], got "
+            f"{tuple(waypoints.shape)}"
+        )
+    if not bool(torch.isfinite(waypoints.float()).all()):
+        raise ValueError("Refusing to save latent waypoints containing NaN or Inf")
     filename = f"shard_{shard_index:09d}.pt"
     path = split_dir / filename
 
@@ -570,6 +578,7 @@ def save_sample_shard(
     record: dict[str, Any] = {
         "cache_layout": "sample_shard",
         "feature_type": "latent_student_spatial_kv",
+        "conditioning_variant": feature_variant,
         "num_samples": batch_size,
         "sample_start_index": sample_start_index,
         "sample_stop_index": sample_start_index + batch_size,
@@ -629,6 +638,7 @@ def save_sample_shard(
                 "path": filename,
                 "cache_layout": "sample_shard",
                 "feature_type": "latent_student_spatial_kv",
+                "conditioning_variant": feature_variant,
                 "num_samples": batch_size,
                 "sample_start_index": sample_start_index,
                 "sample_stop_index": sample_start_index + batch_size,
@@ -641,7 +651,9 @@ def save_sample_shard(
                 "qwen_token_count": int(latent_kv.shape[1]),
                 "qwen_kv_dim": int(latent_kv.shape[2]),
                 "qwen_hidden_state_dim": int(spatial_hidden_states.shape[2]),
+                "waypoint_dim": int(waypoints.shape[2]),
                 "has_qwen_hidden_states": True,
+                "has_latent_waypoints": True,
                 "has_lang_tokens": lang_tokens is not None,
                 "has_image_slots": cache_image_slots,
                 "has_joint_states": "joint_states" in record,
@@ -782,6 +794,7 @@ def precompute_split(
                 save_padded_features=args.save_padded_features,
                 cache_proprioception_schema=args.cache_proprioception_schema,
                 image_storage=args.image_storage,
+                feature_variant=args.feature_variant,
             )
             save_seconds = time.perf_counter() - save_start
             manifest.write(manifest_line)
@@ -852,7 +865,8 @@ def precompute_t5_features_chunked(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Precompute b2 LatentStudent spatial-token KV caches as batched shards."
+            "Precompute B2/B3 LatentStudent spatial-token KV, final hidden "
+            "states, and decoded waypoints as batched shards."
         )
     )
     parser.add_argument("--config", required=True)
@@ -931,6 +945,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--empty-cache-every", type=int, default=25)
 
     parser.add_argument("--student-model-id", default="shreethar/LatentStudent-ckpt-240")
+    parser.add_argument(
+        "--feature-variant",
+        choices=("b2", "b3"),
+        default="b2",
+        help=(
+            "Experimental label stored in every shard and manifest; B2 and "
+            "B3 otherwise share the same tensor extraction contract."
+        ),
+    )
     parser.add_argument("--processor-id", default=None)
     parser.add_argument("--latent-student-code-dir", type=Path, default=None)
     parser.add_argument(
@@ -1119,6 +1142,7 @@ def main() -> None:
     split_names = args.split or list(SPLIT_NAMES)
     metadata = {
         "feature_type": "latent_student_spatial_kv",
+        "conditioning_variant": args.feature_variant,
         "config": args.config,
         "root": str(args.root),
         "splits": split_names,
@@ -1164,6 +1188,10 @@ def main() -> None:
         "layer_index": args.layer_index,
         "prompt_template": args.prompt_template,
         "qwen_kv_dim": cfg.model.qwen_kv_dim,
+        "qwen_hidden_state_dim": cfg.model.qwen_hidden_size,
+        "waypoint_dim": 2,
+        "has_qwen_hidden_states": True,
+        "has_latent_waypoints": True,
         "include_t5": args.include_t5,
         "t5_precision": args.t5_precision,
         "t5_batch_size": args.t5_batch_size,

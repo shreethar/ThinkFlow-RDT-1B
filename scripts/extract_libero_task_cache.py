@@ -37,6 +37,7 @@ SAMPLE_LEVEL_KEYS = {
     "image_slot_jpegs",
     "image_slot_mask",
     "latent_waypoints",
+    "qwen_hidden_states",
 }
 
 

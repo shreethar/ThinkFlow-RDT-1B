@@ -18,6 +18,7 @@ from thinkflow_rdt.adapters.libero import (
     ortho6d_to_libero_rot_command,
     rdt_action_to_libero,
 )
+from scripts.replay_libero_demo_actions import codec_roundtrip
 
 
 class FakeGroup(dict):
@@ -58,6 +59,20 @@ def test_raw_7d_action_round_trips_through_10d_without_gripper_remapping() -> No
     assert encoded.shape == (2, LIBERO_ACTION_DIM)
     np.testing.assert_array_equal(encoded[:, 9], raw[:, 6])
     np.testing.assert_allclose(rdt_action_to_libero(encoded), raw, atol=1e-6)
+
+
+def test_replay_codec_report_detects_bitwise_near_roundtrip() -> None:
+    raw = np.array(
+        [[0.1, -0.2, 0.3, 0.4, -0.5, 0.6, -1.0]],
+        dtype=np.float32,
+    )
+    decoded, report = codec_roundtrip(raw)
+
+    np.testing.assert_allclose(decoded, raw, atol=1e-6)
+    assert report["allclose_atol_1e-6"] is True
+    assert report["encoded_shape"] == [1, 10]
+    assert report["translation_max_l2"] == 0.0
+    assert report["gripper_max_abs_error"] == 0.0
 
 
 def test_libero_image_flip_uses_height_axis_for_frames_and_sequences() -> None:

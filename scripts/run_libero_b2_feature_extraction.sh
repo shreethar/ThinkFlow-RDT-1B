@@ -28,9 +28,14 @@ case "$SUITE" in
     ;;
 esac
 
+FEATURE_VARIANT=${FEATURE_VARIANT:-b2}
+case "$FEATURE_VARIANT" in
+  b2|b3) ;;
+  *) echo "FEATURE_VARIANT must be b2 or b3" >&2; exit 2 ;;
+esac
 CONFIG=${CONFIG:-configs/b2_rdt1b_lora.yaml}
 DATA_ROOT=${DATA_ROOT:-dataset/datasets}
-OUTPUT_ROOT=${OUTPUT_ROOT:-cache_features_libero_b2_native}
+OUTPUT_ROOT=${OUTPUT_ROOT:-cache_features_libero_${FEATURE_VARIANT}_native}
 OUT_DIR="${OUTPUT_ROOT}/${SUITE}"
 
 STUDENT_MODEL_ID=${STUDENT_MODEL_ID:-/workspace/model/LatentStudent-ckpt-400-fixed}
@@ -73,6 +78,7 @@ ARGS=(
   --close-to-open-before "$CLOSE_TO_OPEN_BEFORE"
   --close-to-open-after "$CLOSE_TO_OPEN_AFTER"
   --student-model-id "$STUDENT_MODEL_ID"
+  --feature-variant "$FEATURE_VARIANT"
   --processor-id "$PROCESSOR_ID"
   --latent-student-code-dir "$LATENT_STUDENT_CODE_DIR"
   --attn-implementation "$ATTN_IMPLEMENTATION"

@@ -13,6 +13,9 @@ from torch.utils.data import Dataset, Sampler
 RDT_GRIPPER_INDEX = 10
 RDT_XYZ_SLICE = slice(30, 33)
 RDT_ORTHO6D_SLICE = slice(33, 39)
+RDT_EEF_DELTA_SLICE = slice(39, 45)
+LIBERO_GRIPPER_QPOS_MIN = -0.04245
+LIBERO_GRIPPER_QPOS_MAX = 0.05185
 
 
 def euler_xyz_to_ortho6d(euler: torch.Tensor) -> torch.Tensor:
@@ -65,6 +68,10 @@ ONLINE_SIGLIP_REQUIRED_KEYS = {
     "state",
     "actions",
     "ctrl_freq",
+}
+PLAN_FEATURE_REQUIRED_KEYS = {
+    "qwen_hidden_states",
+    "latent_waypoints",
 }
 
 
@@ -336,6 +343,21 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             )
             or int(qwen_anchor_kv.shape[0]),
         }
+        hidden_states = pack.get("qwen_anchor_hidden_states")
+        if hidden_states is None:
+            hidden_states = pack.get("qwen_hidden_states")
+        if hidden_states is not None:
+            sample["qwen_hidden_states"] = torch.as_tensor(hidden_states)[
+                anchor_index
+            ]
+        if "latent_waypoints" in pack:
+            sample["latent_waypoints"] = torch.as_tensor(
+                pack["latent_waypoints"]
+            )[sample_index]
+        if "joint_state" in pack:
+            sample["joint_state"] = torch.as_tensor(pack["joint_state"])[
+                sample_index
+            ]
         return sample
 
     def _sample_from_sample_shard(
@@ -433,6 +455,17 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             sample["image_slot_mask"] = image_slot_mask
         if "latent_waypoints" in pack:
             sample["latent_waypoints"] = pack["latent_waypoints"][sample_index]
+        hidden_states = pack.get("qwen_hidden_states")
+        if hidden_states is None:
+            hidden_states = pack.get("qwen_anchor_hidden_states")
+        if hidden_states is not None:
+            sample["qwen_hidden_states"] = torch.as_tensor(hidden_states)[
+                sample_index
+            ]
+        if "joint_state" in pack:
+            sample["joint_state"] = torch.as_tensor(pack["joint_state"])[
+                sample_index
+            ]
         return sample
 
 
@@ -604,10 +637,15 @@ class RDTBatchCollator:
     lang_token_dim: int | None = None
     img_token_dim: int | None = None
     qwen_kv_dim: int | None = None
+    plan_hidden_dim: int | None = None
+    spatial_token_count: int = 5
+    waypoint_dim: int = 2
+    require_plan_features: bool = False
     convert_cached_gripper_closed_to_open: bool = True
     cache_state_dim: int | None = None
     cache_action_dim: int | None = None
     native_rdt_128: bool = False
+    native_rdt_128_mapping: str = "eef_pose_ortho6d"
     action_stats_paths: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
@@ -619,17 +657,30 @@ class RDTBatchCollator:
             self.cache_state_dim = self.state_dim
         if self.cache_action_dim is None:
             self.cache_action_dim = self.action_dim
+        if self.plan_hidden_dim is None:
+            self.plan_hidden_dim = self.feature_dim
+        if self.spatial_token_count <= 0:
+            raise ValueError("spatial_token_count must be positive")
+        if self.waypoint_dim <= 0:
+            raise ValueError("waypoint_dim must be positive")
         self._action_stats = _load_action_stats_paths(self.action_stats_paths)
         if self.native_rdt_128:
             if self.state_dim != 128 or self.action_dim != 128:
                 raise ValueError("native_rdt_128 requires state_dim=action_dim=128")
-            if (self.cache_state_dim, self.cache_action_dim) not in {
-                (7, 7),
-                (11, 10),
+            if self.native_rdt_128_mapping not in {
+                "eef_pose_ortho6d",
+                "libero_joint_eef_delta",
             }:
+                raise ValueError("Unsupported native_rdt_128_mapping")
+            allowed = (
+                {(8, 7)}
+                if self.native_rdt_128_mapping == "libero_joint_eef_delta"
+                else {(7, 7), (11, 10)}
+            )
+            if (self.cache_state_dim, self.cache_action_dim) not in allowed:
                 raise ValueError(
-                    "native_rdt_128 requires cached 7-D OXE state/actions or "
-                    "11-D state + 10-D action LIBERO caches"
+                    "native_rdt_128 cache dimensions do not match mapping "
+                    f"{self.native_rdt_128_mapping!r}"
                 )
 
     def _pad_sequence(
@@ -680,9 +731,39 @@ class RDTBatchCollator:
         self,
         state: torch.Tensor,
         state_mask: torch.Tensor,
+        *,
+        joint_state: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         values = state.new_zeros(128)
         mask = state_mask.new_zeros(128)
+        if self.native_rdt_128_mapping == "libero_joint_eef_delta":
+            if joint_state is None:
+                raise KeyError(
+                    "libero_joint_eef_delta requires joint_state in every cache sample"
+                )
+            joints = torch.as_tensor(
+                joint_state,
+                dtype=state.dtype,
+                device=state.device,
+            ).flatten()
+            if joints.numel() < 7:
+                raise ValueError(
+                    f"Expected at least seven LIBERO joints, got {joints.numel()}"
+                )
+            if state.numel() != 8:
+                raise ValueError(
+                    "libero_joint_eef_delta requires cached native LIBERO state8"
+                )
+            if not bool(torch.isfinite(joints[:7]).all()):
+                raise ValueError("joint_state contains NaN or Inf")
+            values[:7] = joints[:7]
+            mask[:7] = 1
+            gripper = (
+                state[6:8] - LIBERO_GRIPPER_QPOS_MIN
+            ) / (LIBERO_GRIPPER_QPOS_MAX - LIBERO_GRIPPER_QPOS_MIN)
+            values[10:12] = gripper * state_mask[6:8]
+            mask[10:12] = state_mask[6:8]
+            return values, mask
         values[RDT_XYZ_SLICE] = state[:3] * state_mask[:3]
         mask[RDT_XYZ_SLICE] = state_mask[:3]
         if self.cache_state_dim == 11:
@@ -712,6 +793,19 @@ class RDTBatchCollator:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         values = actions.new_zeros(actions.shape[0], 128)
         mask = action_mask.new_zeros(128)
+
+        if self.native_rdt_128_mapping == "libero_joint_eef_delta":
+            if self.cache_action_dim != 7 or actions_normalized:
+                raise ValueError(
+                    "libero_joint_eef_delta requires unnormalized raw 7-D LIBERO actions"
+                )
+            values[:, RDT_EEF_DELTA_SLICE] = (
+                actions[:, :6] * action_mask[:6]
+            )
+            mask[RDT_EEF_DELTA_SLICE] = action_mask[:6]
+            values[:, RDT_GRIPPER_INDEX] = actions[:, 6] * action_mask[6]
+            mask[RDT_GRIPPER_INDEX] = action_mask[6]
+            return values, mask
 
         if self.cache_action_dim == 10:
             if actions_normalized:
@@ -778,6 +872,31 @@ class RDTBatchCollator:
             )
         return qwen_kv
 
+    def _prepare_plan_features(
+        self,
+        hidden_value: Any,
+        waypoint_value: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = torch.as_tensor(hidden_value)
+        waypoints = torch.as_tensor(waypoint_value, dtype=torch.float32)
+        expected_hidden = (self.spatial_token_count, self.plan_hidden_dim)
+        expected_waypoints = (self.spatial_token_count, self.waypoint_dim)
+        if tuple(hidden.shape) != expected_hidden:
+            raise ValueError(
+                "Expected qwen_hidden_states "
+                f"{expected_hidden}, got {tuple(hidden.shape)}"
+            )
+        if tuple(waypoints.shape) != expected_waypoints:
+            raise ValueError(
+                f"Expected latent_waypoints {expected_waypoints}, got "
+                f"{tuple(waypoints.shape)}"
+            )
+        if not bool(torch.isfinite(hidden.float()).all()):
+            raise ValueError("qwen_hidden_states contains NaN or Inf")
+        if not bool(torch.isfinite(waypoints).all()):
+            raise ValueError("latent_waypoints contains NaN or Inf")
+        return hidden, waypoints
+
     def _convert_cached_gripper_to_rdt_open(
         self,
         state: torch.Tensor,
@@ -816,6 +935,10 @@ class RDTBatchCollator:
             "action_dim_mask": [],
             "ctrl_freq": [],
         }
+        if self.require_plan_features:
+            batch["qwen_hidden_states"] = []
+            batch["latent_waypoints"] = []
+            batch["plan_mask"] = []
         dataset_ids: list[str] = []
         instructions: list[str] = []
         episode_ids: list[str] = []
@@ -830,6 +953,18 @@ class RDTBatchCollator:
             )
 
             qwen_kv = self._prepare_qwen_kv(sample["qwen_kv"])
+            plan_features: tuple[torch.Tensor, torch.Tensor] | None = None
+            if self.require_plan_features:
+                missing = PLAN_FEATURE_REQUIRED_KEYS.difference(sample)
+                if missing:
+                    raise KeyError(
+                        "Hidden/waypoint fusion requires cache keys: "
+                        + ", ".join(sorted(missing))
+                    )
+                plan_features = self._prepare_plan_features(
+                    sample["qwen_hidden_states"],
+                    sample["latent_waypoints"],
+                )
 
             if "lang_mask" in sample:
                 supplied = torch.as_tensor(sample["lang_mask"], dtype=torch.bool)
@@ -872,7 +1007,9 @@ class RDTBatchCollator:
             dataset_id = str(sample.get("dataset_id") or "unknown")
             if self.native_rdt_128:
                 state, state_dim_mask = self._to_native_rdt_state(
-                    state, state_dim_mask
+                    state,
+                    state_dim_mask,
+                    joint_state=sample.get("joint_state"),
                 )
                 actions, action_dim_mask = self._to_native_rdt_actions(
                     actions,
@@ -882,6 +1019,13 @@ class RDTBatchCollator:
                 )
 
             batch["qwen_kv"].append(qwen_kv)
+            if plan_features is not None:
+                hidden_states, latent_waypoints = plan_features
+                batch["qwen_hidden_states"].append(hidden_states)
+                batch["latent_waypoints"].append(latent_waypoints)
+                batch["plan_mask"].append(
+                    torch.ones(self.spatial_token_count, dtype=torch.bool)
+                )
             batch["lang_tokens"].append(lang)
             batch["lang_mask"].append(default_lang_mask)
             # Preserve the cached feature dtype (normally BF16). Expanding every
@@ -921,10 +1065,15 @@ class RDTOnlineSiglipBatchCollator:
     action_dim: int
     lang_token_dim: int | None = None
     qwen_kv_dim: int | None = None
+    plan_hidden_dim: int | None = None
+    spatial_token_count: int = 5
+    waypoint_dim: int = 2
+    require_plan_features: bool = False
     convert_cached_gripper_closed_to_open: bool = True
     cache_state_dim: int | None = None
     cache_action_dim: int | None = None
     native_rdt_128: bool = False
+    native_rdt_128_mapping: str = "eef_pose_ortho6d"
     action_stats_paths: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
@@ -940,12 +1089,17 @@ class RDTOnlineSiglipBatchCollator:
             lang_token_dim=self.lang_token_dim,
             img_token_dim=1,
             qwen_kv_dim=self.qwen_kv_dim,
+            plan_hidden_dim=self.plan_hidden_dim,
+            spatial_token_count=self.spatial_token_count,
+            waypoint_dim=self.waypoint_dim,
+            require_plan_features=self.require_plan_features,
             convert_cached_gripper_closed_to_open=(
                 self.convert_cached_gripper_closed_to_open
             ),
             cache_state_dim=self.cache_state_dim,
             cache_action_dim=self.cache_action_dim,
             native_rdt_128=self.native_rdt_128,
+            native_rdt_128_mapping=self.native_rdt_128_mapping,
             action_stats_paths=self.action_stats_paths,
         )
 
@@ -962,6 +1116,10 @@ class RDTOnlineSiglipBatchCollator:
             "ctrl_freq": [],
             "image_slot_mask": [],
         }
+        if self.require_plan_features:
+            tensor_batch["qwen_hidden_states"] = []
+            tensor_batch["latent_waypoints"] = []
+            tensor_batch["plan_mask"] = []
         image_slot_jpegs: list[list[bytes]] = []
         dataset_ids: list[str] = []
         instructions: list[str] = []
@@ -978,6 +1136,18 @@ class RDTOnlineSiglipBatchCollator:
                 default_lang_mask[: supplied.shape[0]] &= supplied
 
             qwen_kv = self._base._prepare_qwen_kv(sample["qwen_kv"])
+            plan_features: tuple[torch.Tensor, torch.Tensor] | None = None
+            if self.require_plan_features:
+                missing = PLAN_FEATURE_REQUIRED_KEYS.difference(sample)
+                if missing:
+                    raise KeyError(
+                        "Hidden/waypoint fusion requires cache keys: "
+                        + ", ".join(sorted(missing))
+                    )
+                plan_features = self._base._prepare_plan_features(
+                    sample["qwen_hidden_states"],
+                    sample["latent_waypoints"],
+                )
 
             state = torch.as_tensor(sample["state"], dtype=torch.float32).flatten()
             if state.numel() != self._base.cache_state_dim:
@@ -1032,6 +1202,13 @@ class RDTOnlineSiglipBatchCollator:
                 )
 
             tensor_batch["qwen_kv"].append(qwen_kv)
+            if plan_features is not None:
+                hidden_states, latent_waypoints = plan_features
+                tensor_batch["qwen_hidden_states"].append(hidden_states)
+                tensor_batch["latent_waypoints"].append(latent_waypoints)
+                tensor_batch["plan_mask"].append(
+                    torch.ones(self.spatial_token_count, dtype=torch.bool)
+                )
             tensor_batch["lang_tokens"].append(lang)
             tensor_batch["lang_mask"].append(default_lang_mask)
             tensor_batch["state"].append(state)

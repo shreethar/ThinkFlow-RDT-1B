@@ -266,6 +266,18 @@ def libero_observation_to_rdt(
     position = _dataset(observation, "ee_pos", "robot0_eef_pos").reshape(-1)[:3]
     orientation = _dataset(observation, "ee_ori", "robot0_eef_quat").reshape(-1)
     gripper = _dataset(observation, "gripper_states", "robot0_gripper_qpos").reshape(-1)
+    joints = _optional_dataset(
+        observation,
+        "joint_states",
+        "robot0_joint_pos",
+        "joint_pos",
+    )
+    if joints is not None:
+        joints = np.asarray(joints).reshape(-1)
+        if joints.size < 7:
+            raise ValueError(
+                f"Expected seven LIBERO joint positions, got {joints.shape}"
+            )
     if gripper.size < 2:
         raise ValueError(f"Expected two raw LIBERO finger positions, got {gripper.shape}")
     state = np.concatenate(
@@ -279,7 +291,14 @@ def libero_observation_to_rdt(
         if key in observation:
             wrist = libero_image_to_rgb(observation[key])
             break
-    return {"state": state, "primary": primary, "wrist": wrist}
+    result = {
+        "state": state,
+        "primary": primary,
+        "wrist": wrist,
+    }
+    if joints is not None:
+        result["joint_state"] = joints[:7].astype(np.float32)
+    return result
 
 
 def rdt_action_to_libero(
