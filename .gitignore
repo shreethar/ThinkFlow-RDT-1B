@@ -70,8 +70,12 @@ cache_features_libero_object_task0_demo0/
 __pycache__/
 cached-dataset/
 output_2/
+output_3/
 
 B2/
 SimplerEnv/
 cache_features_libero_b0_recovery/
 cache_features_b0_oxe/
+cache_features_libero_object_task0_10demo_native128/
+
+cache_features_libero_b2_native/
