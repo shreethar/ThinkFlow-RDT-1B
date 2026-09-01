@@ -51,6 +51,7 @@ from thinkflow_rdt.data import (  # noqa: E402
     LIBERO_GRIPPER_QPOS_MAX,
     LIBERO_GRIPPER_QPOS_MIN,
 )
+from thinkflow_rdt.vision import prepare_siglip_images  # noqa: E402
 
 
 CTRL_FREQ_BY_DATASET = {
@@ -860,6 +861,7 @@ def extract_siglip_features(
     max_img_tokens: int,
     expected_dim: int,
     device: torch.device,
+    encode_invalid_slots: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     image_slots: list[list[Image.Image]] = batch["siglip_image_slots"]
     slot_mask = torch.as_tensor(batch["siglip_slot_mask"], dtype=torch.bool, device=device)
@@ -877,6 +879,7 @@ def extract_siglip_features(
         mask = torch.zeros(batch_size, max_img_tokens, dtype=torch.bool, device=device)
         return output, mask
 
+    flat_images = prepare_siglip_images(flat_images, processor)
     inputs = processor(images=flat_images, return_tensors="pt")
     inputs = {
         key: value.to(device) if isinstance(value, torch.Tensor) else value
@@ -916,7 +919,7 @@ def extract_siglip_features(
         for slot_index in range(slots_per_sample):
             token_start = slot_index * tokens_per_image
             token_stop = token_start + tokens_per_image
-            if bool(slot_mask[sample_index, slot_index]):
+            if encode_invalid_slots or bool(slot_mask[sample_index, slot_index]):
                 output[sample_index, token_start:token_stop] = image_features[
                     sample_index, slot_index
                 ]

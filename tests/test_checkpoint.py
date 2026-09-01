@@ -487,6 +487,40 @@ def test_full_base_can_reinitialize_only_a_changed_action_output_head(tmp_path):
     ]
 
 
+def test_upstream_libero_rdt_ema_loads_complete_runner_and_truncates_language_positions(
+    tmp_path,
+):
+    safetensors = pytest.importorskip("safetensors.torch")
+    source_runner = FakeRunner(FakeTransferCore(action_dim=7, lang_tokens=1024))
+    fill_parameters(source_runner, start=3.0)
+    ema_dir = tmp_path / "ema"
+    ema_dir.mkdir()
+    safetensors.save_file(source_runner.state_dict(), ema_dir / "model.safetensors")
+
+    target_runner = FakeRunner(FakeTransferCore(action_dim=7, lang_tokens=128))
+    fill_parameters(target_runner, start=-3.0)
+    model = SimpleNamespace(runner=target_runner)
+    report = load_full_rdt_base(
+        model,
+        tmp_path,
+        allow_language_position_mismatch=True,
+    )
+
+    expected = source_runner.state_dict()
+    for name, tensor in target_runner.state_dict().items():
+        if name == "model.lang_cond_pos_embed":
+            torch.testing.assert_close(tensor, expected[name][:, :128])
+        else:
+            torch.testing.assert_close(tensor, expected[name])
+    assert report["format"] == "upstream_libero_rdt_ema"
+    assert report["loaded_runner_interfaces"] == [
+        "lang_adaptor",
+        "img_adaptor",
+        "state_adaptor",
+    ]
+    assert report["adapted_tensors"] == ["model.lang_cond_pos_embed"]
+
+
 def test_full_base_still_rejects_other_shape_mismatches(tmp_path):
     source_core = FakeTransferCore(action_dim=7, hidden_dim=4)
     torch.save(source_core.state_dict(), tmp_path / FULL_RDT_FILE)

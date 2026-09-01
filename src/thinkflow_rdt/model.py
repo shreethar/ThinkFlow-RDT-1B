@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import types
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -592,8 +593,18 @@ class SFTConditionedRDT(nn.Module):
             ).to(dtype=dtype)
         self.pretrained_report: dict[str, int] | None = None
         self.base_artifact_report: dict[str, Any] | None = None
+        upstream_libero_base = bool(
+            base_artifact
+            and (
+                (Path(base_artifact) / "ema" / "model.safetensors").is_file()
+                or (Path(base_artifact) / "model.safetensors").is_file()
+            )
+        )
 
-        if load_pretrained and cfg.pretrained_model:
+        # The upstream Libero_RDT EMA checkpoint is a complete runner. Avoid
+        # loading the generic RDT-1B runner immediately before overwriting all
+        # of it, which otherwise doubles startup I/O and peak host memory.
+        if load_pretrained and cfg.pretrained_model and not upstream_libero_base:
             source = RDTRunner.from_pretrained(cfg.pretrained_model)
             self.pretrained_report = _copy_selected_pretrained_weights(
                 self.runner, source, cfg
@@ -602,7 +613,9 @@ class SFTConditionedRDT(nn.Module):
             gc.collect()
 
         if cfg.model.freeze_state_adaptor and self.use_native_state_encoder:
-            if load_pretrained and cfg.pretrained_model:
+            if upstream_libero_base:
+                pass
+            elif load_pretrained and cfg.pretrained_model:
                 assert self.pretrained_report is not None
                 if (
                     self.pretrained_report["state_adaptor_copied_tensors"]
@@ -1534,6 +1547,10 @@ class SFTConditionedRDT(nn.Module):
         # prediction_type="sample" means the RDT predicts the clean x0 action
         # chunk at each denoising call. Apply sign classification directly to
         # its existing gripper scalar; this adds no parameters or output head.
+        # Rollout executes sign(prediction): <0 -> -1, >=0 -> +1. A literal
+        # threshold in the training graph would have zero gradient almost
+        # everywhere, so BCEWithLogits is its differentiable counterpart with
+        # the same zero decision boundary and binarized {-1,+1} target.
         gripper_logits = prediction[..., gripper_start]
         gripper_labels = (target[..., gripper_start] >= 0).to(gripper_logits.dtype)
         logit_scale = batch.get("gripper_bce_logit_scale")

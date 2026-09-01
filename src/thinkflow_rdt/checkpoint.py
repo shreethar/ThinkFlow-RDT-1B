@@ -601,19 +601,26 @@ def load_full_rdt_base(
     allow_output_head_mismatch: bool = False,
     allow_language_position_mismatch: bool = False,
 ) -> dict[str, Any]:
-    """Load a merged/full RDT core before wrapping the core with fresh LoRA.
+    """Load a full ThinkFlow core or an upstream Libero_RDT EMA runner.
 
-    Use this for two-stage fine-tuning: first merge an earlier LoRA run into the
-    base RDT transformer, then initialize a new LoRA adapter for the next
-    dataset. This intentionally loads only ``rdt_full.pt``; interface modules
-    such as the Qwen projector may have changed shape between fusion designs.
+    A ThinkFlow artifact contains ``rdt_full.pt`` and intentionally initializes
+    only the RDT core.  The public Libero_RDT checkpoints instead contain a
+    complete runner in ``ema/model.safetensors`` (RDT core plus language,
+    image, and state adaptors).  Detect that layout and load all of those
+    pretrained components; the ThinkFlow-only hidden/waypoint plan modules
+    remain freshly initialized.
     """
     artifact = Path(artifact_dir)
     full_rdt_path = artifact / FULL_RDT_FILE
-    if not full_rdt_path.exists():
-        raise FileNotFoundError(full_rdt_path)
     if _is_peft_model(model.runner.model):
         raise TypeError("load_full_rdt_base must run before applying PEFT/LoRA")
+    if not full_rdt_path.exists():
+        return _load_upstream_libero_rdt_runner(
+            model,
+            artifact,
+            strict=strict,
+            allow_language_position_mismatch=allow_language_position_mismatch,
+        )
     state_dict = torch.load(
         full_rdt_path,
         map_location="cpu",
@@ -707,6 +714,93 @@ def load_full_rdt_base(
     return {
         "loaded_tensors": len(compatible_state),
         "reinitialized_tensors": sorted(mismatched_output_keys),
+        "adapted_tensors": adapted_tensors,
+        "shape_mismatches": shape_mismatches,
+    }
+
+
+def _load_upstream_libero_rdt_runner(
+    model,
+    artifact: Path,
+    *,
+    strict: bool,
+    allow_language_position_mismatch: bool,
+) -> dict[str, Any]:
+    """Load the complete runner published by tj-chen-1209/Libero_RDT."""
+    candidates = (
+        artifact / "ema" / "model.safetensors",
+        artifact / "model.safetensors",
+    )
+    checkpoint = next((path for path in candidates if path.is_file()), None)
+    if checkpoint is None:
+        raise FileNotFoundError(
+            f"Neither {artifact / FULL_RDT_FILE} nor an upstream Libero_RDT "
+            f"model.safetensors exists under {artifact}"
+        )
+    try:
+        from safetensors.torch import load_file
+    except ImportError as exc:  # pragma: no cover - normal env includes it
+        raise RuntimeError(
+            "Loading an upstream Libero_RDT checkpoint requires safetensors"
+        ) from exc
+
+    state_dict = load_file(str(checkpoint), device="cpu")
+    target_state = model.runner.state_dict()
+    source_keys = set(state_dict)
+    target_keys = set(target_state)
+    missing = target_keys - source_keys
+    unexpected = source_keys - target_keys
+    if missing or unexpected:
+        raise RuntimeError(
+            "Upstream Libero_RDT runner keys do not match this RDT runner: "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+        )
+
+    shape_mismatches = {
+        name: (tuple(tensor.shape), tuple(target_state[name].shape))
+        for name, tensor in state_dict.items()
+        if tensor.shape != target_state[name].shape
+    }
+    language_position_key = "model.lang_cond_pos_embed"
+    if set(shape_mismatches) - {language_position_key}:
+        raise RuntimeError(
+            "Upstream Libero_RDT tensor shapes differ outside the language "
+            f"position table: {shape_mismatches}"
+        )
+
+    adapted_tensors: list[str] = []
+    if language_position_key in shape_mismatches:
+        if not allow_language_position_mismatch:
+            raise RuntimeError(
+                f"Language position mismatch: {shape_mismatches[language_position_key]}"
+            )
+        source = state_dict[language_position_key]
+        target = target_state[language_position_key]
+        valid_truncation = (
+            source.ndim == target.ndim == 3
+            and source.shape[0] == target.shape[0]
+            and source.shape[2] == target.shape[2]
+            and source.shape[1] >= target.shape[1]
+        )
+        if not valid_truncation:
+            raise RuntimeError(
+                "Cannot adapt upstream language position table from "
+                f"{tuple(source.shape)} to {tuple(target.shape)}"
+            )
+        state_dict[language_position_key] = source[:, : target.shape[1], :]
+        adapted_tensors.append(language_position_key)
+
+    model.runner.load_state_dict(state_dict, strict=strict)
+    return {
+        "format": "upstream_libero_rdt_ema",
+        "checkpoint": str(checkpoint),
+        "loaded_tensors": len(state_dict),
+        "loaded_runner_interfaces": [
+            "lang_adaptor",
+            "img_adaptor",
+            "state_adaptor",
+        ],
+        "reinitialized_tensors": [],
         "adapted_tensors": adapted_tensors,
         "shape_mismatches": shape_mismatches,
     }

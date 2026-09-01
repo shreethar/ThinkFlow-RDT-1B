@@ -679,6 +679,11 @@ def main() -> None:
                         max_img_tokens=cfg.model.image_tokens,
                         expected_dim=cfg.model.img_token_dim,
                         device=device,
+                        encode_invalid_slots=(
+                            cfg.model.state_encoder_layout == "rdt_native_128"
+                            and cfg.model.native_rdt_128_mapping
+                            == "libero_joint_eef_delta"
+                        ),
                     )
                     lang_tokens, lang_mask = language_by_task[task_id]
                     state = encoded["state"]

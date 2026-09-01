@@ -12,6 +12,7 @@ from scripts.precompute_all_features import (
     episode_sample_count_is_allowed,
     episode_pack_relative_path,
     extract_qwen_kv,
+    extract_siglip_features,
     image_bytes_to_image,
     image_to_jpeg_bytes,
     image_to_lossless_png_bytes,
@@ -67,6 +68,42 @@ class _FakeQwenModel:
             past_key_values=((keys, values),),
             hidden_states=(torch.zeros_like(hidden), hidden),
         )
+
+
+class _FakeSiglipProcessor:
+    image_mean = (0.5, 0.5, 0.5)
+
+    def __call__(self, *, images, return_tensors):
+        assert return_tensors == "pt"
+        return {"pixel_values": torch.zeros(len(images), 3, 2, 2)}
+
+
+class _FakeSiglipEncoder:
+    def __call__(self, *, pixel_values):
+        count = pixel_values.shape[0]
+        values = torch.arange(count * 3, dtype=torch.float32).reshape(count, 1, 3)
+        return SimpleNamespace(last_hidden_state=values)
+
+
+def test_libero_siglip_can_encode_neutral_placeholder_slots():
+    batch = {
+        "siglip_image_slots": [[
+            Image.new("RGB", (8, 8), (255, 0, 0)),
+            Image.new("RGB", (8, 8), (127, 127, 127)),
+        ]],
+        "siglip_slot_mask": [[True, False]],
+    }
+    tokens, mask = extract_siglip_features(
+        batch,
+        _FakeSiglipProcessor(),
+        _FakeSiglipEncoder(),
+        max_img_tokens=2,
+        expected_dim=3,
+        device=torch.device("cpu"),
+        encode_invalid_slots=True,
+    )
+    assert mask.tolist() == [[True, True]]
+    torch.testing.assert_close(tokens[0, 1].float(), torch.tensor([3.0, 4.0, 5.0]))
 
 
 def test_b0_extraction_selects_literal_think_end_for_kv_and_final_hidden():
