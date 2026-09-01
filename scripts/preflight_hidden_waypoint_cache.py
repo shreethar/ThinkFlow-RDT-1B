@@ -18,6 +18,12 @@ def parse_args() -> argparse.Namespace:
         "--expected-variant", choices=("b0", "b2", "b3"), required=True
     )
     parser.add_argument("--expected-dataset", required=True)
+    parser.add_argument(
+        "--scan-shards",
+        type=int,
+        default=32,
+        help="Evenly sample this many shards for shape/finite checks.",
+    )
     return parser.parse_args()
 
 
@@ -35,10 +41,54 @@ def first_manifest_entry(path: Path) -> tuple[dict[str, Any], Path]:
     raise ValueError(f"Manifest is empty: {path}")
 
 
+def manifest_entries(path: Path) -> list[tuple[dict[str, Any], Path]]:
+    entries: list[tuple[dict[str, Any], Path]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        if isinstance(payload, str):
+            payload = {"path": payload}
+        shard = Path(str(payload["path"]))
+        if not shard.is_absolute():
+            shard = (path.parent / shard).resolve()
+        entries.append((payload, shard))
+    if not entries:
+        raise ValueError(f"Manifest is empty: {path}")
+    return entries
+
+
+def validate_feature_tensors(
+    shard: dict[str, Any],
+    shard_path: Path,
+    required: dict[str, tuple[int, ...]],
+) -> int:
+    sample_count = int(shard["num_samples"])
+    for key, trailing_shape in required.items():
+        if key not in shard:
+            raise KeyError(f"{shard_path} lacks required feature {key!r}")
+        tensor = torch.as_tensor(shard[key])
+        if tuple(tensor.shape) != (sample_count, *trailing_shape):
+            raise ValueError(
+                f"{key} has {tuple(tensor.shape)}, expected "
+                f"{(sample_count, *trailing_shape)}"
+            )
+        if not bool(torch.isfinite(tensor.float()).all()):
+            raise ValueError(f"{key} contains NaN/Inf")
+    return sample_count
+
+
 def main() -> None:
     args = parse_args()
     manifest = args.manifest.expanduser().resolve()
-    entry, shard_path = first_manifest_entry(manifest)
+    entries = manifest_entries(manifest)
+    entry, shard_path = entries[0]
+    missing_paths = [str(path) for _, path in entries if not path.is_file()]
+    if missing_paths:
+        raise FileNotFoundError(
+            f"Manifest references {len(missing_paths)} missing shards; "
+            f"first={missing_paths[0]}"
+        )
     if not shard_path.is_file():
         raise FileNotFoundError(shard_path)
     shard = torch.load(shard_path, map_location="cpu", weights_only=True)
@@ -92,18 +142,7 @@ def main() -> None:
             "qwen_hidden_states": (5, 2560),
             "latent_waypoints": (5, 2),
         }
-    sample_count = int(shard["num_samples"])
-    for key, trailing_shape in required.items():
-        if key not in shard:
-            raise KeyError(f"{shard_path} lacks required feature {key!r}")
-        tensor = torch.as_tensor(shard[key])
-        if tuple(tensor.shape) != (sample_count, *trailing_shape):
-            raise ValueError(
-                f"{key} has {tuple(tensor.shape)}, expected "
-                f"{(sample_count, *trailing_shape)}"
-            )
-        if not bool(torch.isfinite(tensor.float()).all()):
-            raise ValueError(f"{key} contains NaN/Inf")
+    sample_count = validate_feature_tensors(shard, shard_path, required)
     for key, width in (("state", 9), ("actions", 7)):
         if key not in shard:
             raise KeyError(f"{shard_path} lacks Libero_RDT field {key!r}")
@@ -122,6 +161,38 @@ def main() -> None:
     state = torch.as_tensor(shard["state"], dtype=torch.float32)
     if not bool(((state[:, 7:9] >= 0) & (state[:, 7:9] <= 1)).all()):
         raise ValueError("Cached gripper state is not normalized to [0,1]")
+
+    scan_count = min(max(1, args.scan_shards), len(entries))
+    scan_indices = sorted(
+        {
+            round(index * (len(entries) - 1) / max(1, scan_count - 1))
+            for index in range(scan_count)
+        }
+    )
+    scanned_samples = 0
+    for index in scan_indices:
+        _, candidate_path = entries[index]
+        candidate = torch.load(
+            candidate_path, map_location="cpu", weights_only=True
+        )
+        candidate_required = required
+        if args.expected_variant != "b0":
+            candidate_required = (
+                {
+                    "qwen_anchor_kv": (5, 2048),
+                    "qwen_anchor_hidden_states": (5, 2560),
+                    "latent_waypoints": (5, 2),
+                }
+                if candidate.get("cache_layout") == "episode_pack"
+                else {
+                    "qwen_kv": (5, 2048),
+                    "qwen_hidden_states": (5, 2560),
+                    "latent_waypoints": (5, 2),
+                }
+            )
+        scanned_samples += validate_feature_tensors(
+            candidate, candidate_path, candidate_required
+        )
     print(
         json.dumps(
             {
@@ -131,6 +202,9 @@ def main() -> None:
                 "dataset": dataset_id,
                 "variant": variant,
                 "samples_in_first_shard": sample_count,
+                "manifest_shards": len(entries),
+                "scanned_shards": len(scan_indices),
+                "scanned_samples": scanned_samples,
                 "training_condition": (
                     "hidden[1,2560]"
                     if args.expected_variant == "b0"
