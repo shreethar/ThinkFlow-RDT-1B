@@ -21,6 +21,7 @@ from thinkflow_rdt.config import load_config
 from thinkflow_rdt.model import SFTConditionedRDT
 from thinkflow_rdt.train import (
     add_online_siglip_features,
+    apply_conditioning_warmup_lrs,
     attach_training_objective,
     create_dataloader,
     create_optimizer,
@@ -46,6 +47,14 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path("outputs/smoke_native128_full_finetune"),
+    )
+    parser.add_argument(
+        "--base-artifact",
+        type=Path,
+        help=(
+            "Optional ThinkFlow full core or upstream Libero_RDT EMA runner "
+            "used to initialize the smoke-test model."
+        ),
     )
     parser.add_argument("--backpasses", type=int, default=10)
     parser.add_argument("--micro-batch-size", type=int, default=8)
@@ -195,8 +204,22 @@ def main() -> None:
         online_siglip=True,
         stratified=True,
     )
-    model = SFTConditionedRDT(cfg, load_pretrained=True).to(device)
+    model = SFTConditionedRDT(
+        cfg,
+        load_pretrained=True,
+        base_artifact=(
+            str(args.base_artifact.expanduser().resolve())
+            if args.base_artifact is not None
+            else None
+        ),
+    ).to(device)
     optimizer = create_optimizer(model, cfg)
+    apply_conditioning_warmup_lrs(
+        optimizer,
+        global_step=0,
+        conditioning_warmup_steps=cfg.training.conditioning_warmup_steps,
+        scheduled_lrs=[group["lr"] for group in optimizer.param_groups],
+    )
     siglip = load_online_siglip(
         model_id=args.siglip_model_id,
         fallback_model_id=args.siglip_fallback_model_id,
@@ -235,6 +258,8 @@ def main() -> None:
             gripper_bce_weight=0.0,
             gripper_bce_logit_scale=1.0,
             rotation_geodesic_weight=0.0,
+            qwen_fusion_loss_weight=cfg.training.qwen_fusion_loss_weight,
+            qwen_fusion_loss_margin=cfg.training.qwen_fusion_loss_margin,
         )
         backward_started = time.perf_counter()
         metrics = model(batch)
@@ -296,6 +321,10 @@ def main() -> None:
             sum(backward_times) / len(backward_times)
         ),
         "mean_training_loss": sum(losses) / len(losses),
+        "optimizer_group_lrs": {
+            str(group.get("name", index)): float(group["lr"])
+            for index, group in enumerate(optimizer.param_groups)
+        },
         "peak_cuda_memory_gib": (
             torch.cuda.max_memory_allocated(device) / 1024.0**3
         ),

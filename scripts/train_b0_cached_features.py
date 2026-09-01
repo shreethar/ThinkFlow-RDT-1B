@@ -215,7 +215,29 @@ def build_config(args: argparse.Namespace):
                 optional_override(args.learning_rate, cfg.training.learning_rate)
             )
         ),
+        learning_rate_rdt_backbone=optional_override(
+            args.learning_rate_rdt_backbone,
+            cfg.training.learning_rate_rdt_backbone,
+        ),
+        learning_rate_rdt_cross_attention=optional_override(
+            args.learning_rate_rdt_cross_attention,
+            cfg.training.learning_rate_rdt_cross_attention,
+        ),
+        learning_rate_plan_projector=optional_override(
+            args.learning_rate_plan_projector,
+            cfg.training.learning_rate_plan_projector,
+        ),
+        conditioning_warmup_cross_attention_learning_rate=optional_override(
+            args.conditioning_warmup_cross_attention_learning_rate,
+            cfg.training.conditioning_warmup_cross_attention_learning_rate,
+        ),
         warmup_steps=int(optional_override(args.warmup_steps, cfg.training.warmup_steps)),
+        conditioning_warmup_steps=int(
+            optional_override(
+                args.conditioning_warmup_steps,
+                cfg.training.conditioning_warmup_steps,
+            )
+        ),
         log_every=int(optional_override(args.log_every, cfg.training.log_every)),
         validate_every=int(
             optional_override(args.validate_every, cfg.training.validate_every)
@@ -279,6 +301,10 @@ def build_config(args: argparse.Namespace):
                 args.qwen_fusion_loss_margin,
                 cfg.training.qwen_fusion_loss_margin,
             )
+        ),
+        conditioning_warmup_fusion_loss_weight=optional_override(
+            args.conditioning_warmup_fusion_loss_weight,
+            cfg.training.conditioning_warmup_fusion_loss_weight,
         ),
     )
     model_cfg = cfg.model
@@ -426,6 +452,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate-lora", type=float, default=None)
     parser.add_argument("--learning-rate-interfaces", type=float, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--learning-rate-rdt-backbone", type=float, default=None)
+    parser.add_argument(
+        "--learning-rate-rdt-cross-attention", type=float, default=None
+    )
+    parser.add_argument("--learning-rate-plan-projector", type=float, default=None)
+    parser.add_argument(
+        "--conditioning-warmup-cross-attention-learning-rate",
+        type=float,
+        default=None,
+    )
     parser.add_argument(
         "--conditioning-variant",
         choices=("b0", "b2", "b3"),
@@ -436,6 +472,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--warmup-steps", type=int, default=None)
+    parser.add_argument(
+        "--conditioning-warmup-steps",
+        type=int,
+        default=None,
+        help=(
+            "For the first N optimizer updates, update only the plan projector "
+            "and RDT cross-attention; then enable the rest of full RDT."
+        ),
+    )
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--validate-every", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=None)
@@ -533,6 +578,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Required matched-vs-shuffled denoising-loss margin.",
+    )
+    parser.add_argument(
+        "--conditioning-warmup-fusion-loss-weight",
+        type=float,
+        default=None,
+        help=(
+            "Fusion ranking weight used only before "
+            "--conditioning-warmup-steps; the ordinary fusion weight is used "
+            "afterward."
+        ),
     )
     return parser.parse_args()
 

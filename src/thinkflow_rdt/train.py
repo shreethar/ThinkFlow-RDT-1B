@@ -38,6 +38,7 @@ from .data import (
     RDTOnlineSiglipBatchCollator,
 )
 from .model import SFTConditionedRDT, resolve_dtype
+from .vision import prepare_siglip_images, validate_siglip_384_processor
 
 
 LIBERO_SUITE_IDS = (
@@ -520,6 +521,7 @@ def load_online_siglip(
 ) -> tuple[SiglipImageProcessor, SiglipVisionModel]:
     resolved_model_id = resolve_model_id(model_id, fallback_model_id)
     processor = SiglipImageProcessor.from_pretrained(resolved_model_id)
+    processor_contract = validate_siglip_384_processor(processor)
     encoder = SiglipVisionModel.from_pretrained(
         resolved_model_id,
         torch_dtype=resolve_dtype(cfg.model.dtype),
@@ -532,6 +534,7 @@ def load_online_siglip(
             "SigLIP hidden_size "
             f"{encoder.config.hidden_size} != cfg.model.img_token_dim {cfg.model.img_token_dim}"
         )
+    print(f"SigLIP preprocessing verified: {processor_contract}")
     return processor, encoder
 
 
@@ -566,6 +569,14 @@ def add_online_siglip_features(
         return batch
 
     slot_mask = batch["image_slot_mask"].to(dtype=torch.bool)
+    # Libero_RDT was trained with a fixed six-image sequence. Missing camera
+    # and history slots are neutral mean-colored images, but are not masked in
+    # the RDT attention call. Preserve that contract when using its native
+    # joint/EEF interface and pretrained LIBERO-Base runner.
+    encode_neutral_slots = (
+        cfg.model.state_encoder_layout == "rdt_native_128"
+        and cfg.model.native_rdt_128_mapping == "libero_joint_eef_delta"
+    )
     valid_slots: list[tuple[int, int]] = []
     flat_images: list[Image.Image] = []
     for sample_index, slots in enumerate(image_slot_jpegs):
@@ -575,7 +586,9 @@ def add_online_siglip_features(
                 f"sample 0 has {slots_per_sample}, sample {sample_index} has {len(slots)}"
             )
         for slot_index, payload in enumerate(slots):
-            if bool(slot_mask[sample_index, slot_index].item()):
+            if encode_neutral_slots or bool(
+                slot_mask[sample_index, slot_index].item()
+            ):
                 valid_slots.append((sample_index, slot_index))
                 flat_images.append(decode_cached_image(payload))
 
@@ -595,6 +608,7 @@ def add_online_siglip_features(
         )
         return batch
 
+    flat_images = prepare_siglip_images(flat_images, processor)
     inputs = processor(images=flat_images, return_tensors="pt")
     encoder_dtype = next(encoder.parameters()).dtype
     inputs = {
@@ -726,14 +740,43 @@ def create_optimizer(model: SFTConditionedRDT, cfg: ExperimentConfig):
             if cfg.training.learning_rate is not None
             else cfg.training.learning_rate_interfaces
         )
-        rdt_parameters: list[torch.nn.Parameter] = []
+        backbone_learning_rate = (
+            learning_rate
+            if cfg.training.learning_rate_rdt_backbone is None
+            else cfg.training.learning_rate_rdt_backbone
+        )
+        cross_attention_learning_rate = (
+            learning_rate
+            if cfg.training.learning_rate_rdt_cross_attention is None
+            else cfg.training.learning_rate_rdt_cross_attention
+        )
+        plan_projector_learning_rate = (
+            learning_rate
+            if cfg.training.learning_rate_plan_projector is None
+            else cfg.training.learning_rate_plan_projector
+        )
+        warmup_cross_attention_learning_rate = (
+            cross_attention_learning_rate
+            if cfg.training.conditioning_warmup_cross_attention_learning_rate
+            is None
+            else cfg.training.conditioning_warmup_cross_attention_learning_rate
+        )
+        scheduled_cross_attention_learning_rate = max(
+            cross_attention_learning_rate,
+            warmup_cross_attention_learning_rate,
+        )
+        rdt_cross_attention_parameters: list[torch.nn.Parameter] = []
+        rdt_backbone_parameters: list[torch.nn.Parameter] = []
         projector_parameters: list[torch.nn.Parameter] = []
         other_parameters: list[torch.nn.Parameter] = []
         for name, parameter in model.named_parameters():
             if not parameter.requires_grad:
                 continue
             if name.startswith("runner.model."):
-                rdt_parameters.append(parameter)
+                if ".cross_attn." in name:
+                    rdt_cross_attention_parameters.append(parameter)
+                else:
+                    rdt_backbone_parameters.append(parameter)
             elif name.startswith(
                 (
                     "qwen_adaptor.",
@@ -747,24 +790,56 @@ def create_optimizer(model: SFTConditionedRDT, cfg: ExperimentConfig):
                 projector_parameters.append(parameter)
             else:
                 other_parameters.append(parameter)
-        if not rdt_parameters:
+        if not rdt_cross_attention_parameters and not rdt_backbone_parameters:
             raise RuntimeError("No full-RDT parameters are trainable")
+        if (
+            cfg.training.conditioning_warmup_steps > 0
+            and not rdt_cross_attention_parameters
+        ):
+            raise RuntimeError(
+                "conditioning_warmup_steps requires trainable RDT cross-attention "
+                "parameters"
+            )
         if not projector_parameters:
             raise RuntimeError("No plan-conditioning projector parameters are trainable")
-        parameter_groups = [
-            {
-                "params": rdt_parameters,
-                "lr": learning_rate,
-                "weight_decay": cfg.training.weight_decay_interfaces,
-                "name": "rdt",
-            },
+        parameter_groups = []
+        if rdt_cross_attention_parameters:
+            parameter_groups.append(
+                {
+                    "params": rdt_cross_attention_parameters,
+                    # The scheduler operates on this warm-up base rate. The
+                    # staged LR helper scales it to the requested post-warm-up
+                    # cross-attention rate at the boundary.
+                    "lr": scheduled_cross_attention_learning_rate,
+                    "weight_decay": cfg.training.weight_decay_interfaces,
+                    "name": "rdt_cross_attention",
+                    "post_warmup_lr_scale": (
+                        cross_attention_learning_rate
+                        / max(scheduled_cross_attention_learning_rate, 1e-30)
+                    ),
+                    "conditioning_warmup_lr_scale": (
+                        warmup_cross_attention_learning_rate
+                        / max(scheduled_cross_attention_learning_rate, 1e-30)
+                    ),
+                }
+            )
+        if rdt_backbone_parameters:
+            parameter_groups.append(
+                {
+                    "params": rdt_backbone_parameters,
+                    "lr": backbone_learning_rate,
+                    "weight_decay": cfg.training.weight_decay_interfaces,
+                    "name": "rdt_backbone",
+                }
+            )
+        parameter_groups.append(
             {
                 "params": projector_parameters,
-                "lr": learning_rate,
+                "lr": plan_projector_learning_rate,
                 "weight_decay": cfg.training.weight_decay_interfaces,
                 "name": "plan_projector",
-            },
-        ]
+            }
+        )
         if other_parameters:
             parameter_groups.append(
                 {
@@ -815,6 +890,57 @@ def create_optimizer(model: SFTConditionedRDT, cfg: ExperimentConfig):
         eps=1e-8,
     )
     return optimizer
+
+
+def apply_conditioning_warmup_lrs(
+    optimizer: torch.optim.Optimizer,
+    *,
+    global_step: int,
+    conditioning_warmup_steps: int,
+    scheduled_lrs: list[float] | tuple[float, ...],
+) -> bool:
+    """Freeze non-conditioning optimizer groups during staged warm-up.
+
+    Parameters stay registered with the optimizer and distributed wrapper, so
+    checkpoint/resume remains exact and no optimizer rebuild is needed at the
+    stage boundary. An lr of zero also prevents AdamW weight decay from moving
+    frozen groups.
+    """
+    warmup_active = global_step < conditioning_warmup_steps
+    frozen_group_names = {"rdt_backbone", "interfaces"}
+    if len(scheduled_lrs) != len(optimizer.param_groups):
+        raise ValueError(
+            "scheduled_lrs must match optimizer.param_groups: "
+            f"{len(scheduled_lrs)} vs {len(optimizer.param_groups)}"
+        )
+    for group, scheduled_lr in zip(optimizer.param_groups, scheduled_lrs):
+        group_name = group.get("name")
+        if warmup_active and group_name in frozen_group_names:
+            group["lr"] = 0.0
+        elif warmup_active:
+            group["lr"] = float(scheduled_lr) * float(
+                group.get("conditioning_warmup_lr_scale", 1.0)
+            )
+        else:
+            group["lr"] = float(scheduled_lr) * float(
+                group.get("post_warmup_lr_scale", 1.0)
+            )
+    return warmup_active
+
+
+def qwen_fusion_weight_for_step(
+    *,
+    global_step: int,
+    conditioning_warmup_steps: int,
+    post_warmup_weight: float,
+    conditioning_warmup_weight: float | None,
+) -> float:
+    if (
+        global_step < conditioning_warmup_steps
+        and conditioning_warmup_weight is not None
+    ):
+        return float(conditioning_warmup_weight)
+    return float(post_warmup_weight)
 
 
 def gradient_statistics(
@@ -2598,7 +2724,14 @@ def train(
             "rotation_geodesic_weight": float(rotation_geodesic_weight),
             "qwen_fusion_loss_weight": float(qwen_fusion_loss_weight),
             "qwen_fusion_loss_margin": float(qwen_fusion_loss_margin),
+            "conditioning_warmup_steps": int(
+                cfg.training.conditioning_warmup_steps
+            ),
         }
+        if cfg.training.conditioning_warmup_fusion_loss_weight is not None:
+            tracker_config["training_objective"][
+                "conditioning_warmup_fusion_loss_weight"
+            ] = cfg.training.conditioning_warmup_fusion_loss_weight
         if report_to.lower() == "tensorboard":
             tracker_config = _tensorboard_hparams(tracker_config)
         accelerator.init_trackers(
@@ -2627,6 +2760,19 @@ def train(
         if not math.isfinite(value) or (value <= 0 if strictly_positive else value < 0):
             qualifier = "positive" if strictly_positive else "non-negative"
             raise ValueError(f"{name} must be finite and {qualifier}")
+    if (
+        cfg.training.conditioning_warmup_fusion_loss_weight is not None
+        and (
+            not math.isfinite(
+                cfg.training.conditioning_warmup_fusion_loss_weight
+            )
+            or cfg.training.conditioning_warmup_fusion_loss_weight < 0
+        )
+    ):
+        raise ValueError(
+            "conditioning_warmup_fusion_loss_weight must be finite and "
+            "non-negative"
+        )
     train_loader = create_dataloader(
         cfg.data.train_manifest,
         cfg,
@@ -2672,6 +2818,10 @@ def train(
         "qwen_fusion_loss_weight": float(qwen_fusion_loss_weight),
         "qwen_fusion_loss_margin": float(qwen_fusion_loss_margin),
     }
+    if cfg.training.conditioning_warmup_fusion_loss_weight is not None:
+        training_objective["conditioning_warmup_fusion_loss_weight"] = (
+            cfg.training.conditioning_warmup_fusion_loss_weight
+        )
     online_siglip = None
     if use_online_siglip:
         online_siglip = load_online_siglip(
@@ -2708,7 +2858,7 @@ def train(
             run.summary["model/trainable_percentage"] = model_report["percentage"]
             run.summary["model/output_dimension"] = cfg.model.action_dim
             run.summary["model/supervised_action_dimensions"] = (
-                10
+                cfg.model.cache_action_dim
                 if cfg.model.action_encoder_layout == "rdt_native_128"
                 else cfg.model.action_dim
             )
@@ -2724,6 +2874,12 @@ def train(
             ]
             run.summary["model/pretrained_copy_report"] = model_report.get(
                 "pretrained"
+            )
+            run.summary["model/base_artifact_report"] = model_report.get(
+                "base_artifact"
+            )
+            run.summary["training/conditioning_warmup_steps"] = int(
+                cfg.training.conditioning_warmup_steps
             )
 
     optimizer = create_optimizer(model, cfg)
@@ -2877,6 +3033,33 @@ def train(
                 f"batches_consumed_in_epoch={batches_consumed_in_epoch}"
             )
 
+    conditioning_warmup_active = apply_conditioning_warmup_lrs(
+        optimizer,
+        global_step=global_step,
+        conditioning_warmup_steps=cfg.training.conditioning_warmup_steps,
+        scheduled_lrs=scheduler.get_last_lr(),
+    )
+    applied_qwen_fusion_loss_weight = qwen_fusion_weight_for_step(
+        global_step=global_step,
+        conditioning_warmup_steps=cfg.training.conditioning_warmup_steps,
+        post_warmup_weight=qwen_fusion_loss_weight,
+        conditioning_warmup_weight=(
+            cfg.training.conditioning_warmup_fusion_loss_weight
+        ),
+    )
+    if accelerator.is_main_process and cfg.training.conditioning_warmup_steps > 0:
+        intended_active_groups = [
+            str(group.get("name"))
+            for group in optimizer.param_groups
+            if group.get("name") not in {"rdt_backbone", "interfaces"}
+        ]
+        print(
+            "Conditioning warm-up stage: "
+            f"global_step={global_step}, "
+            f"ends_after={cfg.training.conditioning_warmup_steps}, "
+            f"update_groups={intended_active_groups}"
+        )
+
     def checkpoint_progress() -> dict[str, object]:
         progress_epoch, progress_batches = normalized_data_position(
             epoch,
@@ -2943,6 +3126,16 @@ def train(
         ):
             saw_batch = True
             batches_consumed_in_epoch = batch_index + 1
+            applied_qwen_fusion_loss_weight = qwen_fusion_weight_for_step(
+                global_step=global_step,
+                conditioning_warmup_steps=(
+                    cfg.training.conditioning_warmup_steps
+                ),
+                post_warmup_weight=qwen_fusion_loss_weight,
+                conditioning_warmup_weight=(
+                    cfg.training.conditioning_warmup_fusion_loss_weight
+                ),
+            )
             if online_siglip is not None:
                 batch = add_online_siglip_features(
                     batch,
@@ -2958,7 +3151,7 @@ def train(
                 gripper_bce_weight=gripper_bce_weight,
                 gripper_bce_logit_scale=gripper_bce_logit_scale,
                 rotation_geodesic_weight=rotation_geodesic_weight,
-                qwen_fusion_loss_weight=qwen_fusion_loss_weight,
+                qwen_fusion_loss_weight=applied_qwen_fusion_loss_weight,
                 qwen_fusion_loss_margin=qwen_fusion_loss_margin,
             )
             with accelerator.accumulate(model):
@@ -3112,6 +3305,24 @@ def train(
                 continue
             bad_accumulation_window = False
             global_step += 1
+            was_conditioning_warmup_active = conditioning_warmup_active
+            conditioning_warmup_active = apply_conditioning_warmup_lrs(
+                optimizer,
+                global_step=global_step,
+                conditioning_warmup_steps=(
+                    cfg.training.conditioning_warmup_steps
+                ),
+                scheduled_lrs=scheduler.get_last_lr(),
+            )
+            if (
+                accelerator.is_main_process
+                and was_conditioning_warmup_active
+                and not conditioning_warmup_active
+            ):
+                print(
+                    "Conditioning warm-up complete at step "
+                    f"{global_step}; enabling the full RDT optimizer groups"
+                )
             if accelerator.device.type == "cuda":
                 torch.cuda.synchronize(accelerator.device)
             local_step_time = time.perf_counter() - update_started_at
@@ -3201,6 +3412,9 @@ def train(
                         running_qwen_fusion_loss / max(running_steps, 1)
                     ),
                     "train/qwen_fusion_loss_weight": float(
+                        applied_qwen_fusion_loss_weight
+                    ),
+                    "train/qwen_fusion_loss_weight_post_warmup": float(
                         qwen_fusion_loss_weight
                     ),
                     "train/qwen_fusion_loss_margin": float(
@@ -3217,6 +3431,12 @@ def train(
                     "train/qwen_fusion_margin_satisfied_fraction": (
                         running_qwen_fusion_margin_satisfied
                         / max(running_steps, 1)
+                    ),
+                    "train/conditioning_warmup_active": float(
+                        conditioning_warmup_active
+                    ),
+                    "train/conditioning_warmup_steps": float(
+                        cfg.training.conditioning_warmup_steps
                     ),
                     "train/loss_xyz": running_xyz_loss / max(running_steps, 1),
                     "train/loss_rot": running_rot_loss / max(running_steps, 1),

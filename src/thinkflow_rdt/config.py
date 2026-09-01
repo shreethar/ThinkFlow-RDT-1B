@@ -201,6 +201,19 @@ class TrainingConfig:
     # sample's KV by at least ``qwen_fusion_loss_margin``.
     qwen_fusion_loss_weight: float = 0.0
     qwen_fusion_loss_margin: float = 0.0
+    # For the first N optimizer updates, update only the plan-conditioning
+    # projector and RDT cross-attention weights. The remaining full-RDT and
+    # interface optimizer groups keep lr=0, then join automatically.
+    conditioning_warmup_steps: int = 0
+    # Optional stronger ranking weight used only while the conditioning stage
+    # is active. Afterwards qwen_fusion_loss_weight is used.
+    conditioning_warmup_fusion_loss_weight: float | None = None
+    # Full-finetune group-specific rates. None preserves the legacy shared
+    # training.learning_rate behavior.
+    learning_rate_rdt_backbone: float | None = None
+    learning_rate_rdt_cross_attention: float | None = None
+    learning_rate_plan_projector: float | None = None
+    conditioning_warmup_cross_attention_learning_rate: float | None = None
 
 
 @dataclass(frozen=True)
@@ -401,8 +414,50 @@ class ExperimentConfig:
             raise ValueError("training.qwen_fusion_loss_weight must be non-negative")
         if self.training.qwen_fusion_loss_margin < 0:
             raise ValueError("training.qwen_fusion_loss_margin must be non-negative")
+        optional_nonnegative = {
+            "conditioning_warmup_fusion_loss_weight": (
+                self.training.conditioning_warmup_fusion_loss_weight
+            ),
+            "learning_rate_rdt_backbone": (
+                self.training.learning_rate_rdt_backbone
+            ),
+            "learning_rate_rdt_cross_attention": (
+                self.training.learning_rate_rdt_cross_attention
+            ),
+            "learning_rate_plan_projector": (
+                self.training.learning_rate_plan_projector
+            ),
+            "conditioning_warmup_cross_attention_learning_rate": (
+                self.training.conditioning_warmup_cross_attention_learning_rate
+            ),
+        }
+        for name, value in optional_nonnegative.items():
+            if value is not None and value < 0:
+                raise ValueError(f"training.{name} must be non-negative")
+        if self.training.conditioning_warmup_steps < 0:
+            raise ValueError(
+                "training.conditioning_warmup_steps must be non-negative"
+            )
+        if self.training.conditioning_warmup_steps > self.training.max_steps:
+            raise ValueError(
+                "training.conditioning_warmup_steps cannot exceed max_steps"
+            )
         if (
-            self.training.qwen_fusion_loss_weight > 0
+            self.training.conditioning_warmup_steps > 0
+            and self.model.finetune_mode != "full"
+        ):
+            raise ValueError(
+                "conditioning_warmup_steps currently requires finetune_mode=full"
+            )
+        if (
+            (
+                self.training.qwen_fusion_loss_weight > 0
+                or (
+                    self.training.conditioning_warmup_fusion_loss_weight
+                    is not None
+                    and self.training.conditioning_warmup_fusion_loss_weight > 0
+                )
+            )
             and self.model.qwen_fusion == "none"
         ):
             raise ValueError(

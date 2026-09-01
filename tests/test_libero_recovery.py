@@ -10,7 +10,11 @@ from scripts.generate_libero_recovery_cache import (
     position_feedback_action,
 )
 from thinkflow_rdt.config import load_config
-from thinkflow_rdt.train import create_optimizer
+from thinkflow_rdt.train import (
+    apply_conditioning_warmup_lrs,
+    create_optimizer,
+    qwen_fusion_weight_for_step,
+)
 
 
 def test_first_gripper_transition_requires_persistence() -> None:
@@ -53,11 +57,17 @@ def test_recovery_config_unfreezes_only_image_condition_adaptor() -> None:
 
 
 def test_full_optimizer_uses_interface_specific_learning_rate() -> None:
+    class TinyRDT(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cross_attn = torch.nn.Linear(2, 2)
+            self.ffn = torch.nn.Linear(2, 2)
+
     class TinyModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.runner = torch.nn.Module()
-            self.runner.model = torch.nn.Linear(2, 2)
+            self.runner.model = TinyRDT()
             self.runner.state_adaptor = torch.nn.Linear(2, 2)
             self.runner.state_adaptor.requires_grad_(False)
             self.runner.img_adaptor = torch.nn.Linear(2, 2)
@@ -69,12 +79,56 @@ def test_full_optimizer_uses_interface_specific_learning_rate() -> None:
             learning_rate=1e-5,
             learning_rate_interfaces=5e-6,
             weight_decay_interfaces=0.01,
+            conditioning_warmup_steps=2,
+            learning_rate_rdt_backbone=1e-5,
+            learning_rate_rdt_cross_attention=2e-5,
+            learning_rate_plan_projector=1e-4,
+            conditioning_warmup_cross_attention_learning_rate=1e-4,
         ),
     )
     optimizer = create_optimizer(TinyModel(), cfg)
     rates = {group["name"]: group["lr"] for group in optimizer.param_groups}
     assert rates == {
-        "rdt": pytest.approx(1e-5),
-        "plan_projector": pytest.approx(1e-5),
+        "rdt_cross_attention": pytest.approx(1e-4),
+        "rdt_backbone": pytest.approx(1e-5),
+        "plan_projector": pytest.approx(1e-4),
         "interfaces": pytest.approx(5e-6),
     }
+
+    scheduled_lrs = [group["lr"] for group in optimizer.param_groups]
+    assert apply_conditioning_warmup_lrs(
+        optimizer,
+        global_step=0,
+        conditioning_warmup_steps=2,
+        scheduled_lrs=scheduled_lrs,
+    )
+    warmup_rates = {group["name"]: group["lr"] for group in optimizer.param_groups}
+    assert warmup_rates["rdt_cross_attention"] == pytest.approx(1e-4)
+    assert warmup_rates["plan_projector"] == pytest.approx(1e-4)
+    assert warmup_rates["rdt_backbone"] == 0.0
+    assert warmup_rates["interfaces"] == 0.0
+
+    assert not apply_conditioning_warmup_lrs(
+        optimizer,
+        global_step=2,
+        conditioning_warmup_steps=2,
+        scheduled_lrs=scheduled_lrs,
+    )
+    restored_rates = {group["name"]: group["lr"] for group in optimizer.param_groups}
+    assert restored_rates == {
+        "rdt_cross_attention": pytest.approx(2e-5),
+        "rdt_backbone": pytest.approx(1e-5),
+        "plan_projector": pytest.approx(1e-4),
+        "interfaces": pytest.approx(5e-6),
+    }
+
+
+def test_qwen_fusion_weight_switches_after_conditioning_warmup() -> None:
+    kwargs = {
+        "conditioning_warmup_steps": 250,
+        "post_warmup_weight": 3.0,
+        "conditioning_warmup_weight": 10.0,
+    }
+    assert qwen_fusion_weight_for_step(global_step=0, **kwargs) == 10.0
+    assert qwen_fusion_weight_for_step(global_step=249, **kwargs) == 10.0
+    assert qwen_fusion_weight_for_step(global_step=250, **kwargs) == 3.0

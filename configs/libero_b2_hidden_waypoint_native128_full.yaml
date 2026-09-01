@@ -82,7 +82,9 @@ training:
   learning_rate_lora: 1.0e-4
   learning_rate_interfaces: 1.0e-4
   weight_decay_interfaces: 0.01
-  warmup_steps: 500
+  # LR ramp and conditioning-only stage are deliberately separate.
+  warmup_steps: 100
+  conditioning_warmup_steps: 250
   max_grad_norm: 1.0
   log_every: 10
   validate_every: 500
@@ -103,5 +105,5 @@ training:
   qualitative_validation_examples: 32
   # Same-sample plans should outperform plans jointly shuffled from another
   # sample. Hidden states, waypoints, and their mask share one permutation.
-  qwen_fusion_loss_weight: 0.5
+  qwen_fusion_loss_weight: 10.0
   qwen_fusion_loss_margin: 0.002
