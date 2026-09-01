@@ -124,7 +124,6 @@ def main() -> None:
         required = {
             "qwen_kv": (1, 2048),
             "qwen_hidden_states": (1, 2560),
-            "eef_position": (3,),
         }
         if shard.get("qwen_token_selector") != "think_end":
             raise ValueError(
@@ -143,6 +142,15 @@ def main() -> None:
             "latent_waypoints": (5, 2),
         }
     sample_count = validate_feature_tensors(shard, shard_path, required)
+    # Absolute EEF XYZ was added later as a diagnostic sidecar. It is not an
+    # RDT conditioning input or action target, so older otherwise-complete
+    # caches remain valid. When present, still enforce its shape/finiteness.
+    if "eef_position" in shard:
+        validate_feature_tensors(
+            shard,
+            shard_path,
+            {"eef_position": (3,)},
+        )
     for key, width in (("state", 9), ("actions", 7)):
         if key not in shard:
             raise KeyError(f"{shard_path} lacks Libero_RDT field {key!r}")
@@ -193,6 +201,12 @@ def main() -> None:
         scanned_samples += validate_feature_tensors(
             candidate, candidate_path, candidate_required
         )
+        if "eef_position" in candidate:
+            validate_feature_tensors(
+                candidate,
+                candidate_path,
+                {"eef_position": (3,)},
+            )
     print(
         json.dumps(
             {
@@ -216,7 +230,11 @@ def main() -> None:
                     else "kv[5,2048]"
                 ),
                 "cached_state": "joint7+normalized_gripper2",
-                "diagnostic_sidecar": "absolute_eef_xyz[3]",
+                "diagnostic_sidecar": (
+                    "absolute_eef_xyz[3]"
+                    if "eef_position" in shard
+                    else "not cached (optional)"
+                ),
                 "cached_actions": "[samples,64,7] raw LIBERO commands",
                 "native_state_slots": {"joints": "0:7", "gripper": "10:12"},
                 "native_action_slots": {"eef_delta": "39:45", "gripper": 10},
