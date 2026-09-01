@@ -168,6 +168,16 @@ def parse_args() -> argparse.Namespace:
             "re-planning. The model still predicts cfg.model.pred_horizon actions."
         ),
     )
+    parser.add_argument(
+        "--inference-steps",
+        type=int,
+        default=None,
+        help=(
+            "Override noise_scheduler.num_inference_timesteps for diffusion "
+            "sampling. This changes the number of denoising iterations used "
+            "to produce each action chunk without modifying the checkpoint."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device-map", default="cuda")
     parser.add_argument("--qwen-max-new-tokens", type=int, default=128)
@@ -331,6 +341,12 @@ def write_summary(results_path: Path, summary_path: Path) -> dict[str, Any]:
         "success_rate": sum(int(row["success"]) for row in rows) / max(len(rows), 1),
         "tasks": [tasks[key] for key in sorted(tasks, key=int)],
     }
+    if rows:
+        summary["action_chunk"] = rows[0].get("action_chunk")
+        summary["diffusion_inference_steps"] = rows[0].get(
+            "diffusion_inference_steps"
+        )
+        summary["max_steps"] = rows[0].get("max_steps")
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
@@ -369,6 +385,16 @@ def main() -> None:
 
     device = torch.device("cuda")
     cfg = load_config(args.config)
+    if args.inference_steps is not None:
+        if args.inference_steps <= 0:
+            raise ValueError("--inference-steps must be positive")
+        cfg = replace(
+            cfg,
+            noise_scheduler=replace(
+                cfg.noise_scheduler,
+                num_inference_timesteps=args.inference_steps,
+            ),
+        )
     if args.pretrained_only or args.disable_qwen_fusion:
         cfg = replace(cfg, model=replace(cfg.model, qwen_fusion="none"))
     if args.require_qwen_fusion and cfg.model.qwen_fusion == "none":
@@ -868,6 +894,11 @@ def main() -> None:
                         "steps": int(success_step[local_index]),
                         "checkpoint": "pretrained-only" if args.pretrained_only else str(args.checkpoint.resolve()),
                         "pretrained_only": bool(args.pretrained_only),
+                        "action_chunk": int(args.action_chunk),
+                        "diffusion_inference_steps": int(
+                            cfg.noise_scheduler.num_inference_timesteps
+                        ),
+                        "max_steps": int(args.max_steps),
                     }
                     if demo_initial_states is not None:
                         row["demo_hdf5"] = str(args.demo_hdf5.resolve())
