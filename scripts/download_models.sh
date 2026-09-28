@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ROOT="${MODEL_ROOT:-/workspace/model}"
-LATENT_REPO="${LATENT_REPO:-shreethar/LatentStudent-ckpt-400}"
+MODEL_ROOT="${MODEL_ROOT:-/home/ubuntu/ThinkFlow-RDT-1B/model}"
+LATENT_REPO="${LATENT_REPO:-shreethar/Latent-Student-Spatial-Forcing}"
 STAGE1_REPO="${STAGE1_REPO:-shreethar/stage1_unsloth}"
 LATENT_DIR="${LATENT_DIR:-}"
 STAGE1_DIR="${STAGE1_DIR:-}"
@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-LATENT_DIR="${LATENT_DIR:-${MODEL_ROOT}/LatentStudent-ckpt-400}"
+LATENT_DIR="${LATENT_DIR:-${MODEL_ROOT}/Latent-Student-Spatial-Forcing}"
 STAGE1_DIR="${STAGE1_DIR:-${MODEL_ROOT}/stage1_unsloth}"
 
 mkdir -p "${MODEL_ROOT}"

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SRC="${SRC:-/workspace/model/LatentStudent-ckpt-400}"
-DST="${DST:-/workspace/model/LatentStudent-ckpt-400-fixed}"
-PROCESSOR_SRC="${PROCESSOR_SRC:-/workspace/model/stage1_unsloth}"
+SRC="${SRC:-/home/ubuntu/ThinkFlow-RDT-1B/model/LatentStudent-ckpt-400}"
+DST="${DST:-/home/ubuntu/ThinkFlow-RDT-1B/model/LatentStudent-ckpt-400-fixed}"
+PROCESSOR_SRC="${PROCESSOR_SRC:-/home/ubuntu/ThinkFlow-RDT-1B/model/stage1_unsloth}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
