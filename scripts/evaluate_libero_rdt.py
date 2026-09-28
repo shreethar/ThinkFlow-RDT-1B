@@ -190,6 +190,17 @@ def parse_args() -> argparse.Namespace:
             "and waypoint features. Auto infers b3, then b2, from paths."
         ),
     )
+    parser.add_argument(
+        "--qwen-ablation",
+        choices=("none", "shuffled"),
+        default="none",
+        help=(
+            "Optionally cyclically shuffle the extracted Qwen condition across "
+            "active samples at every replan. KV, hidden state, and waypoint "
+            "features use the same permutation; a singleton active batch is "
+            "zeroed because no cross-sample donor exists."
+        ),
+    )
     parser.add_argument("--qwen-layer-index", type=int, default=7)
     parser.add_argument(
         "--t5-model-id",
@@ -325,6 +336,34 @@ def load_demo_initial_states(
     return names, np.stack(states)
 
 
+def shuffle_qwen_conditioning(
+    qwen_kv: torch.Tensor,
+    qwen_hidden_states: torch.Tensor | None,
+    latent_waypoints: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Apply one shared, fixed-point-free cyclic permutation across samples."""
+    batch_size = int(qwen_kv.shape[0])
+    features = (qwen_kv, qwen_hidden_states, latent_waypoints)
+    if batch_size == 1:
+        return tuple(
+            None if feature is None else torch.zeros_like(feature)
+            for feature in features
+        )  # type: ignore[return-value]
+    order = torch.roll(torch.arange(batch_size, device=qwen_kv.device), shifts=1)
+    shuffled: list[torch.Tensor | None] = []
+    for feature in features:
+        if feature is None:
+            shuffled.append(None)
+            continue
+        if int(feature.shape[0]) != batch_size:
+            raise ValueError(
+                "Qwen conditioning tensors disagree on batch size: "
+                f"expected {batch_size}, got {int(feature.shape[0])}"
+            )
+        shuffled.append(feature.index_select(0, order.to(feature.device)))
+    return shuffled[0], shuffled[1], shuffled[2]  # type: ignore[return-value]
+
+
 def write_summary(results_path: Path, summary_path: Path) -> dict[str, Any]:
     rows = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     tasks: dict[str, dict[str, Any]] = {}
@@ -347,6 +386,9 @@ def write_summary(results_path: Path, summary_path: Path) -> dict[str, Any]:
             "diffusion_inference_steps"
         )
         summary["max_steps"] = rows[0].get("max_steps")
+        summary["qwen_fusion"] = rows[0].get("qwen_fusion")
+        summary["qwen_extraction"] = rows[0].get("qwen_extraction")
+        summary["qwen_ablation"] = rows[0].get("qwen_ablation")
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
@@ -397,6 +439,10 @@ def main() -> None:
         )
     if args.pretrained_only or args.disable_qwen_fusion:
         cfg = replace(cfg, model=replace(cfg.model, qwen_fusion="none"))
+    if args.qwen_ablation != "none" and cfg.model.qwen_fusion == "none":
+        raise ValueError(
+            "--qwen-ablation requires an enabled Qwen fusion interface"
+        )
     if args.require_qwen_fusion and cfg.model.qwen_fusion == "none":
         raise ValueError(
             "--require-qwen-fusion was requested, but the resolved model config "
@@ -698,6 +744,17 @@ def main() -> None:
                                 qwen_kv, qwen_hidden_states = b0_features
                             else:
                                 qwen_kv = b0_features
+                        if args.qwen_ablation == "shuffled":
+                            assert qwen_kv is not None
+                            (
+                                qwen_kv,
+                                qwen_hidden_states,
+                                latent_waypoints,
+                            ) = shuffle_qwen_conditioning(
+                                qwen_kv,
+                                qwen_hidden_states,
+                                latent_waypoints,
+                            )
                     img_tokens, img_mask = extract_siglip_features(
                         encoded,
                         siglip_processor,
@@ -899,6 +956,11 @@ def main() -> None:
                             cfg.noise_scheduler.num_inference_timesteps
                         ),
                         "max_steps": int(args.max_steps),
+                        "qwen_fusion": cfg.model.qwen_fusion,
+                        "qwen_extraction": (
+                            qwen_extraction_mode if use_qwen else "disabled"
+                        ),
+                        "qwen_ablation": args.qwen_ablation,
                     }
                     if demo_initial_states is not None:
                         row["demo_hdf5"] = str(args.demo_hdf5.resolve())

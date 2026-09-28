@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate a TJ-chen RDT-1B LIBERO checkpoint on LIBERO Goal.
+"""Evaluate a TJ-chen RDT-1B checkpoint on a LIBERO suite.
 
 This is a standalone integration of the checkpoint author's LIBERO policy
 contract with this repository's installed LIBERO environment.  It deliberately
@@ -69,6 +69,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("output_3/checkpoints/RDT-1B-LIBERO-Base"),
     )
     parser.add_argument("--model-id", default="TJ-chen/RDT-1B-LIBERO-Base")
+    parser.add_argument(
+        "--benchmark",
+        choices=("libero_spatial", "libero_object", "libero_goal", "libero_10"),
+        default="libero_goal",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("output_3/libero_goal_base"))
     parser.add_argument("--libero-root", type=Path, default=LIBERO_ROOT)
     parser.add_argument("--rdt-repo", type=Path, default=RDT_REPO)
@@ -80,6 +85,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20241201)
     parser.add_argument("--video-resolution", type=int, default=512)
     parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument(
+        "--save-videos",
+        action="store_true",
+        help="Save rollout videos. Disabled by default for checkpoint/state sweeps.",
+    )
     parser.add_argument("--task-id", type=int, action="append", choices=range(10))
     return parser.parse_args()
 
@@ -259,7 +269,8 @@ def main() -> None:
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     video_dir = output_dir / "videos"
-    video_dir.mkdir(exist_ok=True)
+    if args.save_videos:
+        video_dir.mkdir(exist_ok=True)
     results_path = output_dir / "episodes.jsonl"
     summary_path = output_dir / "summary.json"
     run_config_path = output_dir / "run_config.json"
@@ -269,7 +280,7 @@ def main() -> None:
     from libero.libero.benchmark import get_benchmark
     from libero.libero.envs import SubprocVectorEnv
 
-    benchmark = get_benchmark("libero_goal")(0)
+    benchmark = get_benchmark(args.benchmark)(0)
     task_ids = sorted(set(args.task_id)) if args.task_id else list(range(10))
     instructions = {task_id: benchmark.get_task(task_id).language for task_id in task_ids}
     config = load_checkpoint_config(checkpoint_dir)
@@ -279,12 +290,16 @@ def main() -> None:
     run_config = {
         "model": args.model_id,
         "checkpoint_dir": str(checkpoint_dir),
-        "benchmark": "libero_goal",
+        "benchmark": args.benchmark,
         "task_ids": task_ids,
         "episodes_per_task": args.episodes_per_task,
         "action_chunk": args.action_chunk,
         "max_steps": args.max_steps,
         "seed": args.seed,
+        "diffusion_seed_schedule": (
+            "seed + task_id*100000 + init_state_index*1000 + plan_index"
+        ),
+        "policy_batch_size": 1,
         "state_indices": STATE_INDICES,
         "action_indices": ACTION_INDICES,
     }
@@ -339,11 +354,24 @@ def main() -> None:
                 wrist = np.asarray(obs["robot0_eye_in_hand_image"])
                 histories.append((deque([agent, agent], maxlen=2), deque([wrist, wrist], maxlen=2)))
             writers = []
-            video_paths = []
+            video_paths: list[Path | None] = []
             for init_index in pending:
-                path = video_dir / f"task{task_id:02d}_init{init_index:02d}.mp4"
+                path = (
+                    video_dir / f"task{task_id:02d}_init{init_index:02d}.mp4"
+                    if args.save_videos
+                    else None
+                )
                 video_paths.append(path)
-                writers.append(imageio.get_writer(path, format="FFMPEG", fps=args.video_fps, codec="libx264", quality=8))
+                if path is not None:
+                    writers.append(
+                        imageio.get_writer(
+                            path,
+                            format="FFMPEG",
+                            fps=args.video_fps,
+                            codec="libx264",
+                            quality=8,
+                        )
+                    )
 
             done = np.zeros(len(pending), dtype=bool)
             success_steps = np.full(len(pending), args.max_steps, dtype=np.int32)
@@ -359,16 +387,34 @@ def main() -> None:
                         images = process_images(histories, replan, processor, vision, device)
                         states = format_state(observations, replan, device)
                         lang, lang_mask = language[task_id]
-                        torch.manual_seed(args.seed + task_id * 100_000 + plan)
+                        # Match the Gradio website exactly: each initial state
+                        # is sampled independently with its own deterministic
+                        # diffusion seed. This deliberately avoids the
+                        # batch-row-dependent noise stream used by the older
+                        # five-state evaluation.
+                        predictions = []
                         with torch.inference_mode():
-                            predicted = policy.predict_action(
-                                lang_tokens=lang.expand(len(replan), -1, -1).to(device),
-                                lang_attn_mask=lang_mask.expand(len(replan), -1).to(device),
-                                img_tokens=images,
-                                state_tokens=states,
-                                action_mask=action_mask.expand(len(replan), -1, -1),
-                                ctrl_freqs=torch.full((len(replan),), CTRL_FREQUENCY, device=device),
-                            ).float().cpu().numpy()
+                            for batch_index, env_index in enumerate(replan):
+                                init_index = pending[env_index]
+                                torch.manual_seed(
+                                    args.seed
+                                    + task_id * 100_000
+                                    + init_index * 1_000
+                                    + plan
+                                )
+                                predictions.append(
+                                    policy.predict_action(
+                                        lang_tokens=lang.to(device),
+                                        lang_attn_mask=lang_mask.to(device),
+                                        img_tokens=images[batch_index : batch_index + 1],
+                                        state_tokens=states[batch_index : batch_index + 1],
+                                        action_mask=action_mask,
+                                        ctrl_freqs=torch.full(
+                                            (1,), CTRL_FREQUENCY, device=device
+                                        ),
+                                    ).float().cpu()
+                                )
+                        predicted = torch.cat(predictions, dim=0).numpy()
                         commands = predicted[:, :, list(ACTION_INDICES)]
                         commands[:, :, -1] = np.where(commands[:, :, -1] < 0, -1.0, 1.0)
                         if not np.isfinite(commands).all():
@@ -390,14 +436,26 @@ def main() -> None:
                     newly_done = (~done) & np.asarray(step_done, dtype=bool)
                     success_steps[newly_done] = step
                     done |= np.asarray(step_done, dtype=bool)
-                    rendered = render_parallel(env, width=args.video_resolution, height=args.video_resolution, camera_name="agentview")
+                    rendered = (
+                        render_parallel(
+                            env,
+                            width=args.video_resolution,
+                            height=args.video_resolution,
+                            camera_name="agentview",
+                        )
+                        if args.save_videos
+                        else None
+                    )
                     for env_index, obs in enumerate(observations):
                         if done_before[env_index]:
                             continue
                         histories[env_index][0].append(np.asarray(obs["agentview_image"]))
                         histories[env_index][1].append(np.asarray(obs["robot0_eye_in_hand_image"]))
-                        label = f"goal task={task_id} init={pending[env_index]} step={step} success={int(done[env_index])}"
-                        writers[env_index].append_data(frame_for_video(rendered[env_index], label))
+                        if rendered is not None:
+                            label = f"{args.benchmark} task={task_id} init={pending[env_index]} step={step} success={int(done[env_index])}"
+                            writers[env_index].append_data(
+                                frame_for_video(rendered[env_index], label)
+                            )
                     if step % 100 == 0:
                         print(f"task={task_id} step={step}/{args.max_steps} successes={int(done.sum())}/{len(done)}", flush=True)
             finally:
@@ -408,7 +466,7 @@ def main() -> None:
             elapsed = time.perf_counter() - started
             for local_index, init_index in enumerate(pending):
                 row = {
-                    "benchmark": "libero_goal",
+                    "benchmark": args.benchmark,
                     "task_id": task_id,
                     "task_name": task.name,
                     "instruction": task.language,
@@ -418,7 +476,11 @@ def main() -> None:
                     "action_chunk": args.action_chunk,
                     "model": args.model_id,
                     "checkpoint": str(checkpoint_dir),
-                    "video": str(video_paths[local_index]),
+                    "video": (
+                        str(video_paths[local_index])
+                        if video_paths[local_index] is not None
+                        else None
+                    ),
                     "elapsed_batch_seconds": elapsed,
                 }
                 output.write(json.dumps(row) + "\n")
