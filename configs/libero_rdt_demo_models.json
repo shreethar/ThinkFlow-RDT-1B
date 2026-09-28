@@ -1,0 +1,51 @@
+{
+  "models": [
+    {
+      "suite": "libero_spatial",
+      "variant": "b0",
+      "checkpoint": "output_2/libero_spatial_b0_hidden",
+      "config": "configs/libero_b0_hidden_native128_full.yaml",
+      "cache_root": "cache_features_libero_b0_raw_ortho6d/libero_spatial",
+      "qwen_model_id": "model/model/stage1_unsloth",
+      "processor_id": "model/model/stage1_unsloth"
+    },
+    {
+      "suite": "libero_spatial",
+      "variant": "b2",
+      "checkpoint": "output_2/libero_spatial_b2_hidden_waypoint_fusion10_warm250_v2/checkpoint-5000",
+      "config": "configs/libero_b2_hidden_waypoint_native128_full.yaml",
+      "cache_root": "cache_features_libero_b2_native/libero_spatial",
+      "student_model_id": "/home/ubuntu/ThinkFlow-RDT-1B/model/LatentStudent-ckpt-400-fixed",
+      "processor_id": "/home/ubuntu/ThinkFlow-RDT-1B/model/model/stage1_unsloth"
+    },
+    {
+      "suite": "libero_spatial",
+      "variant": "b3",
+      "checkpoint": "output_2/libero_spatial_b3_hidden_waypoint_fusion10_warm250_v1",
+      "config": "configs/libero_b2_hidden_waypoint_native128_full.yaml",
+      "cache_root": "LIBERO_Spatial_B3",
+      "student_model_id": "/home/ubuntu/ThinkFlow-RDT-1B/model/Latent-Student-Spatial-Forcing",
+      "processor_id": "/home/ubuntu/ThinkFlow-RDT-1B/model/Latent-Student-Spatial-Forcing"
+    },
+    {
+      "suite": "libero_10",
+      "variant": "b0",
+      "checkpoint": "output_2/libero_long_b0_hidden",
+      "config": "configs/libero_b0_hidden_native128_full.yaml",
+      "cache_root": "cache_features_libero_b0_raw_ortho6d/libero_10",
+      "qwen_model_id": "model/model/stage1_unsloth",
+      "processor_id": "model/model/stage1_unsloth"
+    },
+    {
+      "suite": "libero_10",
+      "variant": "b2",
+      "checkpoint": "output_3/checkpoints/RDT-1B-LIBERO-Long",
+      "config": "configs/libero_b0_hidden_native128_full.yaml",
+      "cache_root": "cache_features_libero_b2_native/libero_10",
+      "student_model_id": "/home/ubuntu/ThinkFlow-RDT-1B/model/LatentStudent-ckpt-400-fixed",
+      "processor_id": "/home/ubuntu/ThinkFlow-RDT-1B/model/model/stage1_unsloth",
+      "controller": "upstream_ema",
+      "conditioning": "visualization_only"
+    }
+  ]
+}

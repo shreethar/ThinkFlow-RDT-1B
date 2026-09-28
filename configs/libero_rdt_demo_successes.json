@@ -1,0 +1,400 @@
+{
+  "evaluation_contract": {
+    "initial_states": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "diffusion_steps": 5,
+    "action_chunk": 10,
+    "spatial_max_steps": 300,
+    "long_max_steps": 600,
+    "seed": 42,
+    "policy_batch_size": 1,
+    "simulator_seed_formula": "seed + task_id",
+    "diffusion_seed_formula": "seed + task_id*100000 + init_state_index*1000 + plan_index"
+  },
+  "results": {
+    "libero_spatial": {
+      "b0": {
+        "source": "output_2/demo_seed_exact_250/libero_spatial_b0/episodes.jsonl",
+        "tasks": {
+          "0": [
+            true,
+            true,
+            true,
+            true,
+            true
+          ],
+          "1": [
+            true,
+            false,
+            false,
+            true,
+            true
+          ],
+          "2": [
+            true,
+            true,
+            false,
+            true,
+            true
+          ],
+          "3": [
+            true,
+            true,
+            false,
+            false,
+            true
+          ],
+          "4": [
+            false,
+            false,
+            false,
+            false,
+            true
+          ],
+          "5": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "6": [
+            true,
+            false,
+            true,
+            false,
+            true
+          ],
+          "7": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "8": [
+            true,
+            false,
+            false,
+            false,
+            false
+          ],
+          "9": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        }
+      },
+      "b2": {
+        "source": "output_2/demo_seed_exact_250/libero_spatial_b2/episodes.jsonl",
+        "tasks": {
+          "0": [
+            true,
+            true,
+            true,
+            true,
+            false
+          ],
+          "1": [
+            true,
+            true,
+            false,
+            true,
+            false
+          ],
+          "2": [
+            false,
+            true,
+            true,
+            true,
+            true
+          ],
+          "3": [
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "4": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "5": [
+            false,
+            false,
+            false,
+            false,
+            true
+          ],
+          "6": [
+            false,
+            true,
+            true,
+            false,
+            false
+          ],
+          "7": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "8": [
+            true,
+            true,
+            false,
+            false,
+            false
+          ],
+          "9": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        }
+      },
+      "b3": {
+        "source": "output_2/demo_seed_exact_250/libero_spatial_b3/episodes.jsonl",
+        "tasks": {
+          "0": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "1": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "2": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "3": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "4": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "5": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "6": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "7": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "8": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "9": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        }
+      }
+    },
+    "libero_10": {
+      "b0": {
+        "source": "output_2/demo_seed_exact_250/libero_10_b0/episodes.jsonl",
+        "tasks": {
+          "0": [
+            false,
+            false,
+            false,
+            false,
+            false
+          ],
+          "1": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "2": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "3": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "4": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "5": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "6": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "7": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "8": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "9": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        }
+      },
+      "b2": {
+        "source": "output_2/demo_seed_exact_250/libero_10_b2/episodes.jsonl",
+        "tasks": {
+          "0": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "1": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "2": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "3": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "4": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "5": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "6": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "7": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "8": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ],
+          "9": [
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        }
+      }
+    }
+  }
+}
