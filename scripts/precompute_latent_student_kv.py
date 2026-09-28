@@ -116,6 +116,81 @@ def load_local_spatial_parameters_if_present(student: Any, model_id: str) -> Non
             return
 
 
+def restore_packaged_visual_weights_if_needed(student: Any, model_id: str) -> int:
+    """Repair the legacy Spatial-Forcing visual-tower key prefix in memory.
+
+    The standalone B3 package was saved with visual tensors below
+    ``model.language_model.visual``. Current Transformers versions construct
+    Qwen3.5 with the same tower below ``model.visual`` and otherwise leave the
+    entire vision encoder randomly initialized. Copy the packaged tensors into
+    their expected destinations without rewriting or duplicating the multi-GB
+    checkpoint on disk.
+    """
+    model_path = Path(model_id).expanduser()
+    index_path = model_path / "model.safetensors.index.json"
+    if not index_path.is_file():
+        return 0
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    weight_map = index.get("weight_map", {})
+    source_prefix = "model.language_model.visual."
+    target_prefix = "model.visual."
+    visual_sources = {
+        name: filename
+        for name, filename in weight_map.items()
+        if name.startswith(source_prefix)
+    }
+    if not visual_sources:
+        return 0
+
+    from safetensors import safe_open
+
+    target_tensors = dict(student.vlm.named_parameters())
+    target_tensors.update(dict(student.vlm.named_buffers()))
+    missing_targets = [
+        target_prefix + name.removeprefix(source_prefix)
+        for name in visual_sources
+        if target_prefix + name.removeprefix(source_prefix) not in target_tensors
+    ]
+    if missing_targets:
+        raise KeyError(
+            "Spatial-Forcing visual-prefix repair cannot find target tensor "
+            f"{missing_targets[0]!r} ({len(missing_targets)} missing)"
+        )
+
+    sources_by_file: dict[str, list[str]] = {}
+    for source_name, filename in visual_sources.items():
+        sources_by_file.setdefault(str(filename), []).append(source_name)
+    restored = 0
+    with torch.no_grad():
+        for filename, source_names in sources_by_file.items():
+            shard_path = model_path / filename
+            if not shard_path.is_file():
+                raise FileNotFoundError(shard_path)
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                for source_name in source_names:
+                    target_name = target_prefix + source_name.removeprefix(
+                        source_prefix
+                    )
+                    source = handle.get_tensor(source_name)
+                    target = target_tensors[target_name]
+                    if source.shape != target.shape:
+                        raise ValueError(
+                            f"Visual tensor {source_name} has shape "
+                            f"{tuple(source.shape)}, expected {tuple(target.shape)}"
+                        )
+                    target.copy_(source.to(device=target.device, dtype=target.dtype))
+                    restored += 1
+    if restored != len(visual_sources):
+        raise RuntimeError(
+            f"Restored {restored}/{len(visual_sources)} packaged visual tensors"
+        )
+    print(
+        "Restored Spatial-Forcing visual tower from packaged legacy prefix: "
+        f"{restored} tensors"
+    )
+    return restored
+
+
 @contextmanager
 def override_image_text_attention(implementation: str | None):
     """Temporarily override nested VLM loading for rollout-only compatibility."""
@@ -158,6 +233,7 @@ def load_student_and_processor(args: argparse.Namespace, device: torch.device) -
         load_spatial_parameters(student, args.spatial_parameters_path)
     else:
         load_local_spatial_parameters_if_present(student, args.student_model_id)
+    restore_packaged_visual_weights_if_needed(student, args.student_model_id)
     spatial_shape = tuple(student.spatial_tokens.shape)
     if spatial_shape[0] != args.spatial_token_count:
         raise ValueError(
